@@ -56,9 +56,9 @@ advice = "use asyncio streams (`asyncio.open_connection`) or `loop.getaddrinfo`,
 functions = [
     "socket.create_connection",
     "socket.getaddrinfo",
-    "socket.gethostbyname",
-    "socket.gethostbyname_ex",
-    "socket.gethostbyaddr",
+    "_socket.gethostbyname",
+    "_socket.gethostbyname_ex",
+    "_socket.gethostbyaddr",
     "socket.socket.accept",
     "_socket.socket.connect",
     "_socket.socket.recv",
@@ -85,7 +85,6 @@ advice = "use `anyio`/`aiofiles` file APIs or `await asyncio.to_thread(...)`"
 functions = [
     "builtins.open",
     "builtins.input",
-    "io.open",
     "os.read",
     "os.write",
     "os.fsync",
@@ -104,7 +103,6 @@ functions = [
     "genericpath.isfile",
     "genericpath.isdir",
     "genericpath.getsize",
-    "posixpath.exists",
     "pathlib.Path.open",
     "pathlib.Path.read_text",
     "pathlib.Path.read_bytes",
@@ -127,16 +125,7 @@ functions = [
     "shutil.copy2",
     "shutil.copyfile",
     "shutil.copytree",
-    "shutil.rmtree",
-    "shutil.move",
-    "json.load",
-    "json.dump",
-    "_io.TextIOWrapper.read",
-    "_io.TextIOWrapper.readline",
-    "_io.TextIOWrapper.readlines",
-    "_io.TextIOWrapper.write",
-    "_io.BufferedReader.read",
-    "_io.BufferedWriter.write",
+    "shutil._RmtreeType.__call__",
 ]
 
 [[sink]]
@@ -165,7 +154,7 @@ functions = [
 category = "database"
 advice = "use an async driver (`asyncpg`, SQLAlchemy `AsyncSession`, `redis.asyncio`) or `await asyncio.to_thread(...)`"
 functions = [
-    "sqlite3.connect",
+    "_sqlite3.connect",
     "sqlite3.Connection.execute",
     "sqlite3.Connection.executemany",
     "sqlite3.Connection.executescript",
@@ -212,7 +201,6 @@ functions = [
     "_thread.lock.acquire",
     "_thread.lock.__enter__",
     "_thread.RLock.acquire",
-    "_thread.RLock.__enter__",
     "threading.Event.wait",
     "threading.Condition.wait",
     "threading.Semaphore.acquire",
@@ -240,7 +228,13 @@ functions = [
 [[sink]]
 category = "retry"
 advice = "use `tenacity.AsyncRetrying` / decorate the coroutine, whose waits use `asyncio.sleep`"
-functions = ["tenacity.Retrying.__call__"]
+functions = ["tenacity.Retrying.__call__", "tenacity.BaseRetrying.__iter__"]
+
+# Calling a sync function decorated with these runs a retry loop that sleeps between attempts.
+[[blocking_decorator]]
+category = "retry"
+advice = "decorate a coroutine instead (tenacity then waits with `asyncio.sleep`), or run the call with `await asyncio.to_thread(...)`"
+functions = ["tenacity.retry"]
 
 [[sink]]
 category = "cpu"
@@ -250,8 +244,8 @@ functions = [
     "bcrypt.hashpw",
     "bcrypt.checkpw",
     "bcrypt.kdf",
-    "hashlib.pbkdf2_hmac",
-    "hashlib.scrypt",
+    "_hashlib.pbkdf2_hmac",
+    "_hashlib.scrypt",
 ]
 
 # ---------------------------------------------------------------------------------------------
@@ -269,8 +263,6 @@ functions = [
     "anyio.to_process.run_sync",
     "concurrent.futures._base.Executor.submit",
     "concurrent.futures._base.Executor.map",
-    "concurrent.futures.thread.ThreadPoolExecutor.submit",
-    "concurrent.futures.process.ProcessPoolExecutor.submit",
     "threading.Thread.__init__",
     "multiprocessing.process.BaseProcess.__init__",
 ]
@@ -287,9 +279,7 @@ functions = [
     "asyncio.events.AbstractEventLoop.add_reader",
     "asyncio.events.AbstractEventLoop.add_writer",
     "asyncio.events.AbstractEventLoop.add_signal_handler",
-    "asyncio.futures.Future.add_done_callback",
     "_asyncio.Future.add_done_callback",
-    "_asyncio.Task.add_done_callback",
 ]
 
 # ---------------------------------------------------------------------------------------------
@@ -321,7 +311,6 @@ functions = [
     "fastapi.routing.APIRoute.__init__",
     "starlette.routing.Route.__init__",
     "starlette.applications.Starlette.add_route",
-    "starlette.applications.Starlette.route",
 ]
 
 [[entry]]
@@ -362,7 +351,6 @@ functions = [
     "fastapi.routing.APIRouter.__init__",
     "fastapi.routing.APIRouter.on_event",
     "fastapi.routing.APIRouter.add_event_handler",
-    "starlette.applications.Starlette.add_event_handler",
 ]
 
 [[entry]]

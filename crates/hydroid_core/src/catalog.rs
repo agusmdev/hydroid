@@ -15,6 +15,9 @@ const BUILTIN: &str = include_str!("../catalog.toml");
 struct CatalogFile {
     #[serde(default)]
     sink: Vec<SinkGroup>,
+    /// Decorators that make calls to the sync functions they decorate block (retry loops).
+    #[serde(default)]
+    blocking_decorator: Vec<SinkGroup>,
     #[serde(default)]
     offload: Group,
     #[serde(default)]
@@ -88,6 +91,18 @@ impl<T: Clone> Patterns<T> {
     }
 }
 
+/// Whether `qualname` matches a catalog name (`*` matches within one dotted segment).
+pub fn qualname_matches(pattern: &str, qualname: &str) -> bool {
+    let (mut p, mut q) = (pattern.split('.'), qualname.split('.'));
+    loop {
+        match (p.next(), q.next()) {
+            (None, None) => return true,
+            (Some(p), Some(q)) if segment_matches(p, q) => {}
+            _ => return false,
+        }
+    }
+}
+
 /// `*` matches any run of characters inside one segment.
 fn segment_matches(pattern: &str, segment: &str) -> bool {
     let mut parts = pattern.split('*');
@@ -111,6 +126,7 @@ fn segment_matches(pattern: &str, segment: &str) -> bool {
 #[derive(Default)]
 pub struct Catalog {
     sinks: Patterns<usize>,
+    blocking_decorators: Patterns<usize>,
     groups: Vec<(String, String)>,
     offload: Patterns<()>,
     loop_callbacks: Patterns<()>,
@@ -129,14 +145,17 @@ impl Catalog {
     /// Adds the groups of a catalog document (same schema as the builtin one).
     pub fn extend(&mut self, toml_text: &str, opt_in: bool) -> anyhow::Result<()> {
         let file: CatalogFile = toml::from_str(toml_text).context("invalid catalog")?;
-        for group in file.sink {
+        for (group, blocking_decorator) in
+            file.sink.into_iter().map(|g| (g, false)).chain(file.blocking_decorator.into_iter().map(|g| (g, true)))
+        {
             if group.opt_in && !opt_in {
                 continue;
             }
             let index = self.groups.len();
             self.groups.push((group.category, group.advice));
+            let patterns = if blocking_decorator { &mut self.blocking_decorators } else { &mut self.sinks };
             for name in &group.functions {
-                self.sinks.insert(name, index);
+                patterns.insert(name, index);
             }
         }
         for name in &file.offload.functions {
@@ -161,6 +180,13 @@ impl Catalog {
         Some(Sink { qualname: qualname.to_string(), category: category.clone(), advice: advice.clone() })
     }
 
+    /// The blocking behavior a decorator gives the sync functions it decorates.
+    pub fn blocking_decorator(&self, qualname: &str) -> Option<Sink> {
+        let &index = self.blocking_decorators.get(qualname)?;
+        let (category, advice) = &self.groups[index];
+        Some(Sink { qualname: qualname.to_string(), category: category.clone(), advice: advice.clone() })
+    }
+
     pub fn is_offload(&self, qualname: &str) -> bool {
         self.offload.get(qualname).is_some()
     }
@@ -179,6 +205,7 @@ impl Catalog {
         let mut names: Vec<String> = self
             .sinks
             .all()
+            .chain(self.blocking_decorators.all())
             .chain(self.offload.all())
             .chain(self.loop_callbacks.all())
             .chain(self.entries.all())

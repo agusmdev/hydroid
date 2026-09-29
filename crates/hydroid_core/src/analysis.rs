@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::catalog::Catalog;
 use crate::facts::{Call, ClassId, Facts, FnId, Flow, FunctionKind, Location, Origin, Slot, Value};
-use crate::report::{Diagnostic, Frame, ReachedFrom, Report, Unresolved};
+use crate::report::{Diagnostic, Frame, ReachedFrom, Report, Sink, Unresolved};
 
 pub fn analyze(facts: &Facts, catalog: &Catalog) -> Report {
     let graph = Graph::new(facts, catalog);
@@ -30,18 +30,17 @@ pub fn analyze(facts: &Facts, catalog: &Catalog) -> Report {
             continue;
         }
         for &call in &graph.calls_of[root.0 as usize] {
-            let Some(chain) = graph.blocking_chain(call, &blocking) else {
+            let Some((chain, sink)) = graph.blocking_chain(call, &blocking) else {
                 continue;
             };
             let c = &facts.calls[call];
             if suppressed.contains(&(c.location.path.as_str(), c.location.line)) {
                 continue;
             }
-            let sink_fn = chain.last().expect("chains are non-empty").callee.clone();
             diagnostics.push(Diagnostic {
                 location: c.location.clone(),
                 function: root_fn.qualname.clone(),
-                sink: catalog.sink(&sink_fn).expect("chains end at a sink"),
+                sink,
                 chain,
                 reached_from: reached.clone(),
             });
@@ -67,7 +66,9 @@ struct Graph<'a> {
     /// Effective targets of each call: resolved targets, decorator wrappers, overrides in
     /// subclasses, callables flowing into called parameters. Offload APIs are cut.
     targets: Vec<Vec<FnId>>,
-    sink: Vec<bool>,
+    /// What blocking means for each function, if it blocks by itself: a catalog sink, or a sync
+    /// function wrapped in a blocking decorator (retry loops).
+    sink: Vec<Option<Sink>>,
     /// See [`Graph::called_params`].
     called: HashSet<ParamKey>,
 }
@@ -81,7 +82,16 @@ impl<'a> Graph<'a> {
         for (i, call) in facts.calls.iter().enumerate() {
             calls_of[call.caller.0 as usize].push(i);
         }
-        let sink = facts.functions.iter().map(|f| catalog.sink(&f.qualname).is_some()).collect();
+        let sink = facts
+            .functions
+            .iter()
+            .map(|f| {
+                catalog.sink(&f.qualname).or_else(|| {
+                    let decorators = f.decorators.iter().map(|d| &facts.function(*d).qualname);
+                    (!f.is_async).then(|| decorators.filter_map(|d| catalog.blocking_decorator(d)).next())?
+                })
+            })
+            .collect();
         let mut graph = Self { facts, catalog, calls_of, targets: Vec::new(), sink, called: HashSet::new() };
         let nested = graph.nested_functions();
         let params = graph.parameter_values(&nested);
@@ -283,11 +293,11 @@ impl<'a> Graph<'a> {
         let mut queue = VecDeque::new();
         for (i, call) in self.facts.calls.iter().enumerate() {
             let caller = self.facts.function(call.caller);
-            if caller.is_async || self.sink[call.caller.0 as usize] {
+            if caller.is_async || self.sink[call.caller.0 as usize].is_some() {
                 continue;
             }
             for &t in &self.targets[i] {
-                if self.sink[t.0 as usize] {
+                if self.sink[t.0 as usize].is_some() {
                     if !call.awaited && next[call.caller.0 as usize].is_none() {
                         next[call.caller.0 as usize] = Some((1, i, t));
                         queue.push_back(call.caller);
@@ -309,13 +319,13 @@ impl<'a> Graph<'a> {
         next
     }
 
-    /// The shortest blocking chain starting at `call`, if the call blocks.
-    fn blocking_chain(&self, call: usize, next: &[Option<(u32, usize, FnId)>]) -> Option<Vec<Frame>> {
+    /// The shortest blocking chain starting at `call`, and what blocks at its end.
+    fn blocking_chain(&self, call: usize, next: &[Option<(u32, usize, FnId)>]) -> Option<(Vec<Frame>, Sink)> {
         let c = &self.facts.calls[call];
         let best = self.targets[call]
             .iter()
             .filter_map(|&t| {
-                if self.sink[t.0 as usize] {
+                if self.sink[t.0 as usize].is_some() {
                     (!c.awaited).then_some((0, t))
                 } else if self.facts.function(t).is_async {
                     None
@@ -326,12 +336,14 @@ impl<'a> Graph<'a> {
             .min()?;
         let mut chain = vec![self.frame(call, best.1)];
         let mut current = best.1;
-        while !self.sink[current.0 as usize] {
+        loop {
+            if let Some(sink) = &self.sink[current.0 as usize] {
+                return Some((chain, sink.clone()));
+            }
             let (_, call, target) = next[current.0 as usize].expect("blocking functions chain to a sink");
             chain.push(self.frame(call, target));
             current = target;
         }
-        Some(chain)
     }
 
     fn frame(&self, call: usize, target: FnId) -> Frame {
@@ -415,7 +427,7 @@ impl<'a> Graph<'a> {
             for &call in &self.calls_of[f.0 as usize] {
                 for &t in &self.targets[call] {
                     let target = self.facts.function(t);
-                    if !on_loop[t.0 as usize] && !target.is_async && !self.sink[t.0 as usize] {
+                    if !on_loop[t.0 as usize] && !target.is_async && self.sink[t.0 as usize].is_none() {
                         on_loop[t.0 as usize] = true;
                         queue.push_back(t);
                     }

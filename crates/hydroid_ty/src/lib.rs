@@ -11,12 +11,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
+use hydroid_core::catalog::qualname_matches;
 use hydroid_core::facts::{Call, Class, ClassId, Facts, FnId, Flow, Function, Origin, Slot, Value};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use ruff_db::files::{File, system_path_to_file};
 use ruff_db::system::{SystemPath, SystemPathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};
+use ty_module_resolver::{ModuleName, resolve_module_confident};
 
 use crate::db::HydroidDb;
 use crate::extract::{FileFacts, RawSlot, RawValue, extract_file};
@@ -41,9 +43,40 @@ fn system_path(path: &Path) -> anyhow::Result<SystemPathBuf> {
     SystemPathBuf::from_path_buf(path).map_err(|p| anyhow::anyhow!("`{}` is not valid UTF-8", p.display()))
 }
 
+/// Absolute, but symlinks kept: `.venv/bin/python` must not become the base interpreter.
+fn python_path(path: &Path) -> anyhow::Result<SystemPathBuf> {
+    let path = std::path::absolute(path)?;
+    SystemPathBuf::from_path_buf(path).map_err(|p| anyhow::anyhow!("`{}` is not valid UTF-8", p.display()))
+}
+
+/// Catalog names (or patterns) that match no definition in the environment's modules.
+pub fn unknown_names(root: &Path, python: Option<&Path>, names: &[String]) -> anyhow::Result<Vec<String>> {
+    let python = python.map(python_path).transpose()?;
+    let db = HydroidDb::new(&system_path(root)?, python.as_deref())?;
+    let environment = db.program().resolver_environment(&db);
+    let mut indexes: FxHashMap<File, FileIndex> = FxHashMap::default();
+    let mut unknown = Vec::new();
+    for name in names {
+        let segments: Vec<&str> = name.split('.').collect();
+        let found = (1..segments.len()).rev().any(|split| {
+            let Some(module) = ModuleName::new(&segments[..split].join(".")) else { return false };
+            let Some(file) = resolve_module_confident(&db, environment, &module).and_then(|m| m.file(&db))
+            else {
+                return false;
+            };
+            let index = indexes.entry(file).or_insert_with(|| FileIndex::build(&db, file));
+            index.functions.values().any(|f| qualname_matches(name, &f.qualname))
+        });
+        if !found {
+            unknown.push(name.clone());
+        }
+    }
+    Ok(unknown)
+}
+
 pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
     let root = system_path(options.root)?;
-    let python = options.python.map(system_path).transpose()?;
+    let python = options.python.map(python_path).transpose()?;
     let db = HydroidDb::new(&root, python.as_deref())?;
     let files = project_files(&db, &root)?;
 
