@@ -320,7 +320,7 @@ impl<'a> Graph<'a> {
             .iter()
             .enumerate()
             .filter(|(_, f)| f.analyzed && f.is_async && f.origin == Origin::Project)
-            .map(|(i, f)| (FnId(i as u32), f.qualname.clone()));
+            .map(|(i, _)| (FnId(i as u32), "project code".to_string()));
         let count = entries.len();
         let from_entries = self.bfs(entries);
         let from_project = self.bfs(project_async.collect());
@@ -419,10 +419,14 @@ struct EntryPaths<'a> {
 }
 
 impl EntryPaths<'_> {
+    /// How entry points reach `f`. Library functions no entry point reaches are attributed to
+    /// the project code that reaches them.
     fn path_to(&self, f: FnId) -> Option<ReachedFrom> {
         let reach = if self.from_entries[f.0 as usize].is_some() {
             &self.from_entries
-        } else if self.from_project[f.0 as usize].is_some() {
+        } else if self.graph.facts.function(f).origin != Origin::Project
+            && self.from_project[f.0 as usize].is_some()
+        {
             &self.from_project
         } else {
             return None;

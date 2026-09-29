@@ -2,7 +2,9 @@
 //! the inline expectations in the sources:
 //!
 //! - `# expect: time.sleep` — a diagnostic on this line whose blocking function is `time.sleep`
-//!   (several qualnames separated by spaces for several diagnostics on one line).
+//!   (several qualnames separated by spaces for several diagnostics on one line). A trailing
+//!   `via <entry>` also checks the entry point reported as reaching it (`via route GET /x`,
+//!   `via nothing` when no entry point does).
 //! - `# expect-unresolved` — an unresolved call on the event loop on this line; only checked in
 //!   cases whose `case.toml` sets `unresolved = true`.
 //!
@@ -47,7 +49,12 @@ fn expectations(dir: &Path) -> (Expected, Expected) {
         for (i, line) in std::fs::read_to_string(path).unwrap().lines().enumerate() {
             let key = (rel.clone(), i as u32 + 1);
             if let Some((_, rest)) = line.split_once("# expect: ") {
-                let names = rest.split_whitespace().map(str::to_string);
+                // `time.sleep time.sleep via route GET /x`: sinks, then the entry reaching them.
+                let (names, via) = match rest.split_once(" via ") {
+                    Some((names, entry)) => (names, format!(" via {}", entry.trim())),
+                    None => (rest, String::new()),
+                };
+                let names = names.split_whitespace().map(|n| format!("{n}{via}"));
                 blocking.entry(key.clone()).or_default().extend(names);
             }
             if line.contains("# expect-unresolved") {
@@ -87,7 +94,10 @@ fn run_case(dir: &Path) -> Vec<String> {
     let mut got_blocking = Expected::new();
     for d in &report.diagnostics {
         let key = (d.location.path.clone(), d.location.line);
-        got_blocking.entry(key).or_default().push(d.sink.qualname.clone());
+        let wants_entry = want_blocking.get(&key).is_some_and(|w| w.iter().any(|n| n.contains(" via ")));
+        let entry = d.reached_from.as_ref().map_or("nothing", |r| r.entry.split(": ").next().unwrap_or_default());
+        let got = if wants_entry { format!("{} via {entry}", d.sink.qualname) } else { d.sink.qualname.clone() };
+        got_blocking.entry(key).or_default().push(got);
     }
     let mut mismatches = Vec::new();
     diff("blocking", &want_blocking, &got_blocking, &mut mismatches);

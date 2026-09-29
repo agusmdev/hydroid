@@ -367,4 +367,8 @@ functions = [
 
 [[entry]]
 kind = "background task"
-functions = ["starlette.background.BackgroundTasks.add_task", "starlette.background.BackgroundTask.__init__"]
+functions = [
+    "fastapi.background.BackgroundTasks.add_task",
+    "starlette.background.BackgroundTasks.add_task",
+    "starlette.background.BackgroundTask.__init__",
+]
