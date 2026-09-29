@@ -1,0 +1,370 @@
+# hydroid's knowledge about functions whose bodies it does not (or must not) analyze.
+#
+# Names are *defining* qualified names: the module where the function is defined, not where it is
+# re-exported (`requests.get` is defined as `requests.api.get`). Stdlib names follow typeshed.
+# `*` matches within one dotted segment: `requests.sessions.Session.*`.
+# `tests/catalog.rs` checks that every name resolves in the fixture environment.
+
+# ---------------------------------------------------------------------------------------------
+# Blocking functions. A call to one of these on the event loop is a diagnostic.
+# A call whose result is awaited is never blocking (dual sync/async APIs share definitions).
+# ---------------------------------------------------------------------------------------------
+
+[[sink]]
+category = "sleep"
+advice = "use `await asyncio.sleep(...)`"
+functions = ["time.sleep"]
+
+[[sink]]
+category = "http"
+advice = "use an async client (`httpx.AsyncClient`, `aiohttp`) or `await asyncio.to_thread(...)`"
+functions = [
+    "requests.api.*",
+    "requests.sessions.Session.get",
+    "requests.sessions.Session.options",
+    "requests.sessions.Session.head",
+    "requests.sessions.Session.post",
+    "requests.sessions.Session.put",
+    "requests.sessions.Session.patch",
+    "requests.sessions.Session.delete",
+    "requests.sessions.Session.request",
+    "requests.sessions.Session.send",
+    "httpx._api.*",
+    "httpx._client.Client.get",
+    "httpx._client.Client.options",
+    "httpx._client.Client.head",
+    "httpx._client.Client.post",
+    "httpx._client.Client.put",
+    "httpx._client.Client.patch",
+    "httpx._client.Client.delete",
+    "httpx._client.Client.request",
+    "httpx._client.Client.send",
+    "httpx._client.Client.stream",
+    "urllib.request.urlopen",
+    "urllib.request.urlretrieve",
+    "urllib.request.OpenerDirector.open",
+    "http.client.HTTPConnection.request",
+    "http.client.HTTPConnection.getresponse",
+    "http.client.HTTPConnection.connect",
+    "urllib3.poolmanager.PoolManager.urlopen",
+    "urllib3._request_methods.RequestMethods.request",
+]
+
+[[sink]]
+category = "network"
+advice = "use asyncio streams (`asyncio.open_connection`) or `loop.getaddrinfo`, or `await asyncio.to_thread(...)`"
+functions = [
+    "socket.create_connection",
+    "socket.getaddrinfo",
+    "socket.gethostbyname",
+    "socket.gethostbyname_ex",
+    "socket.gethostbyaddr",
+    "socket.socket.accept",
+    "_socket.socket.connect",
+    "_socket.socket.recv",
+    "_socket.socket.recv_into",
+    "_socket.socket.recvfrom",
+    "_socket.socket.send",
+    "_socket.socket.sendall",
+    "_socket.socket.sendto",
+    "smtplib.SMTP.__init__",
+    "smtplib.SMTP.connect",
+    "smtplib.SMTP.login",
+    "smtplib.SMTP.starttls",
+    "smtplib.SMTP.sendmail",
+    "smtplib.SMTP.send_message",
+    "smtplib.SMTP.quit",
+    "ftplib.FTP.__init__",
+    "ftplib.FTP.connect",
+    "ftplib.FTP.login",
+]
+
+[[sink]]
+category = "file"
+advice = "use `anyio`/`aiofiles` file APIs or `await asyncio.to_thread(...)`"
+functions = [
+    "builtins.open",
+    "builtins.input",
+    "io.open",
+    "os.read",
+    "os.write",
+    "os.fsync",
+    "os.listdir",
+    "os.scandir",
+    "os.walk",
+    "os.remove",
+    "os.unlink",
+    "os.rename",
+    "os.replace",
+    "os.makedirs",
+    "os.mkdir",
+    "os.rmdir",
+    "os.stat",
+    "genericpath.exists",
+    "genericpath.isfile",
+    "genericpath.isdir",
+    "genericpath.getsize",
+    "posixpath.exists",
+    "pathlib.Path.open",
+    "pathlib.Path.read_text",
+    "pathlib.Path.read_bytes",
+    "pathlib.Path.write_text",
+    "pathlib.Path.write_bytes",
+    "pathlib.Path.touch",
+    "pathlib.Path.mkdir",
+    "pathlib.Path.unlink",
+    "pathlib.Path.rmdir",
+    "pathlib.Path.rename",
+    "pathlib.Path.replace",
+    "pathlib.Path.iterdir",
+    "pathlib.Path.glob",
+    "pathlib.Path.rglob",
+    "pathlib.Path.stat",
+    "pathlib.Path.exists",
+    "pathlib.Path.is_file",
+    "pathlib.Path.is_dir",
+    "shutil.copy",
+    "shutil.copy2",
+    "shutil.copyfile",
+    "shutil.copytree",
+    "shutil.rmtree",
+    "shutil.move",
+    "json.load",
+    "json.dump",
+    "_io.TextIOWrapper.read",
+    "_io.TextIOWrapper.readline",
+    "_io.TextIOWrapper.readlines",
+    "_io.TextIOWrapper.write",
+    "_io.BufferedReader.read",
+    "_io.BufferedWriter.write",
+]
+
+[[sink]]
+category = "subprocess"
+advice = "use `asyncio.create_subprocess_exec` or `await asyncio.to_thread(...)`"
+functions = [
+    "subprocess.run",
+    "subprocess.call",
+    "subprocess.check_call",
+    "subprocess.check_output",
+    "subprocess.getoutput",
+    "subprocess.getstatusoutput",
+    "subprocess.Popen.__init__",
+    "subprocess.Popen.wait",
+    "subprocess.Popen.communicate",
+    "os.system",
+    "os.popen",
+    "os.wait",
+    "os.waitpid",
+    "os.posix_spawn",
+    "os.spawnl",
+    "os.spawnv",
+]
+
+[[sink]]
+category = "database"
+advice = "use an async driver (`asyncpg`, SQLAlchemy `AsyncSession`, `redis.asyncio`) or `await asyncio.to_thread(...)`"
+functions = [
+    "sqlite3.connect",
+    "sqlite3.Connection.execute",
+    "sqlite3.Connection.executemany",
+    "sqlite3.Connection.executescript",
+    "sqlite3.Connection.commit",
+    "sqlite3.Cursor.execute",
+    "sqlite3.Cursor.executemany",
+    "sqlite3.Cursor.fetchone",
+    "sqlite3.Cursor.fetchall",
+    "sqlalchemy.orm.session.Session.execute",
+    "sqlalchemy.orm.session.Session.scalar",
+    "sqlalchemy.orm.session.Session.scalars",
+    "sqlalchemy.orm.session.Session.get",
+    "sqlalchemy.orm.session.Session.commit",
+    "sqlalchemy.orm.session.Session.flush",
+    "sqlalchemy.orm.session.Session.refresh",
+    "sqlalchemy.orm.session.Session.merge",
+    "sqlalchemy.orm.session.Session.connection",
+    "sqlalchemy.orm.query.Query.all",
+    "sqlalchemy.orm.query.Query.first",
+    "sqlalchemy.orm.query.Query.one",
+    "sqlalchemy.orm.query.Query.one_or_none",
+    "sqlalchemy.orm.query.Query.scalar",
+    "sqlalchemy.orm.query.Query.count",
+    "sqlalchemy.engine.base.Connection.execute",
+    "sqlalchemy.engine.base.Connection.commit",
+    "sqlalchemy.engine.base.Engine.connect",
+    "sqlalchemy.engine.base.Engine.begin",
+    "sqlmodel.orm.session.Session.exec",
+    "pymysql.connections.Connection.__init__",
+    "pymysql.connections.Connection.commit",
+    "pymysql.cursors.Cursor.execute",
+    "pymysql.cursors.Cursor.executemany",
+    "pymysql.cursors.Cursor.fetchone",
+    "pymysql.cursors.Cursor.fetchall",
+    "redis.client.Redis.execute_command",
+    "redis.client.Pipeline.execute",
+    "redis.commands.core.*Commands.*",
+]
+
+[[sink]]
+category = "synchronization"
+advice = "use asyncio primitives (`asyncio.Lock`, `asyncio.Queue`, `asyncio.Event`) or `await asyncio.wrap_future(...)`"
+functions = [
+    "_thread.lock.acquire",
+    "_thread.lock.__enter__",
+    "_thread.RLock.acquire",
+    "_thread.RLock.__enter__",
+    "threading.Event.wait",
+    "threading.Condition.wait",
+    "threading.Semaphore.acquire",
+    "threading.Thread.join",
+    "queue.Queue.get",
+    "queue.Queue.put",
+    "queue.Queue.join",
+    "concurrent.futures._base.Future.result",
+    "concurrent.futures._base.wait",
+    "concurrent.futures._base.Executor.shutdown",
+    "multiprocessing.pool.Pool.map",
+    "multiprocessing.pool.Pool.apply",
+]
+
+[[sink]]
+category = "event-loop"
+advice = "`await` the coroutine instead of starting a nested event loop"
+functions = [
+    "asyncio.runners.run",
+    "asyncio.runners.Runner.run",
+    "asyncio.events.AbstractEventLoop.run_until_complete",
+    "asyncio.events.AbstractEventLoop.run_forever",
+]
+
+[[sink]]
+category = "retry"
+advice = "use `tenacity.AsyncRetrying` / decorate the coroutine, whose waits use `asyncio.sleep`"
+functions = ["tenacity.Retrying.__call__"]
+
+[[sink]]
+category = "cpu"
+opt_in = true
+advice = "CPU-bound: run it with `await asyncio.to_thread(...)` or in a process pool"
+functions = [
+    "bcrypt.hashpw",
+    "bcrypt.checkpw",
+    "bcrypt.kdf",
+    "hashlib.pbkdf2_hmac",
+    "hashlib.scrypt",
+]
+
+# ---------------------------------------------------------------------------------------------
+# Work moved off the event loop. Callables passed to these run in a worker thread or process:
+# hydroid never follows them, and never follows the bodies of these functions.
+# ---------------------------------------------------------------------------------------------
+[offload]
+functions = [
+    "asyncio.threads.to_thread",
+    "asyncio.events.AbstractEventLoop.run_in_executor",
+    "starlette.concurrency.run_in_threadpool",
+    "starlette.concurrency.iterate_in_threadpool",
+    "starlette.concurrency.run_until_first_complete",
+    "anyio.to_thread.run_sync",
+    "anyio.to_process.run_sync",
+    "concurrent.futures._base.Executor.submit",
+    "concurrent.futures._base.Executor.map",
+    "concurrent.futures.thread.ThreadPoolExecutor.submit",
+    "concurrent.futures.process.ProcessPoolExecutor.submit",
+    "threading.Thread.__init__",
+    "multiprocessing.process.BaseProcess.__init__",
+]
+
+# ---------------------------------------------------------------------------------------------
+# Sync callables passed to these run *on* the event loop.
+# ---------------------------------------------------------------------------------------------
+[loop_callback]
+functions = [
+    "asyncio.events.AbstractEventLoop.call_soon",
+    "asyncio.events.AbstractEventLoop.call_soon_threadsafe",
+    "asyncio.events.AbstractEventLoop.call_later",
+    "asyncio.events.AbstractEventLoop.call_at",
+    "asyncio.events.AbstractEventLoop.add_reader",
+    "asyncio.events.AbstractEventLoop.add_writer",
+    "asyncio.events.AbstractEventLoop.add_signal_handler",
+    "asyncio.futures.Future.add_done_callback",
+    "_asyncio.Future.add_done_callback",
+    "_asyncio.Task.add_done_callback",
+]
+
+# ---------------------------------------------------------------------------------------------
+# FastAPI / Starlette entry points: used to show which endpoint reaches a diagnostic.
+# ---------------------------------------------------------------------------------------------
+[[entry]]
+kind = "route"
+functions = [
+    "fastapi.applications.FastAPI.get",
+    "fastapi.applications.FastAPI.put",
+    "fastapi.applications.FastAPI.post",
+    "fastapi.applications.FastAPI.delete",
+    "fastapi.applications.FastAPI.options",
+    "fastapi.applications.FastAPI.head",
+    "fastapi.applications.FastAPI.patch",
+    "fastapi.applications.FastAPI.trace",
+    "fastapi.applications.FastAPI.api_route",
+    "fastapi.applications.FastAPI.add_api_route",
+    "fastapi.routing.APIRouter.get",
+    "fastapi.routing.APIRouter.put",
+    "fastapi.routing.APIRouter.post",
+    "fastapi.routing.APIRouter.delete",
+    "fastapi.routing.APIRouter.options",
+    "fastapi.routing.APIRouter.head",
+    "fastapi.routing.APIRouter.patch",
+    "fastapi.routing.APIRouter.trace",
+    "fastapi.routing.APIRouter.api_route",
+    "fastapi.routing.APIRouter.add_api_route",
+    "fastapi.routing.APIRoute.__init__",
+    "starlette.routing.Route.__init__",
+    "starlette.applications.Starlette.add_route",
+    "starlette.applications.Starlette.route",
+]
+
+[[entry]]
+kind = "websocket"
+functions = [
+    "fastapi.applications.FastAPI.websocket",
+    "fastapi.applications.FastAPI.add_api_websocket_route",
+    "fastapi.routing.APIRouter.websocket",
+    "fastapi.routing.APIRouter.add_api_websocket_route",
+    "starlette.routing.WebSocketRoute.__init__",
+]
+
+[[entry]]
+kind = "dependency"
+functions = ["fastapi.param_functions.Depends", "fastapi.param_functions.Security"]
+
+[[entry]]
+kind = "middleware"
+functions = [
+    "fastapi.applications.FastAPI.middleware",
+    "starlette.applications.Starlette.add_middleware",
+    "starlette.middleware.Middleware.__init__",
+    "starlette.middleware.base.BaseHTTPMiddleware.__init__",
+]
+
+[[entry]]
+kind = "exception handler"
+functions = [
+    "fastapi.applications.FastAPI.exception_handler",
+    "starlette.applications.Starlette.add_exception_handler",
+]
+
+[[entry]]
+kind = "lifecycle"
+functions = [
+    "fastapi.applications.FastAPI.__init__",
+    "fastapi.applications.FastAPI.on_event",
+    "fastapi.routing.APIRouter.__init__",
+    "fastapi.routing.APIRouter.on_event",
+    "fastapi.routing.APIRouter.add_event_handler",
+    "starlette.applications.Starlette.add_event_handler",
+]
+
+[[entry]]
+kind = "background task"
+functions = ["starlette.background.BackgroundTasks.add_task", "starlette.background.BackgroundTask.__init__"]

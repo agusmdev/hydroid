@@ -92,6 +92,7 @@ fn run_case(dir: &Path) -> Vec<String> {
         root: dir.to_path_buf(),
         python: Some(FIXTURE_VENV.clone()),
         follow_libs: config.follow_libs,
+        ..Options::default()
     };
     let report = match hydroid::check(&options) {
         Ok(report) => report,

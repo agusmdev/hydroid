@@ -1,0 +1,513 @@
+//! From facts to diagnostics.
+//!
+//! Where code runs is a property of the *call*, not of the function: a sync function runs on the
+//! event loop when called from code on the loop, and in a worker thread when handed to
+//! `asyncio.to_thread`. So "does calling `f` block?" has one answer per function, computed once
+//! by a breadth-first search backwards from blocking calls (shortest witness chains, O(V+E), no
+//! recursion, any depth). Diagnostics are the call sites inside loop code (`async def` bodies and
+//! callbacks scheduled on the loop) whose callee blocks.
+
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+
+use crate::catalog::Catalog;
+use crate::facts::{Call, ClassId, Facts, FnId, FunctionKind, Origin, Slot, Value};
+use crate::report::{Diagnostic, Frame, ReachedFrom, Report, Unresolved};
+
+pub fn analyze(facts: &Facts, catalog: &Catalog) -> Report {
+    let graph = Graph::new(facts, catalog);
+    let blocking = graph.blocking_distances();
+    let roots = graph.roots();
+    let context = graph.entry_paths();
+
+    let suppressed: HashSet<(&str, u32)> =
+        facts.suppressed.iter().map(|(p, l)| (p.as_str(), *l)).collect();
+    let mut diagnostics = Vec::new();
+    for &root in &roots {
+        let reached = context.path_to(root);
+        let root_fn = facts.function(root);
+        // Library code only matters when project code can reach it.
+        if root_fn.origin != Origin::Project && reached.is_none() {
+            continue;
+        }
+        for &call in &graph.calls_of[root.0 as usize] {
+            let Some(chain) = graph.blocking_chain(call, &blocking) else {
+                continue;
+            };
+            let c = &facts.calls[call];
+            if suppressed.contains(&(c.location.path.as_str(), c.location.line)) {
+                continue;
+            }
+            let sink_fn = chain.last().expect("chains are non-empty").callee.clone();
+            diagnostics.push(Diagnostic {
+                location: c.location.clone(),
+                function: root_fn.qualname.clone(),
+                sink: catalog.sink(&sink_fn).expect("chains end at a sink"),
+                chain,
+                reached_from: reached.clone(),
+            });
+        }
+    }
+    diagnostics.sort_by(|a, b| (&a.location, &a.sink.qualname).cmp(&(&b.location, &b.sink.qualname)));
+
+    let mut report = Report { diagnostics, unresolved: graph.unresolved(&roots), ..Report::default() };
+    report.stats.entry_points = context.entries;
+    report.stats.functions_analyzed = facts.functions.iter().filter(|f| f.analyzed).count();
+    report.stats.call_sites = facts.calls.len();
+    report.stats.call_sites_resolved = (0..facts.calls.len())
+        .filter(|&i| !graph.targets[i].is_empty() || facts.calls[i].param.is_some())
+        .count();
+    report
+}
+
+struct Graph<'a> {
+    facts: &'a Facts,
+    catalog: &'a Catalog,
+    /// Calls made by each function.
+    calls_of: Vec<Vec<usize>>,
+    /// Effective targets of each call: resolved targets, decorator wrappers, overrides in
+    /// subclasses, callables flowing into called parameters. Offload APIs are cut.
+    targets: Vec<Vec<FnId>>,
+    sink: Vec<bool>,
+}
+
+type ParamKey = (FnId, String);
+
+impl<'a> Graph<'a> {
+    fn new(facts: &'a Facts, catalog: &'a Catalog) -> Self {
+        let n = facts.functions.len();
+        let mut calls_of = vec![Vec::new(); n];
+        for (i, call) in facts.calls.iter().enumerate() {
+            calls_of[call.caller.0 as usize].push(i);
+        }
+        let sink = facts.functions.iter().map(|f| catalog.sink(&f.qualname).is_some()).collect();
+        let mut graph = Self { facts, catalog, calls_of, targets: Vec::new(), sink };
+        let nested = graph.nested_functions();
+        let params = graph.parameter_values(&nested);
+        let hierarchy = Hierarchy::new(facts);
+        graph.targets = facts
+            .calls
+            .iter()
+            .map(|call| graph.effective_targets(call, &nested, &params, &hierarchy))
+            .collect();
+        graph
+    }
+
+    fn is_offload(&self, f: FnId) -> bool {
+        self.catalog.is_offload(&self.facts.function(f).qualname)
+    }
+
+    /// Functions defined (at any depth) inside each function.
+    fn nested_functions(&self) -> Vec<Vec<FnId>> {
+        let mut nested = vec![Vec::new(); self.facts.functions.len()];
+        for (i, f) in self.facts.functions.iter().enumerate() {
+            let mut parent = f.parent;
+            while let Some(p) = parent {
+                nested[p.0 as usize].push(FnId(i as u32));
+                parent = self.facts.function(p).parent;
+            }
+        }
+        nested
+    }
+
+    /// The parameters a flow into `into` at `slot` lands on. A decorated function lands on the
+    /// first parameter of the decorator and of every function nested in it (decorator factories).
+    fn slot_params(&self, into: FnId, slot: &Slot, nested: &[Vec<FnId>]) -> Vec<ParamKey> {
+        match slot {
+            Slot::Param(name) => vec![(into, name.clone())],
+            Slot::Unknown => Vec::new(),
+            Slot::Decorated => std::iter::once(into)
+                .chain(nested[into.0 as usize].iter().copied())
+                .filter_map(|owner| {
+                    let f = self.facts.function(owner);
+                    let first = f.params.iter().find(|p| *p != "self" && *p != "cls")?;
+                    Some((owner, first.clone()))
+                })
+                .collect(),
+        }
+    }
+
+    /// Which functions each parameter can hold, to a fixpoint over forwarded parameters.
+    fn parameter_values(&self, nested: &[Vec<FnId>]) -> HashMap<ParamKey, BTreeSet<FnId>> {
+        let mut values: HashMap<ParamKey, BTreeSet<FnId>> = HashMap::new();
+        let mut forwards: HashMap<ParamKey, Vec<ParamKey>> = HashMap::new();
+        for flow in &self.facts.flows {
+            if self.is_offload(flow.into) {
+                continue;
+            }
+            for key in self.slot_params(flow.into, &flow.slot, nested) {
+                match &flow.value {
+                    Value::Function(f) => {
+                        values.entry(key).or_default().insert(*f);
+                    }
+                    Value::Param(owner, name) => {
+                        forwards.entry((*owner, name.clone())).or_default().push(key);
+                    }
+                    Value::Class(_) => {}
+                }
+            }
+        }
+        let mut queue: VecDeque<ParamKey> = values.keys().cloned().collect();
+        while let Some(from) = queue.pop_front() {
+            let Some(targets) = forwards.get(&from) else { continue };
+            let incoming = values[&from].clone();
+            for to in targets {
+                let slot = values.entry(to.clone()).or_default();
+                let before = slot.len();
+                slot.extend(&incoming);
+                if slot.len() != before {
+                    queue.push_back(to.clone());
+                }
+            }
+        }
+        values
+    }
+
+    fn effective_targets(
+        &self,
+        call: &Call,
+        nested: &[Vec<FnId>],
+        params: &HashMap<ParamKey, BTreeSet<FnId>>,
+        hierarchy: &Hierarchy,
+    ) -> Vec<FnId> {
+        let mut out = BTreeSet::new();
+        for &t in &call.targets {
+            // Calling a function decorated by project code runs the decorator's wrapper, which
+            // reaches the original through the decorator's parameter.
+            let wrappers: Vec<FnId> = self
+                .facts
+                .function(t)
+                .decorators
+                .iter()
+                .filter(|d| self.facts.function(**d).analyzed)
+                .flat_map(|d| nested[d.0 as usize].iter().copied())
+                .collect();
+            if wrappers.is_empty() {
+                out.insert(t);
+            } else {
+                out.extend(wrappers);
+            }
+            if call.virtual_dispatch {
+                out.extend(hierarchy.overrides(self.facts, t));
+            }
+        }
+        if let Some(key) = &call.param
+            && let Some(values) = params.get(key)
+        {
+            out.extend(values);
+        }
+        out.into_iter().filter(|&t| !self.is_offload(t)).collect()
+    }
+
+    /// Loop code: every analyzed `async def`, plus sync callables scheduled on the loop.
+    fn roots(&self) -> Vec<FnId> {
+        let mut roots: BTreeSet<FnId> = self
+            .facts
+            .functions
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.analyzed && f.is_async)
+            .map(|(i, _)| FnId(i as u32))
+            .collect();
+        for flow in &self.facts.flows {
+            if let Value::Function(f) = flow.value
+                && self.catalog.is_loop_callback(&self.facts.function(flow.into).qualname)
+                && self.facts.function(f).analyzed
+            {
+                roots.insert(f);
+            }
+        }
+        roots.into_iter().collect()
+    }
+
+    /// For each sync function that blocks when called: `(distance, next call, next function)`
+    /// on a shortest chain to a blocking function.
+    fn blocking_distances(&self) -> Vec<Option<(u32, usize, FnId)>> {
+        let n = self.facts.functions.len();
+        let mut next: Vec<Option<(u32, usize, FnId)>> = vec![None; n];
+        let mut callers_of: Vec<Vec<(FnId, usize)>> = vec![Vec::new(); n];
+        let mut queue = VecDeque::new();
+        for (i, call) in self.facts.calls.iter().enumerate() {
+            let caller = self.facts.function(call.caller);
+            if caller.is_async || self.sink[call.caller.0 as usize] {
+                continue;
+            }
+            for &t in &self.targets[i] {
+                if self.sink[t.0 as usize] {
+                    if !call.awaited && next[call.caller.0 as usize].is_none() {
+                        next[call.caller.0 as usize] = Some((1, i, t));
+                        queue.push_back(call.caller);
+                    }
+                } else if !self.facts.function(t).is_async {
+                    callers_of[t.0 as usize].push((call.caller, i));
+                }
+            }
+        }
+        while let Some(f) = queue.pop_front() {
+            let (d, _, _) = next[f.0 as usize].expect("queued functions have a distance");
+            for &(caller, call) in &callers_of[f.0 as usize] {
+                if next[caller.0 as usize].is_none() {
+                    next[caller.0 as usize] = Some((d + 1, call, f));
+                    queue.push_back(caller);
+                }
+            }
+        }
+        next
+    }
+
+    /// The shortest blocking chain starting at `call`, if the call blocks.
+    fn blocking_chain(&self, call: usize, next: &[Option<(u32, usize, FnId)>]) -> Option<Vec<Frame>> {
+        let c = &self.facts.calls[call];
+        let best = self.targets[call]
+            .iter()
+            .filter_map(|&t| {
+                if self.sink[t.0 as usize] {
+                    (!c.awaited).then_some((0, t))
+                } else if self.facts.function(t).is_async {
+                    None
+                } else {
+                    next[t.0 as usize].map(|(d, _, _)| (d, t))
+                }
+            })
+            .min()?;
+        let mut chain = vec![self.frame(call, best.1)];
+        let mut current = best.1;
+        while !self.sink[current.0 as usize] {
+            let (_, call, target) = next[current.0 as usize].expect("blocking functions chain to a sink");
+            chain.push(self.frame(call, target));
+            current = target;
+        }
+        Some(chain)
+    }
+
+    fn frame(&self, call: usize, target: FnId) -> Frame {
+        let c = &self.facts.calls[call];
+        Frame {
+            location: c.location.clone(),
+            text: c.text.clone(),
+            callee: self.facts.function(target).qualname.clone(),
+        }
+    }
+
+    /// Whether `target` runs on the same thread as `caller` when called (a sync function calling
+    /// an `async def` only creates a coroutine).
+    fn runs_inline(&self, caller: FnId, target: FnId) -> bool {
+        self.facts.function(caller).is_async || !self.facts.function(target).is_async
+    }
+
+    /// Shortest paths from FastAPI entry points (and, as a fallback, from project `async def`s)
+    /// to every function they reach.
+    fn entry_paths(&self) -> EntryPaths<'_> {
+        let mut entries: Vec<(FnId, String)> = Vec::new();
+        for flow in &self.facts.flows {
+            let into = &self.facts.function(flow.into).qualname;
+            let Some(kind) = self.catalog.entry_kind(into) else { continue };
+            let label = entry_label(kind, into, flow);
+            match flow.value {
+                Value::Function(f) => entries.push((f, label)),
+                Value::Class(class) => {
+                    for method in ["dispatch", "__call__"] {
+                        if let Some(m) = Hierarchy::lookup(self.facts, class, method) {
+                            entries.push((m, format!("{label} ({method})")));
+                        }
+                    }
+                }
+                Value::Param(..) => {}
+            }
+        }
+        let project_async = self
+            .facts
+            .functions
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.analyzed && f.is_async && f.origin == Origin::Project)
+            .map(|(i, f)| (FnId(i as u32), f.qualname.clone()));
+        let count = entries.len();
+        let from_entries = self.bfs(entries);
+        let from_project = self.bfs(project_async.collect());
+        EntryPaths { graph: self, from_entries, from_project, entries: count }
+    }
+
+    fn bfs(&self, sources: Vec<(FnId, String)>) -> Vec<Option<Reach>> {
+        let mut reach: Vec<Option<Reach>> = vec![None; self.facts.functions.len()];
+        let mut queue = VecDeque::new();
+        for (f, label) in sources {
+            if reach[f.0 as usize].is_none() {
+                reach[f.0 as usize] = Some(Reach::Entry(label));
+                queue.push_back(f);
+            }
+        }
+        while let Some(f) = queue.pop_front() {
+            for &call in &self.calls_of[f.0 as usize] {
+                for &t in &self.targets[call] {
+                    if reach[t.0 as usize].is_none() && self.runs_inline(f, t) {
+                        reach[t.0 as usize] = Some(Reach::Via(f, call));
+                        queue.push_back(t);
+                    }
+                }
+            }
+        }
+        reach
+    }
+
+    /// Calls on the event loop whose target is unknown, in project code.
+    fn unresolved(&self, roots: &[FnId]) -> Vec<Unresolved> {
+        let mut on_loop: Vec<bool> = vec![false; self.facts.functions.len()];
+        let mut queue: VecDeque<FnId> = roots.iter().copied().collect();
+        for r in roots {
+            on_loop[r.0 as usize] = true;
+        }
+        while let Some(f) = queue.pop_front() {
+            for &call in &self.calls_of[f.0 as usize] {
+                for &t in &self.targets[call] {
+                    let target = self.facts.function(t);
+                    if !on_loop[t.0 as usize] && !target.is_async && !self.sink[t.0 as usize] {
+                        on_loop[t.0 as usize] = true;
+                        queue.push_back(t);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (i, call) in self.facts.calls.iter().enumerate() {
+            let caller = self.facts.function(call.caller);
+            if !on_loop[call.caller.0 as usize] || caller.origin != Origin::Project || !self.targets[i].is_empty() {
+                continue;
+            }
+            let reason = match (&call.param, &call.unresolved) {
+                (Some((_, name)), _) => format!("parameter `{name}` receives no known callable"),
+                (None, Some(reason)) => reason.clone(),
+                // Resolved, but only to offload APIs.
+                (None, None) => continue,
+            };
+            out.push(Unresolved {
+                location: call.location.clone(),
+                function: caller.qualname.clone(),
+                text: call.text.clone(),
+                reason,
+            });
+        }
+        out
+    }
+}
+
+fn entry_label(kind: &str, into: &str, flow: &crate::facts::Flow) -> String {
+    let method = into.rsplit('.').next().unwrap_or_default();
+    let detail = match (kind, method) {
+        ("route", "get" | "put" | "post" | "delete" | "options" | "head" | "patch" | "trace") => {
+            Some(method.to_uppercase())
+        }
+        ("lifecycle", _) => match &flow.slot {
+            Slot::Param(p) => Some(p.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    [Some(kind.to_string()), detail, flow.literal.clone()].into_iter().flatten().collect::<Vec<_>>().join(" ")
+}
+
+#[derive(Clone)]
+enum Reach {
+    Entry(String),
+    Via(FnId, usize),
+}
+
+struct EntryPaths<'a> {
+    graph: &'a Graph<'a>,
+    from_entries: Vec<Option<Reach>>,
+    from_project: Vec<Option<Reach>>,
+    entries: usize,
+}
+
+impl EntryPaths<'_> {
+    fn path_to(&self, f: FnId) -> Option<ReachedFrom> {
+        let reach = if self.from_entries[f.0 as usize].is_some() {
+            &self.from_entries
+        } else if self.from_project[f.0 as usize].is_some() {
+            &self.from_project
+        } else {
+            return None;
+        };
+        let mut frames = Vec::new();
+        let mut current = f;
+        loop {
+            match reach[current.0 as usize].as_ref().expect("reached") {
+                Reach::Via(prev, call) => {
+                    frames.push(self.graph.frame(*call, current));
+                    current = *prev;
+                }
+                Reach::Entry(label) => {
+                    frames.reverse();
+                    let entry = self.graph.facts.function(current);
+                    return Some(ReachedFrom {
+                        entry: if entry.kind == FunctionKind::Module { label.clone() } else { format!("{label}: {}", entry.qualname) },
+                        location: entry.location.clone(),
+                        frames,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Class hierarchy analysis: which methods may run for `obj.method()`.
+struct Hierarchy {
+    subclasses: Vec<Vec<ClassId>>,
+}
+
+impl Hierarchy {
+    fn new(facts: &Facts) -> Self {
+        let mut subclasses = vec![Vec::new(); facts.classes.len()];
+        for (i, class) in facts.classes.iter().enumerate() {
+            for base in &class.bases {
+                subclasses[base.0 as usize].push(ClassId(i as u32));
+            }
+        }
+        Self { subclasses }
+    }
+
+    /// Methods overriding `method` in subclasses of its class; for protocols, the same-named
+    /// methods of every class that defines all of the protocol's methods.
+    fn overrides(&self, facts: &Facts, method: FnId) -> Vec<FnId> {
+        let Some(class) = facts.function(method).class else { return Vec::new() };
+        let Some(name) = facts.class(class).methods.iter().find(|(_, m)| *m == method).map(|(n, _)| n)
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut seen = HashSet::from([class]);
+        let mut queue = VecDeque::from([class]);
+        while let Some(c) = queue.pop_front() {
+            for &sub in &self.subclasses[c.0 as usize] {
+                if seen.insert(sub) {
+                    out.extend(facts.class(sub).methods.iter().filter(|(n, _)| n == name).map(|(_, m)| *m));
+                    queue.push_back(sub);
+                }
+            }
+        }
+        let protocol = facts.class(class);
+        if protocol.is_protocol {
+            let required: Vec<&String> = protocol.methods.iter().map(|(n, _)| n).collect();
+            for implementer in facts.classes.iter().filter(|c| !c.is_protocol) {
+                let defines = |n: &String| implementer.methods.iter().any(|(m, _)| m == n);
+                if required.iter().all(|n| defines(n)) {
+                    out.extend(implementer.methods.iter().filter(|(n, _)| n == name).map(|(_, m)| *m));
+                }
+            }
+        }
+        out
+    }
+
+    /// `class.name` through the bases (breadth-first approximation of the MRO).
+    fn lookup(facts: &Facts, class: ClassId, name: &str) -> Option<FnId> {
+        let mut seen = HashSet::from([class]);
+        let mut queue = VecDeque::from([class]);
+        while let Some(c) = queue.pop_front() {
+            let cls = facts.class(c);
+            if let Some((_, m)) = cls.methods.iter().find(|(n, _)| n == name) {
+                return Some(*m);
+            }
+            queue.extend(cls.bases.iter().filter(|b| seen.insert(**b)));
+        }
+        None
+    }
+}
