@@ -1,0 +1,14 @@
+[package]
+name = "hydroid_core"
+description = "Call-graph analysis and blocking-call catalog for hydroid (no dependency on ty)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }

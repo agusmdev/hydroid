@@ -1,0 +1,21 @@
+# One shared, locked environment with real third-party libraries for every fixture case.
+# Tests run `uv sync --frozen` here before analyzing `cases/*`.
+[project]
+name = "hydroid-fixtures"
+version = "0"
+requires-python = ">=3.13"
+dependencies = [
+    "anyio",
+    "bcrypt",
+    "fastapi",
+    "httpx",
+    "pymysql",
+    "redis",
+    "requests",
+    "sqlalchemy",
+    "sqlmodel",
+    "tenacity",
+]
+
+[tool.uv]
+package = false

@@ -16,3 +16,8 @@ build/
 .DS_Store
 .idea/
 .vscode/
+
+# Rust / Python
+target/
+.venv/
+__pycache__/

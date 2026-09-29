@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/agusmdev/event-loop-checker"
+
+[workspace.dependencies]
+hydroid_core = { path = "crates/hydroid_core" }
+hydroid_ty = { path = "crates/hydroid_ty" }
+
+# ty's crates are published with every ruff release and carry no API stability promise:
+# pin exact versions and bump them together.
+ruff_db = { version = "=0.0.15", features = ["os"] }
+ruff_python_ast = "=0.0.15"
+ruff_text_size = "=0.0.15"
+ruff_source_file = "=0.0.15"
+ty_module_resolver = "=0.0.15"
+ty_python_core = "=0.0.15"
+ty_python_semantic = "=0.0.15"
+ty_site_packages = "=0.0.15"
+ty_vendored = "=0.0.15"
+salsa = { version = "0.28.5", default-features = false, features = ["compact_str", "macros", "salsa_unstable", "inventory"] }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+parking_lot = "0.12"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

@@ -1,0 +1,16 @@
+[package]
+name = "hydroid"
+description = "Finds blocking calls reachable on the event loop in async FastAPI code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+hydroid_core = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+ignore = "0.4"
