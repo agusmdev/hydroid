@@ -1,0 +1,11 @@
+# A third-party library stand-in: installed (not editable) into the fixture venv's
+# site-packages, so hydroid treats it exactly like any dependency.
+[project]
+name = "slowlib"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = ["requests"]
+
+[build-system]
+requires = ["uv_build>=0.8,<1"]
+build-backend = "uv_build"

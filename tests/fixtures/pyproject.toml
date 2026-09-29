@@ -12,6 +12,7 @@ dependencies = [
     "pymysql",
     "redis",
     "requests",
+    "slowlib",
     "sqlalchemy",
     "sqlmodel",
     "tenacity",
@@ -19,3 +20,6 @@ dependencies = [
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+slowlib = { path = "libs/slowlib", editable = false }

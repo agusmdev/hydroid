@@ -23,30 +23,43 @@ pub fn analyze(facts: &Facts, catalog: &Catalog) -> Report {
         facts.suppressed.iter().map(|(p, l)| (p.as_str(), *l)).collect();
     let mut diagnostics = Vec::new();
     for &root in &roots {
-        let reached = context.path_to(root);
         let root_fn = facts.function(root);
-        // Library code only matters when project code can reach it.
-        if root_fn.origin != Origin::Project && reached.is_none() {
-            continue;
-        }
+        let steps = context.steps_to(root);
+        // Diagnostics land in project code: blocking inside a library coroutine is reported where
+        // project code enters the library, with the path into the library prepended to the chain.
+        let (function, entered_at, prefix, reached) = if root_fn.origin == Origin::Project {
+            let reached = steps.as_ref().map(|s| context.reached_from(s, s.steps.len()));
+            (root_fn.qualname.clone(), None, Vec::new(), reached)
+        } else {
+            let Some(s) = steps else { continue };
+            let Some(cut) = s.steps.iter().rposition(|(caller, _, _)| facts.function(*caller).origin == Origin::Project)
+            else {
+                continue;
+            };
+            let (caller, call, _) = s.steps[cut];
+            let prefix = s.steps[cut..].iter().map(|&(_, call, target)| graph.frame(call, target)).collect();
+            let reached = (s.entry_is_project_entry()).then(|| context.reached_from(&s, cut));
+            (facts.function(caller).qualname.clone(), Some(call), prefix, reached)
+        };
         for &call in &graph.calls_of[root.0 as usize] {
             let Some((chain, sink)) = graph.blocking_chain(call, &blocking) else {
                 continue;
             };
-            let c = &facts.calls[call];
-            if suppressed.contains(&(c.location.path.as_str(), c.location.line)) {
+            let location = &facts.calls[entered_at.unwrap_or(call)].location;
+            if suppressed.contains(&(location.path.as_str(), location.line)) {
                 continue;
             }
             diagnostics.push(Diagnostic {
-                location: c.location.clone(),
-                function: root_fn.qualname.clone(),
+                location: location.clone(),
+                function: function.clone(),
                 sink,
-                chain,
+                chain: prefix.iter().cloned().chain(chain).collect(),
                 reached_from: reached.clone(),
             });
         }
     }
     diagnostics.sort_by(|a, b| (&a.location, &a.sink.qualname).cmp(&(&b.location, &b.sink.qualname)));
+    diagnostics.dedup_by(|a, b| a.location == b.location && a.sink.qualname == b.sink.qualname);
 
     let mut report = Report { diagnostics, unresolved: graph.unresolved(&roots), ..Report::default() };
     report.stats.entry_points = context.entries;
@@ -489,37 +502,57 @@ struct EntryPaths<'a> {
     entries: usize,
 }
 
+/// A shortest path from an entry point (or project code) to a function.
+struct Steps {
+    label: Option<String>,
+    entry: FnId,
+    /// `(caller, call, callee)`, from the entry onwards.
+    steps: Vec<(FnId, usize, FnId)>,
+}
+
+impl Steps {
+    fn entry_is_project_entry(&self) -> bool {
+        self.label.is_some()
+    }
+}
+
 impl EntryPaths<'_> {
     /// How entry points reach `f`. Library functions no entry point reaches are attributed to
-    /// the project code that reaches them.
-    fn path_to(&self, f: FnId) -> Option<ReachedFrom> {
-        let reach = if self.from_entries[f.0 as usize].is_some() {
-            &self.from_entries
+    /// the project code that reaches them (`label` is then `None`).
+    fn steps_to(&self, f: FnId) -> Option<Steps> {
+        let (reach, from_entry) = if self.from_entries[f.0 as usize].is_some() {
+            (&self.from_entries, true)
         } else if self.graph.facts.function(f).origin != Origin::Project
             && self.from_project[f.0 as usize].is_some()
         {
-            &self.from_project
+            (&self.from_project, false)
         } else {
             return None;
         };
-        let mut frames = Vec::new();
+        let mut steps = Vec::new();
         let mut current = f;
         loop {
             match reach[current.0 as usize].as_ref().expect("reached") {
                 Reach::Via(prev, call) => {
-                    frames.push(self.graph.frame(*call, current));
+                    steps.push((*prev, *call, current));
                     current = *prev;
                 }
                 Reach::Entry(label) => {
-                    frames.reverse();
-                    let entry = self.graph.facts.function(current);
-                    return Some(ReachedFrom {
-                        entry: if entry.kind == FunctionKind::Module { label.clone() } else { format!("{label}: {}", entry.qualname) },
-                        location: entry.location.clone(),
-                        frames,
-                    });
+                    steps.reverse();
+                    return Some(Steps { label: from_entry.then(|| label.clone()), entry: current, steps });
                 }
             }
+        }
+    }
+
+    /// The first `upto` steps of a path from an entry point.
+    fn reached_from(&self, steps: &Steps, upto: usize) -> ReachedFrom {
+        let entry = self.graph.facts.function(steps.entry);
+        let label = steps.label.clone().unwrap_or_default();
+        ReachedFrom {
+            entry: if entry.kind == FunctionKind::Module { label } else { format!("{label}: {}", entry.qualname) },
+            location: entry.location.clone(),
+            frames: steps.steps[..upto].iter().map(|&(_, call, target)| self.graph.frame(call, target)).collect(),
         }
     }
 }
