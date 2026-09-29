@@ -10,28 +10,13 @@
 //! real against a locked virtualenv (`tests/fixtures/uv.lock`) — nothing is mocked.
 //! `HYDROID_CASE=<name>` runs a single case.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::LazyLock;
 
+use common::{FIXTURE_VENV, fixtures_dir};
 use hydroid::Options;
-
-fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures").canonicalize().unwrap()
-}
-
-/// The shared locked virtualenv, synced once per test binary.
-static FIXTURE_VENV: LazyLock<PathBuf> = LazyLock::new(|| {
-    let dir = fixtures_dir();
-    let status = Command::new("uv")
-        .args(["sync", "--frozen", "--quiet"])
-        .current_dir(&dir)
-        .status()
-        .expect("`uv` must be installed to run the fixture tests");
-    assert!(status.success(), "uv sync failed in {}", dir.display());
-    dir.join(".venv")
-});
 
 #[derive(Default)]
 struct CaseConfig {
