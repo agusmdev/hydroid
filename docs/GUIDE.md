@@ -5,33 +5,31 @@ hydroid finds code that blocks the asyncio event loop in FastAPI apps: a `time.s
 
 ## 1. Install
 
-You need [uv](https://docs.astral.sh/uv/getting-started/installation/) and, for now, a Rust
-toolchain (`curl https://sh.rustup.rs -sSf | sh`): uv builds hydroid from source the first time,
-which takes about a minute, then reuses the cached build.
+You need [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
-Run it without installing:
-
-```sh
-uvx --from git+https://github.com/agusmdev/hydroid hydroid .
-```
-
-Or install the `hydroid` command permanently:
-
-```sh
-uv tool install git+https://github.com/agusmdev/hydroid
-hydroid .
-uv tool upgrade hydroid-cli        # later, to get new versions
-```
-
-Pin a version with `git+https://github.com/agusmdev/hydroid@v0.1.0`.
-
-Once a release is tagged, prebuilt wheels (no Rust needed) are attached to it:
+**Prebuilt binaries** (macOS, Linux, Windows; no Rust needed), from the GitHub release:
 
 ```sh
 uvx --from hydroid-cli --find-links https://github.com/agusmdev/hydroid/releases/expanded_assets/v0.1.0 hydroid .
 ```
 
-From a clone, `cargo install --path crates/hydroid` also works.
+Install the `hydroid` command permanently the same way:
+
+```sh
+uv tool install hydroid-cli --find-links https://github.com/agusmdev/hydroid/releases/expanded_assets/v0.1.0
+hydroid .
+```
+
+**From source** (latest `main`; needs a Rust toolchain, `curl https://sh.rustup.rs -sSf | sh`;
+the first build takes about a minute, then it is cached):
+
+```sh
+uvx --from git+https://github.com/agusmdev/hydroid hydroid .
+uv tool install git+https://github.com/agusmdev/hydroid      # permanent
+```
+
+Pin a version with `git+https://github.com/agusmdev/hydroid@v0.1.0`. From a clone,
+`cargo install --path crates/hydroid` also works.
 
 ## 2. Prepare the project to check
 

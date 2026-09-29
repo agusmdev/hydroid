@@ -22,15 +22,22 @@ go-to-definition). Polar's server (1,845 files, 107k call sites) is analyzed in 
 
 ## Install and run
 
-With [uv](https://docs.astral.sh/uv/), straight from GitHub (builds once, then cached; needs a
-Rust toolchain until prebuilt wheels are published — see the [guide](docs/GUIDE.md#1-install)):
+With [uv](https://docs.astral.sh/uv/), using the prebuilt binaries of the latest release
+(macOS, Linux, Windows; no Rust needed):
+
+```sh
+uvx --from hydroid-cli --find-links https://github.com/agusmdev/hydroid/releases/expanded_assets/v0.1.0 hydroid .
+```
+
+Or straight from the source on `main` (builds once with a Rust toolchain, then cached):
 
 ```sh
 uvx --from git+https://github.com/agusmdev/hydroid hydroid .
 ```
 
-Or install it permanently: `uv tool install git+https://github.com/agusmdev/hydroid`, then
-`hydroid .` anywhere. From a clone: `cargo install --path crates/hydroid`.
+To install the `hydroid` command permanently, replace `uvx --from` with `uv tool install`
+(e.g. `uv tool install git+https://github.com/agusmdev/hydroid`), then run `hydroid .` anywhere.
+From a clone: `cargo install --path crates/hydroid`. More in the [guide](docs/GUIDE.md#1-install).
 
 ```sh
 hydroid path/to/project                 # finds .venv / VIRTUAL_ENV like ty
