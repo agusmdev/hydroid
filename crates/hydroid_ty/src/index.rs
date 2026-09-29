@@ -259,8 +259,16 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                         class,
                     },
                 );
+                // Decorators, defaults and annotations are evaluated in the enclosing scope.
+                for decorator in &def.decorator_list {
+                    self.visit_decorator(decorator);
+                }
+                self.visit_parameters(&def.parameters);
+                if let Some(returns) = &def.returns {
+                    self.visit_annotation(returns);
+                }
                 self.scopes.push((Scope::Function(key), qualname));
-                walk_stmt(self, stmt);
+                self.visit_body(&def.body);
                 self.scopes.pop();
             }
             Stmt::ClassDef(def) => {

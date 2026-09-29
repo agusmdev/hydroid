@@ -38,7 +38,7 @@ pub fn analyze(facts: &Facts, catalog: &Catalog) -> Report {
             };
             let (caller, call, _) = s.steps[cut];
             let prefix = s.steps[cut..].iter().map(|&(_, call, target)| graph.frame(call, target)).collect();
-            let reached = (s.entry_is_project_entry()).then(|| context.reached_from(&s, cut));
+            let reached = s.starts_at_entry_point().then(|| context.reached_from(&s, cut));
             (facts.function(caller).qualname.clone(), Some(call), prefix, reached)
         };
         for &call in &graph.calls_of[root.0 as usize] {
@@ -514,7 +514,8 @@ struct Steps {
 }
 
 impl Steps {
-    fn entry_is_project_entry(&self) -> bool {
+    /// Whether the path starts at a FastAPI entry point (not merely at project code).
+    fn starts_at_entry_point(&self) -> bool {
         self.label.is_some()
     }
 }

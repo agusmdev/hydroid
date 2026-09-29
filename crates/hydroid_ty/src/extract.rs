@@ -31,12 +31,14 @@ pub struct RawCall {
     pub property_access: bool,
 }
 
+#[derive(Clone)]
 pub enum RawSlot {
     Positional(usize),
     Keyword(String),
     Decorated,
 }
 
+#[derive(Clone)]
 pub enum RawValue {
     Function(Key),
     Class(Key),
@@ -325,23 +327,13 @@ impl<'db> Extractor<'_, 'db> {
         for (slot, argument) in arguments {
             let Some(value) = self.value_of(argument) else { continue };
             for &(into, bound) in &resolution.targets {
-                let slot = match &slot {
-                    RawSlot::Positional(i) => RawSlot::Positional(*i),
-                    RawSlot::Keyword(k) => RawSlot::Keyword(k.clone()),
-                    RawSlot::Decorated => RawSlot::Decorated,
-                };
-                let value = match &value {
-                    RawValue::Function(k) => RawValue::Function(*k),
-                    RawValue::Class(k) => RawValue::Class(*k),
-                    RawValue::Param(o, n) => RawValue::Param(*o, n.clone()),
-                };
                 self.out.flows.push(RawFlow {
                     caller: self.current,
                     location: location.clone(),
                     into,
                     bound,
-                    slot,
-                    value,
+                    slot: slot.clone(),
+                    value: value.clone(),
                     literal: literal.clone(),
                 });
             }
