@@ -573,13 +573,18 @@ impl Hierarchy {
         Self { subclasses }
     }
 
-    /// Methods overriding `method` in subclasses of its class; for protocols, the same-named
-    /// methods of every class that defines all of the protocol's methods.
+    /// Methods overriding `method` in subclasses of its class; for protocols defined in the
+    /// project, the same-named methods of every class that defines all of the protocol's methods.
+    /// Only analyzed methods count: stub-only classes (stdlib) are never dispatch targets, which
+    /// keeps generic protocols like `AbstractContextManager` from matching every lock.
     fn overrides(&self, facts: &Facts, method: FnId) -> Vec<FnId> {
         let Some(class) = facts.function(method).class else { return Vec::new() };
         let Some(name) = facts.class(class).methods.iter().find(|(_, m)| *m == method).map(|(n, _)| n)
         else {
             return Vec::new();
+        };
+        let named = |c: &crate::facts::Class| -> Vec<FnId> {
+            c.methods.iter().filter(|(n, m)| n == name && facts.function(*m).analyzed).map(|(_, m)| *m).collect()
         };
         let mut out = Vec::new();
         let mut seen = HashSet::from([class]);
@@ -587,18 +592,18 @@ impl Hierarchy {
         while let Some(c) = queue.pop_front() {
             for &sub in &self.subclasses[c.0 as usize] {
                 if seen.insert(sub) {
-                    out.extend(facts.class(sub).methods.iter().filter(|(n, _)| n == name).map(|(_, m)| *m));
+                    out.extend(named(facts.class(sub)));
                     queue.push_back(sub);
                 }
             }
         }
         let protocol = facts.class(class);
-        if protocol.is_protocol {
+        if protocol.is_protocol && facts.function(method).origin == Origin::Project {
             let required: Vec<&String> = protocol.methods.iter().map(|(n, _)| n).collect();
             for implementer in facts.classes.iter().filter(|c| !c.is_protocol) {
                 let defines = |n: &String| implementer.methods.iter().any(|(m, _)| m == n);
                 if required.iter().all(|n| defines(n)) {
-                    out.extend(implementer.methods.iter().filter(|(n, _)| n == name).map(|(_, m)| *m));
+                    out.extend(named(implementer));
                 }
             }
         }
