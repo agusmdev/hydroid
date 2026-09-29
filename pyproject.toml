@@ -1,0 +1,37 @@
+# Packages the `hydroid` binary as a Python wheel (like ruff and ty), so it runs with uv:
+#   uvx --from git+https://github.com/agusmdev/hydroid hydroid .
+# `hydroid` is taken on PyPI by an unrelated project; the distribution is `hydroid-cli`,
+# the command is `hydroid`.
+[project]
+name = "hydroid-cli"
+description = "Finds blocking calls reachable on the event loop in async FastAPI code."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.9"
+keywords = ["fastapi", "asyncio", "static-analysis", "linter", "event-loop"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Framework :: FastAPI",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/agusmdev/hydroid"
+Documentation = "https://github.com/agusmdev/hydroid/blob/main/docs/GUIDE.md"
+
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "crates/hydroid/Cargo.toml"
+module-name = "hydroid"
+strip = true
+exclude = ["tests/**", "scripts/**", "target/**"]

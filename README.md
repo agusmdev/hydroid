@@ -20,12 +20,21 @@ error[blocking-http]: `requests.api.get` blocks the event loop
 Written in Rust on top of [ty](https://github.com/astral-sh/ty)'s semantic model (types, imports,
 go-to-definition). Polar's server (1,845 files, 107k call sites) is analyzed in ~2.5 s.
 
-## Usage
+## Install and run
+
+With [uv](https://docs.astral.sh/uv/), straight from GitHub (builds once, then cached; needs a
+Rust toolchain until prebuilt wheels are published — see the [guide](docs/GUIDE.md#1-install)):
 
 ```sh
-cargo build --release
-target/release/hydroid path/to/project            # finds .venv / VIRTUAL_ENV like ty
-target/release/hydroid . --python .venv --format sarif > hydroid.sarif
+uvx --from git+https://github.com/agusmdev/hydroid hydroid .
+```
+
+Or install it permanently: `uv tool install git+https://github.com/agusmdev/hydroid`, then
+`hydroid .` anywhere. From a clone: `cargo install --path crates/hydroid`.
+
+```sh
+hydroid path/to/project                 # finds .venv / VIRTUAL_ENV like ty
+hydroid . --python .venv --format sarif > hydroid.sarif
 ```
 
 | Flag | |
