@@ -10,7 +10,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::catalog::Catalog;
-use crate::facts::{Call, ClassId, Facts, FnId, FunctionKind, Origin, Slot, Value};
+use crate::facts::{Call, ClassId, Facts, FnId, Flow, FunctionKind, Location, Origin, Slot, Value};
 use crate::report::{Diagnostic, Frame, ReachedFrom, Report, Unresolved};
 
 pub fn analyze(facts: &Facts, catalog: &Catalog) -> Report {
@@ -68,6 +68,8 @@ struct Graph<'a> {
     /// subclasses, callables flowing into called parameters. Offload APIs are cut.
     targets: Vec<Vec<FnId>>,
     sink: Vec<bool>,
+    /// See [`Graph::called_params`].
+    called: HashSet<ParamKey>,
 }
 
 type ParamKey = (FnId, String);
@@ -80,14 +82,23 @@ impl<'a> Graph<'a> {
             calls_of[call.caller.0 as usize].push(i);
         }
         let sink = facts.functions.iter().map(|f| catalog.sink(&f.qualname).is_some()).collect();
-        let mut graph = Self { facts, catalog, calls_of, targets: Vec::new(), sink };
+        let mut graph = Self { facts, catalog, calls_of, targets: Vec::new(), sink, called: HashSet::new() };
         let nested = graph.nested_functions();
         let params = graph.parameter_values(&nested);
+        graph.called = graph.called_params();
+        let called = &graph.called;
         let hierarchy = Hierarchy::new(facts);
+        let mut flows_at: HashMap<(FnId, &Location), Vec<&Flow>> = HashMap::new();
+        for flow in &facts.flows {
+            flows_at.entry((flow.caller, &flow.location)).or_default().push(flow);
+        }
         graph.targets = facts
             .calls
             .iter()
-            .map(|call| graph.effective_targets(call, &nested, &params, &hierarchy))
+            .map(|call| {
+                let flows = flows_at.get(&(call.caller, &call.location)).map_or(&[][..], |f| &f[..]);
+                graph.effective_targets(call, flows, &nested, &params, called, &hierarchy)
+            })
             .collect();
         graph
     }
@@ -162,11 +173,42 @@ impl<'a> Graph<'a> {
         values
     }
 
+    /// Parameters of sync functions that the function itself ends up calling during the call:
+    /// directly, or by forwarding them to such a parameter of another function. Callables passed
+    /// there run as part of that call, so they are attributed to the call site that passes them
+    /// (keeping `apply(blocking, x)` and `apply(abs, x)` apart).
+    fn called_params(&self) -> HashSet<ParamKey> {
+        let direct = |owner: FnId, caller: FnId| owner == caller && !self.facts.function(owner).is_async;
+        let mut called: HashSet<ParamKey> = self
+            .facts
+            .calls
+            .iter()
+            .filter_map(|c| c.param.as_ref().filter(|(owner, _)| direct(*owner, c.caller)).cloned())
+            .collect();
+        loop {
+            let before = called.len();
+            for flow in &self.facts.flows {
+                if let (Value::Param(owner, name), Slot::Param(slot)) = (&flow.value, &flow.slot)
+                    && direct(*owner, flow.caller)
+                    && !self.is_offload(flow.into)
+                    && called.contains(&(flow.into, slot.clone()))
+                {
+                    called.insert((*owner, name.clone()));
+                }
+            }
+            if called.len() == before {
+                return called;
+            }
+        }
+    }
+
     fn effective_targets(
         &self,
         call: &Call,
+        flows: &[&Flow],
         nested: &[Vec<FnId>],
         params: &HashMap<ParamKey, BTreeSet<FnId>>,
+        called: &HashSet<ParamKey>,
         hierarchy: &Hierarchy,
     ) -> Vec<FnId> {
         let mut out = BTreeSet::new();
@@ -190,7 +232,20 @@ impl<'a> Graph<'a> {
                 out.extend(hierarchy.overrides(self.facts, t));
             }
         }
+        // Callables passed here that the callee calls during this call.
+        for flow in flows {
+            if let (Value::Function(f), Slot::Param(slot)) = (&flow.value, &flow.slot)
+                && called.contains(&(flow.into, slot.clone()))
+                && !self.is_offload(flow.into)
+            {
+                out.insert(*f);
+            }
+        }
+        // A called parameter: closures (decorator wrappers) and `async def`s see every callable
+        // flowing into it; sync functions calling their own parameter are handled above, at the
+        // call sites passing the callable.
         if let Some(key) = &call.param
+            && !called.contains(key)
             && let Some(values) = params.get(key)
         {
             out.extend(values);
@@ -371,6 +426,10 @@ impl<'a> Graph<'a> {
         for (i, call) in self.facts.calls.iter().enumerate() {
             let caller = self.facts.function(call.caller);
             if !on_loop[call.caller.0 as usize] || caller.origin != Origin::Project || !self.targets[i].is_empty() {
+                continue;
+            }
+            // Resolved at the call sites passing the callable.
+            if call.param.as_ref().is_some_and(|k| self.called.contains(k)) {
                 continue;
             }
             let reason = match (&call.param, &call.unresolved) {
