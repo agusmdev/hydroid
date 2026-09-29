@@ -36,6 +36,8 @@ pub struct ExtractOptions<'a> {
     /// those for which `follow` returns `false` (catalog functions).
     pub follow_libs: bool,
     pub follow: &'a (dyn Fn(&str) -> bool + Sync),
+    /// Gitignore-style globs, relative to `root`, of project files to skip.
+    pub exclude: &'a [String],
 }
 
 fn system_path(path: &Path) -> anyhow::Result<SystemPathBuf> {
@@ -78,7 +80,7 @@ pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
     let root = system_path(options.root)?;
     let python = options.python.map(python_path).transpose()?;
     let db = HydroidDb::new(&root, python.as_deref())?;
-    let files = project_files(&db, &root)?;
+    let files = project_files(&db, &root, options.exclude)?;
 
     let indexes = Indexes::default();
     let mut merger = Merger::new(&db, &indexes);
@@ -103,10 +105,14 @@ pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
     Ok(Extraction { facts: merger.finish(), files: files.len() })
 }
 
-fn project_files(db: &HydroidDb, root: &SystemPath) -> anyhow::Result<Vec<File>> {
+fn project_files(db: &HydroidDb, root: &SystemPath, exclude: &[String]) -> anyhow::Result<Vec<File>> {
     let site_packages = &db.layout().site_packages;
+    let mut overrides = ignore::overrides::OverrideBuilder::new(root.as_std_path());
+    for glob in exclude {
+        overrides.add(&format!("!{glob}")).with_context(|| format!("invalid exclude glob `{glob}`"))?;
+    }
     let mut files = Vec::new();
-    for entry in ignore::WalkBuilder::new(root.as_std_path()).build() {
+    for entry in ignore::WalkBuilder::new(root.as_std_path()).overrides(overrides.build()?).build() {
         let entry = entry?;
         let path = entry.path();
         if path.extension().is_none_or(|e| e != "py") || !entry.file_type().is_some_and(|t| t.is_file()) {

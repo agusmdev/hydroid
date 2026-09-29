@@ -1,3 +1,4 @@
+pub mod config;
 pub mod render;
 
 use std::path::PathBuf;
@@ -15,10 +16,12 @@ pub struct Options {
     pub python: Option<PathBuf>,
     /// Analyze third-party function bodies too.
     pub follow_libs: bool,
-    /// Report CPU-bound calls (hashing, KDFs).
+    /// Report CPU-bound calls (hashing, key derivation).
     pub cpu: bool,
     /// Extra catalog documents (same schema as the builtin catalog).
     pub catalogs: Vec<String>,
+    /// Gitignore-style globs of project files to skip, relative to `root`.
+    pub exclude: Vec<String>,
 }
 
 pub fn check(options: &Options) -> anyhow::Result<Report> {
@@ -33,6 +36,7 @@ pub fn check(options: &Options) -> anyhow::Result<Report> {
         python: options.python.as_deref(),
         follow_libs: options.follow_libs,
         follow: &follow,
+        exclude: &options.exclude,
     })?;
     let extracted = Instant::now();
     let mut report = analyze(&extraction.facts, &catalog);

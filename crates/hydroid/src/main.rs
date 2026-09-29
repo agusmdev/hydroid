@@ -2,9 +2,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
+use hydroid::config::Config;
 use hydroid::{Options, check, render};
 
 /// Finds blocking calls reachable on the event loop in async FastAPI code.
+///
+/// Options also read from `[tool.hydroid]` in `<PATH>/pyproject.toml`; flags take precedence.
+/// Exit status: 0 clean, 1 blocking calls found (or unresolved calls with --strict), 2 error.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
@@ -23,6 +27,9 @@ struct Cli {
     /// Report calls on the event loop that could not be resolved, and fail on them.
     #[arg(long)]
     strict: bool,
+    /// Gitignore-style glob of files to skip (repeatable).
+    #[arg(long)]
+    exclude: Vec<String>,
     #[arg(long, value_enum, default_value_t = Format::Human)]
     format: Format,
 }
@@ -31,28 +38,34 @@ struct Cli {
 enum Format {
     Human,
     Json,
+    Sarif,
+}
+
+fn run(cli: Cli) -> anyhow::Result<ExitCode> {
+    let config = Config::load(&cli.path)?;
+    let catalogs = config.catalog_document().into_iter().collect();
+    let strict = cli.strict || config.strict;
+    let options = Options {
+        python: cli.python.or(config.python),
+        follow_libs: cli.follow_libs || config.follow_libs,
+        cpu: cli.cpu || config.cpu,
+        catalogs,
+        exclude: config.exclude.into_iter().chain(cli.exclude).collect(),
+        root: cli.path,
+    };
+    let report = check(&options)?;
+    match cli.format {
+        Format::Human => print!("{}", render::human(&report, strict)),
+        Format::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        Format::Sarif => println!("{}", serde_json::to_string_pretty(&render::sarif(&report, strict))?),
+    }
+    let failed = !report.diagnostics.is_empty() || (strict && !report.unresolved.is_empty());
+    Ok(if failed { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let options = Options {
-        root: cli.path,
-        python: cli.python,
-        follow_libs: cli.follow_libs,
-        cpu: cli.cpu,
-        catalogs: Vec::new(),
-    };
-    let report = match check(&options) {
-        Ok(report) => report,
-        Err(err) => {
-            eprintln!("hydroid: {err:#}");
-            return ExitCode::from(2);
-        }
-    };
-    match cli.format {
-        Format::Human => print!("{}", render::human(&report, cli.strict)),
-        Format::Json => println!("{}", serde_json::to_string_pretty(&report).expect("reports serialize")),
-    }
-    let failed = !report.diagnostics.is_empty() || (cli.strict && !report.unresolved.is_empty());
-    if failed { ExitCode::from(1) } else { ExitCode::SUCCESS }
+    run(Cli::parse()).unwrap_or_else(|err| {
+        eprintln!("hydroid: {err:#}");
+        ExitCode::from(2)
+    })
 }
