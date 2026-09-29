@@ -15,6 +15,8 @@ error[blocking-http]: `requests.api.get` blocks the event loop
    = help: use an async client (`httpx.AsyncClient`, `aiohttp`) or `await asyncio.to_thread(...)`
 ```
 
+**New here? Read the [usage guide](docs/GUIDE.md).**
+
 Written in Rust on top of [ty](https://github.com/astral-sh/ty)'s semantic model (types, imports,
 go-to-definition). Polar's server (1,845 files, 107k call sites) is analyzed in ~2.5 s.
 

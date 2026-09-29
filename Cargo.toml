@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
-repository = "https://github.com/agusmdev/event-loop-checker"
+repository = "https://github.com/agusmdev/hydroid"
 
 [workspace.dependencies]
 hydroid_core = { path = "crates/hydroid_core" }
