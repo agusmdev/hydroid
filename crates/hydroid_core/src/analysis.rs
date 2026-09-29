@@ -287,8 +287,11 @@ impl<'a> Graph<'a> {
             .map(|(i, _)| FnId(i as u32))
             .collect();
         for flow in &self.facts.flows {
+            // Starlette calls sync startup/shutdown handlers directly on the loop.
+            let into = &self.facts.function(flow.into).qualname;
+            let on_loop = self.catalog.is_loop_callback(into) || self.catalog.entry_kind(into) == Some("lifecycle");
             if let Value::Function(f) = flow.value
-                && self.catalog.is_loop_callback(&self.facts.function(flow.into).qualname)
+                && on_loop
                 && self.facts.function(f).analyzed
             {
                 roots.insert(f);

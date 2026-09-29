@@ -98,6 +98,12 @@ async def socket(websocket: WebSocket):
     time.sleep(1)  # expect: time.sleep via websocket /ws
 
 
+@app.on_event("shutdown")
+def flush_metrics():
+    # Sync startup/shutdown handlers are called directly on the loop, not in a threadpool.
+    requests.post("https://metrics.example.com")  # expect: requests.api.post
+
+
 @app.on_event("startup")
 async def warm_cache():
     requests.get("https://example.com/warm")  # expect: requests.api.get via lifecycle startup
