@@ -30,6 +30,10 @@ struct CatalogFile {
 struct SinkGroup {
     category: String,
     advice: String,
+    /// Only a call made directly from code on the loop counts: sync functions calling these do
+    /// not block because of them.
+    #[serde(default)]
+    direct: bool,
     #[serde(default)]
     opt_in: bool,
     functions: Vec<String>,
@@ -127,6 +131,8 @@ pub struct Catalog {
     sinks: Patterns<usize>,
     blocking_decorators: Patterns<usize>,
     groups: Vec<(String, String)>,
+    /// Groups marked `direct`, by index.
+    direct: Vec<bool>,
     offload: Patterns<()>,
     loop_callbacks: Patterns<()>,
     entries: Patterns<usize>,
@@ -152,6 +158,7 @@ impl Catalog {
             }
             let index = self.groups.len();
             self.groups.push((group.category, group.advice));
+            self.direct.push(group.direct);
             let patterns = if blocking_decorator { &mut self.blocking_decorators } else { &mut self.sinks };
             for name in &group.functions {
                 patterns.insert(name, index);
@@ -177,6 +184,11 @@ impl Catalog {
         let &index = self.sinks.get(qualname)?;
         let (category, advice) = &self.groups[index];
         Some(Sink { qualname: qualname.to_string(), category: category.clone(), advice: advice.clone() })
+    }
+
+    /// Whether `qualname` is a sink only when called directly from loop code.
+    pub fn is_direct_sink(&self, qualname: &str) -> bool {
+        self.sinks.get(qualname).is_some_and(|&index| self.direct[index])
     }
 
     /// The blocking behavior a decorator gives the sync functions it decorates.

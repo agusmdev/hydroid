@@ -29,6 +29,8 @@ async def files(src: str, dst: str):
     os.symlink(src, dst)  # expect: *
     Path(dst).chmod(0o600)  # expect: *
     Path(dst).resolve(strict=True)  # expect: *
+    with tempfile.TemporaryDirectory() as scratch:  # expect: tempfile.TemporaryDirectory.__init__ tempfile.TemporaryDirectory.__exit__
+        print(scratch)
     os.path.join(src, dst)
     Path(src).name
     return tmp.name

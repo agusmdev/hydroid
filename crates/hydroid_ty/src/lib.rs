@@ -23,7 +23,7 @@ use ty_module_resolver::{ModuleName, resolve_module_confident};
 
 use crate::db::HydroidDb;
 use crate::extract::{FileFacts, Implicit, RawSlot, RawValue, extract_file};
-use crate::index::{FileIndex, Key};
+use crate::index::{FileIndex, Key, class_bases};
 
 pub struct Extraction {
     pub facts: Facts,
@@ -81,7 +81,23 @@ pub fn unknown_names(root: &Path, python: Option<&Path>, names: &[String]) -> an
     Ok(unknown)
 }
 
+/// Phase timings on stderr when `HYDROID_TIMINGS` is set (for profiling large projects).
+struct Timings(Option<std::time::Instant>);
+
+impl Timings {
+    fn new() -> Self {
+        Self(std::env::var_os("HYDROID_TIMINGS").map(|_| std::time::Instant::now()))
+    }
+
+    fn phase(&self, name: &str) {
+        if let Some(start) = self.0 {
+            eprintln!("hydroid: {name} at {} ms", start.elapsed().as_millis());
+        }
+    }
+}
+
 pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
+    let timings = Timings::new();
     let root = system_path(options.root)?;
     let python = options.python.map(python_path).transpose()?;
     let db = HydroidDb::new(&root, python.as_deref())?;
@@ -104,17 +120,22 @@ pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
         None
     };
     let files = project_files(&db, &root, options.exclude)?;
+    timings.phase("environment and project files");
 
     let indexes = Indexes::default();
     let mut merger = Merger::new(&db, &indexes);
     let units: Vec<(File, Option<FxHashSet<u32>>)> = files.iter().map(|&f| (f, None)).collect();
-    indexes.prebuild(&db, files.iter().copied().collect());
+    indexes.prebuild(&db, files.iter().copied().collect(), FxHashSet::default());
+    timings.phase("project indexes");
     let mut round = run(&db, &indexes, &units, options.follow_libs);
+    timings.phase("bodies");
     let mut first = true;
     loop {
         // Merging interns every definition the facts mention, indexing its file: index them
         // all in parallel first.
-        indexes.prebuild(&db, referenced_files(&round));
+        let (referenced_files, classes) = referenced(&round);
+        indexes.prebuild(&db, referenced_files, classes);
+        timings.phase("referenced indexes");
         if std::mem::take(&mut first) {
             for &file in &files {
                 merger.add_file(file);
@@ -133,6 +154,7 @@ pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
         round = run(&db, &indexes, &next, true);
     }
     let entry = cache::Entry { files: files.len(), facts: merger.finish() };
+    timings.phase("merged");
     // Tearing down ty's caches takes seconds on large projects: do it off the critical path.
     std::thread::spawn(move || drop((db, indexes)));
     if let Some(fingerprint) = fingerprint {
@@ -168,9 +190,10 @@ fn project_files(db: &HydroidDb, root: &SystemPath, exclude: &[String]) -> anyho
     Ok(files)
 }
 
-/// File indexes shared between extraction threads and the merge.
+/// File indexes shared between extraction threads and the merge, and the bases of the library
+/// classes that are ancestors of project classes.
 #[derive(Default)]
-struct Indexes(Mutex<FxHashMap<File, Arc<FileIndex>>>);
+struct Indexes(Mutex<FxHashMap<File, Arc<FileIndex>>>, Mutex<FxHashMap<Key, Vec<Key>>>);
 
 impl Indexes {
     fn get(&self, db: &HydroidDb, file: File) -> Arc<FileIndex> {
@@ -181,34 +204,67 @@ impl Indexes {
         self.0.lock().entry(file).or_insert(index).clone()
     }
 
-    /// Builds the indexes of `files`, and of the files defining the bases of every indexed
-    /// class, in parallel (building one runs type inference on its file).
-    fn prebuild(&self, db: &HydroidDb, files: FxHashSet<File>) {
+    /// The bases of a class (library classes: only once resolved by [`Indexes::prebuild`]).
+    fn bases(&self, class: Key) -> Vec<Key> {
+        let map = self.0.lock();
+        match map.get(&class.0).and_then(|i| i.classes.get(&class.1)) {
+            Some(entry) if !entry.bases.is_empty() => entry.bases.clone(),
+            _ => self.1.lock().get(&class).cloned().unwrap_or_default(),
+        }
+    }
+
+    /// Builds the indexes of `files`, in parallel (building one runs type inference on its
+    /// file), and of every ancestor of the indexed project classes and of `classes`, resolving
+    /// the bases of library ancestors on the way.
+    fn prebuild(&self, db: &HydroidDb, files: FxHashSet<File>, mut classes: FxHashSet<Key>) {
         let mut pending: Vec<File> = {
             let built = self.0.lock();
-            let bases = built.values().flat_map(|i| i.classes.values().flat_map(|c| c.bases.iter().map(|b| b.0)));
-            let wanted: FxHashSet<File> = files.into_iter().chain(bases).collect();
-            wanted.into_iter().filter(|f| !built.contains_key(f)).collect()
+            files.into_iter().filter(|f| !built.contains_key(f)).collect()
         };
-        while !pending.is_empty() {
+        loop {
             let shared = Mutex::new(db.clone());
             let built: Vec<(File, Arc<FileIndex>)> = pending
                 .par_iter()
                 .map_init(|| shared.lock().clone(), |db, &file| (file, Arc::new(FileIndex::build(db, file))))
                 .collect();
-            let mut map = self.0.lock();
-            let mut next = FxHashSet::default();
-            for (file, index) in built {
-                next.extend(index.classes.values().flat_map(|c| c.bases.iter().map(|b| b.0)));
-                map.entry(file).or_insert(index);
+            {
+                let mut map = self.0.lock();
+                for (file, index) in built {
+                    map.entry(file).or_insert(index);
+                }
             }
+            // Library ancestors whose bases are not resolved yet.
+            let unresolved: Vec<Key> = {
+                let map = self.0.lock();
+                let resolved = self.1.lock();
+                let ancestors: FxHashSet<Key> = map
+                    .values()
+                    .flat_map(|i| i.classes.values().flat_map(|c| c.bases.iter().copied()))
+                    .chain(resolved.values().flatten().copied())
+                    .chain(classes.drain())
+                    .filter(|k| map.get(&k.0).is_none_or(|i| i.origin != Origin::Project) && !resolved.contains_key(k))
+                    .collect();
+                ancestors.into_iter().collect()
+            };
+            let resolved: Vec<(Key, Vec<Key>)> = unresolved
+                .par_iter()
+                .map_init(|| shared.lock().clone(), |db, &class| (class, class_bases(db, class)))
+                .collect();
+            let map = self.0.lock();
+            let mut next: FxHashSet<File> = unresolved.iter().map(|k| k.0).collect();
+            next.extend(resolved.iter().flat_map(|(_, bases)| bases.iter().map(|b| b.0)));
+            self.1.lock().extend(resolved);
             pending = next.into_iter().filter(|f| !map.contains_key(f)).collect();
+            if pending.is_empty() && unresolved.is_empty() {
+                break;
+            }
         }
     }
 
     /// What can run implicitly, from the indexed files: see [`Implicit`].
     fn implicit(&self) -> Implicit {
         let map = self.0.lock();
+        let library_bases = self.1.lock();
         let mut names: FxHashSet<String> = map
             .values()
             .flat_map(|i| i.functions.values())
@@ -241,6 +297,7 @@ impl Indexes {
                     }
                     let bases = map.get(&key.0).and_then(|i| i.classes.get(&key.1)).map(|c| c.bases.clone());
                     queue.extend(bases.into_iter().flatten());
+                    queue.extend(library_bases.get(&key).into_iter().flatten().copied());
                 }
             }
         }
@@ -248,10 +305,15 @@ impl Indexes {
     }
 }
 
-/// Files defining something the extracted facts refer to.
-fn referenced_files(facts: &[FileFacts]) -> FxHashSet<File> {
+/// Files defining something the extracted facts refer to, and the classes whose members are
+/// looked up (so whose ancestors matter).
+fn referenced(facts: &[FileFacts]) -> (FxHashSet<File>, FxHashSet<Key>) {
     let mut files = FxHashSet::default();
+    let mut classes = FxHashSet::default();
     for f in facts {
+        classes.extend(f.calls.iter().filter_map(|c| c.attribute.as_ref().map(|(key, _)| *key)));
+        classes.extend(f.calls.iter().filter_map(|c| c.constructs));
+        files.extend(classes.iter().map(|key| key.0));
         files.extend(f.calls.iter().flat_map(|c| c.targets.iter().map(|(key, _)| key.0)));
         files.extend(f.decorators.iter().flat_map(|(_, d)| d.iter().map(|key| key.0)));
         for (_, value) in &f.returns {
@@ -275,7 +337,7 @@ fn referenced_files(facts: &[FileFacts]) -> FxHashSet<File> {
             }
         }
     }
-    files
+    (files, classes)
 }
 
 /// `all_implicit`: check every attribute access and operator for implicit calls (library
@@ -378,7 +440,7 @@ impl<'a> Merger<'a> {
             is_protocol: entry.is_protocol,
             methods: Vec::new(),
         });
-        let bases = entry.bases.iter().filter_map(|&b| self.class_id(b)).collect();
+        let bases = self.indexes.bases(key).into_iter().filter_map(|b| self.class_id(b)).collect();
         let methods = entry
             .methods
             .iter()

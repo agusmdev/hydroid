@@ -88,6 +88,10 @@ struct Graph<'a> {
     called: HashSet<ParamKey>,
     /// Catalog offload APIs, by function.
     offload: Vec<bool>,
+    /// Sinks that only count when called directly from loop code, by function.
+    direct: Vec<bool>,
+    /// Parameters that are called, or handed to something other than an offload API.
+    used_params: HashSet<ParamKey>,
 }
 
 type ParamKey = (FnId, String);
@@ -122,8 +126,29 @@ impl<'a> Graph<'a> {
             })
             .collect();
         let offload = facts.functions.iter().map(|f| catalog.is_offload(&f.qualname)).collect();
-        let mut graph =
-            Self { facts, catalog, calls_of, targets: Vec::new(), sink, called: HashSet::default(), offload };
+        let direct = facts.functions.iter().map(|f| catalog.is_direct_sink(&f.qualname)).collect();
+        let mut graph = Self {
+            facts,
+            catalog,
+            calls_of,
+            targets: Vec::new(),
+            sink,
+            called: HashSet::default(),
+            offload,
+            direct,
+            used_params: HashSet::default(),
+        };
+        let used_from_calls = facts.calls.iter().filter_map(|c| c.param.clone());
+        let used_from_flows: Vec<ParamKey> = facts
+            .flows
+            .iter()
+            .filter(|f| !graph.is_offload(f.into))
+            .filter_map(|f| match &f.value {
+                Value::Param(owner, name) => Some((*owner, name.clone())),
+                _ => None,
+            })
+            .collect();
+        graph.used_params = used_from_calls.chain(used_from_flows).collect();
         let nested = graph.nested_functions();
         let params = graph.parameter_values(&nested);
         let stored = graph.stored_values(&params);
@@ -201,7 +226,10 @@ impl<'a> Graph<'a> {
         let mut values: HashMap<ParamKey, BTreeSet<FnId>> = HashMap::default();
         let mut forwards: HashMap<ParamKey, Vec<ParamKey>> = HashMap::default();
         for flow in &self.facts.flows {
-            if self.is_offload(flow.into) {
+            // A decorated function reaches its decorator's wrapper only when it is itself called,
+            // and that call links to it directly (see `effective_targets`): letting it flow into
+            // the decorator's parameter would make every wrapper call every decorated function.
+            if self.is_offload(flow.into) || flow.slot == Slot::Decorated {
                 continue;
             }
             for key in self.slot_params(flow.into, &flow.slot, nested) {
@@ -274,23 +302,29 @@ impl<'a> Graph<'a> {
         let mut out = Vec::new();
         for &t in &call.targets {
             let (body, overrides) = runs.entry(t).or_insert_with(|| {
-                // Calling a function decorated by project code runs the decorator's wrapper,
-                // which reaches the original through the decorator's parameter.
-                let wrappers: Vec<FnId> = self
-                    .facts
-                    .function(t)
-                    .decorators
-                    .iter()
-                    .filter(|d| self.facts.function(**d).analyzed)
-                    .flat_map(|d| nested[d.0 as usize].iter().copied())
-                    .collect();
-                let body = if wrappers.is_empty() { vec![t] } else { wrappers };
+                // Calling a function decorated by project code runs the decorator's wrapper, and
+                // the wrapper calls the original. Decorators wrapping both kinds define an async
+                // and a sync wrapper: a coroutine function gets the async ones.
+                let is_async = self.facts.function(t).is_async;
+                let mut body = Vec::new();
+                for d in self.facts.function(t).decorators.iter().filter(|d| self.facts.function(**d).analyzed) {
+                    let wrappers = &nested[d.0 as usize];
+                    let matching: Vec<FnId> =
+                        wrappers.iter().copied().filter(|w| self.facts.function(*w).is_async == is_async).collect();
+                    body.extend(if matching.is_empty() { wrappers.clone() } else { matching });
+                }
+                if self.facts.function(t).decorators.iter().any(|d| self.calls_original(*d, nested)) {
+                    body.push(t);
+                }
+                if body.is_empty() {
+                    body.push(t);
+                }
                 (body, hierarchy.overrides(self.facts, t))
             });
             out.extend(body.iter().copied());
             out.extend(dispatches.get(&t).into_iter().flatten());
             if call.virtual_dispatch {
-                out.extend(overrides.iter().copied());
+                out.extend(overrides.iter().copied().filter(|&o| self.dispatches_into(call.caller, o)));
             }
         }
         if let Some(class) = call.constructs {
@@ -391,6 +425,26 @@ impl<'a> Graph<'a> {
         hooks
     }
 
+    /// Whether decorating with `decorator` keeps calling the original on the loop: one of its
+    /// wrappers calls the decorated parameter, or hands it to something other than an offload API
+    /// (`asyncio.to_thread(func)` does not run it here). Undecorated library decorators count as
+    /// calling it.
+    fn calls_original(&self, decorator: FnId, nested: &[Vec<FnId>]) -> bool {
+        if !self.facts.function(decorator).analyzed {
+            return true;
+        }
+        self.slot_params(decorator, &Slot::Decorated, nested).iter().any(|k| self.used_params.contains(k))
+    }
+
+    /// Whether a virtual call made in `caller` may dispatch to the override `method`: test doubles
+    /// (overrides defined in test code) only stand in for real classes in test code, and classes
+    /// defined inside a function only in their own file.
+    fn dispatches_into(&self, caller: FnId, method: FnId) -> bool {
+        let (caller, method) = (self.facts.function(caller), self.facts.function(method));
+        (!is_test_path(&method.location.path) || is_test_path(&caller.location.path))
+            && (!method.qualname.contains(".<locals>.") || method.location.path == caller.location.path)
+    }
+
     /// Whether calling `target` at `call` runs its body now: calling a generator function only
     /// creates the generator, unless the call site iterates it right away.
     fn runs_body(&self, call: usize, target: FnId) -> bool {
@@ -434,6 +488,9 @@ impl<'a> Graph<'a> {
                 continue;
             }
             for &t in &self.targets[i] {
+                if self.direct[t.0 as usize] {
+                    continue;
+                }
                 if self.sink[t.0 as usize].is_some() {
                     if !call.awaited && next[call.caller.0 as usize].is_none() {
                         next[call.caller.0 as usize] = Some((1, i, t));
@@ -585,6 +642,11 @@ impl<'a> Graph<'a> {
             if call.param.as_ref().is_some_and(|k| self.called.contains(k)) {
                 continue;
             }
+            // Awaited calls never block; constructing a known class whose `__init__` is
+            // synthesized (dataclasses, pydantic models) runs no code of its own.
+            if call.awaited || call.constructs.is_some() {
+                continue;
+            }
             let reason = match (&call.param, &call.unresolved) {
                 (Some((_, name)), _) => format!("parameter `{name}` receives no known callable"),
                 (None, Some(reason)) => reason.clone(),
@@ -600,6 +662,15 @@ impl<'a> Graph<'a> {
         }
         out
     }
+}
+
+/// Test code by the usual conventions: a `tests`/`test` directory, `test_*.py`, `*_test.py`,
+/// `conftest.py`.
+fn is_test_path(path: &str) -> bool {
+    let mut parts = path.split('/').rev();
+    let file = parts.next().unwrap_or_default();
+    let test_file = file.starts_with("test_") || file.ends_with("_test.py") || file == "conftest.py";
+    test_file || parts.any(|d| d == "tests" || d == "test")
 }
 
 fn entry_label(kind: &str, into: &str, flow: &crate::facts::Flow) -> String {

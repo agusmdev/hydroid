@@ -19,8 +19,8 @@ error[blocking-http]: `requests.api.get` blocks the event loop
 
 Written in Rust on top of [ty](https://github.com/astral-sh/ty)'s semantic model (types, imports,
 go-to-definition). Polar's server (1,854 files, 108k call sites) takes about as long as ty needs
-to type-check it the first time (~12 s on 4 vCPUs), then ~0.35 s while nothing changed: extracted
-facts are cached in `.hydroid_cache/`.
+to type-check it the first time (~10 s on 4 vCPUs), then ~0.35 s while nothing changed: extracted
+facts are cached in `.hydroid_cache/`. `HYDROID_TIMINGS=1` prints where the time goes.
 
 ## Install and run
 
@@ -91,8 +91,11 @@ functions = ["acme.client.Client.fetch"]
    blocking functions — shortest witness chains, no recursion, any depth. Diagnostics are the
    call sites inside loop code (`async def` bodies, sync callbacks scheduled on the loop) whose
    callee blocks. Offload APIs cut the graph; callbacks are attributed to the call site passing
-   them; overrides are found by class-hierarchy analysis; calling a generator function runs
-   nothing until the generator is iterated.
+   them; overrides are found by class-hierarchy analysis (test doubles only stand in for real
+   classes in test code); calling a generator function runs nothing until the generator is
+   iterated; a decorated function is reached through its decorator's wrappers only when they call
+   it. Starting an event loop (`asyncio.run`) is only reported when loop code does it directly:
+   sync bridges reaching it almost always check for a running loop first.
 3. **Catalog** (`crates/hydroid_core/catalog.toml`): blocking functions, offload APIs, loop
    callback APIs and FastAPI entry points, by defining qualified name. A test checks every name
    exists in a real environment.
@@ -111,7 +114,7 @@ project (no per-file incremental cache yet).
 
 ```sh
 cargo test --workspace        # needs `uv`; syncs tests/fixtures/.venv from uv.lock
-scripts/corpus.sh             # runs on pinned real codebases
+scripts/corpus.sh [names]     # Polar, mealie, lnbits, dispatch, litellm, open-webui, template
 ```
 
 Fixture cases live in `tests/fixtures/cases/*`; expectations are inline comments:
@@ -125,6 +128,7 @@ scripts/hillclimb/score.py --split train            # misses and false positives
 scripts/hillclimb/score.py --split holdout --quiet  # aggregate only: don't tune on it
 scripts/hillclimb/polar_time.sh target/release/hydroid 5
 uv run --with anthropic scripts/hillclimb/adversary.py --count 5   # Claude proposes new cases
+scripts/hillclimb/oracle.py PROJECT report.json   # naive syntactic scan: candidate misses
 ```
 
 ty's crates are pinned to exact versions (`=0.0.15`); they have no API stability promise.

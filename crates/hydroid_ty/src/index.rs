@@ -38,6 +38,8 @@ pub struct FnEntry {
 
 pub struct ClassEntry {
     pub qualname: String,
+    /// Project classes only: resolving bases runs type inference on the module, which is costly
+    /// on large libraries. Library bases are resolved on demand, see [`class_bases`].
     pub bases: Vec<Key>,
     pub is_protocol: bool,
     pub methods: Vec<(String, u32)>,
@@ -206,17 +208,47 @@ impl Builder<'_, '_> {
         (positional.into_iter().chain(rest).collect(), count)
     }
 
-    fn resolve_base(&self, base: &Expr) -> Option<Key> {
-        let db = self.model.db();
-        let ty = base.inferred_type(self.model)?;
-        let def = match ty.definition(db, &self.model.program_environment())? {
-            TypeDefinition::StaticClass(def) | TypeDefinition::DynamicClass(def) => def,
-            _ => return None,
-        };
-        let module = parsed_module(db, def.python_file(db)).load(db);
-        let range = def.focus_range(db, &module);
-        Some((range.file(), range.start().to_u32()))
+}
+
+fn resolve_base(model: &SemanticModel<'_>, base: &Expr) -> Option<Key> {
+    let db = model.db();
+    let ty = base.inferred_type(model)?;
+    let def = match ty.definition(db, &model.program_environment())? {
+        TypeDefinition::StaticClass(def) | TypeDefinition::DynamicClass(def) => def,
+        _ => return None,
+    };
+    let module = parsed_module(db, def.python_file(db)).load(db);
+    let range = def.focus_range(db, &module);
+    Some((range.file(), range.start().to_u32()))
+}
+
+/// The bases of the class whose name starts at `class.1` in `class.0`.
+pub fn class_bases(db: &HydroidDb, class: Key) -> Vec<Key> {
+    struct Finder<'a> {
+        offset: u32,
+        found: Option<&'a ast::StmtClassDef>,
     }
+    impl<'a> SourceOrderVisitor<'a> for Finder<'a> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if self.found.is_some() || !stmt.range().contains(TextSize::new(self.offset)) {
+                return;
+            }
+            if let Stmt::ClassDef(def) = stmt
+                && def.name.start().to_u32() == self.offset
+            {
+                self.found = Some(def);
+                return;
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, _: &'a Expr) {}
+    }
+    let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, class.0));
+    let parsed = parsed_module(db, model.python_file()).load(db);
+    let mut finder = Finder { offset: class.1, found: None };
+    finder.visit_body(&parsed.syntax().body);
+    let Some(def) = finder.found else { return Vec::new() };
+    def.bases().iter().filter_map(|b| resolve_base(&model, b)).collect()
 }
 
 /// The last name of a decorator: `property`, `setter` (`@x.setter`), `field_validator` (`@field_validator("x")`).
@@ -328,7 +360,11 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
             Stmt::ClassDef(def) => {
                 let key = def.name.start().to_u32();
                 let qualname = format!("{}.{}", self.prefix(), def.name);
-                let bases = def.bases().iter().filter_map(|b| self.resolve_base(b)).collect();
+                let bases = if self.index.origin == Origin::Project {
+                    def.bases().iter().filter_map(|b| resolve_base(self.model, b)).collect()
+                } else {
+                    Vec::new()
+                };
                 let is_protocol = def.bases().iter().any(is_protocol_base);
                 self.index.classes.insert(
                     key,

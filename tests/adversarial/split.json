@@ -17,6 +17,7 @@
   "getattr_proxy": "train",
   "inherited_init": "train",
   "local_helpers": "train",
+  "nested_loop_guard": "train",
   "network_ops": "train",
   "operator_dunders": "train",
   "overload_impl": "train",

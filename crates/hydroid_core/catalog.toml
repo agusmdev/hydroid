@@ -135,6 +135,9 @@ functions = [
     "tempfile.TemporaryFile",
     "tempfile.mkstemp",
     "tempfile.mkdtemp",
+    "tempfile.TemporaryDirectory.__init__",
+    "tempfile.TemporaryDirectory.__exit__",
+    "tempfile.TemporaryDirectory.cleanup",
     "tarfile.TarFile.open",
     "zipfile.ZipFile.__init__",
     "gzip.open",
@@ -314,8 +317,11 @@ functions = [
 ]
 
 [[sink]]
+# Inside a running loop these raise instead of blocking: only a direct call from loop code is a
+# certain bug. Sync helpers reaching them almost always check for a running loop first.
 category = "event-loop"
-advice = "`await` the coroutine instead of starting a nested event loop"
+advice = "`await` the coroutine: starting an event loop inside a running one raises `RuntimeError`"
+direct = true
 functions = [
     "asyncio.runners.run",
     "asyncio.runners.Runner.run",

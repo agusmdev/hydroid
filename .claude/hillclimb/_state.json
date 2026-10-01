@@ -108,6 +108,87 @@
         12348
       ],
       "polar_warm_ms_median": 365
+    },
+    {
+      "round": 5,
+      "lever": "real-world corpora (precision, noise, speed)",
+      "corpora": "added mealie, lnbits, Netflix dispatch, litellm, open-webui to scripts/corpus.sh; scripts/hillclimb/oracle.py (naive syntactic second opinion) to look for misses",
+      "findings": {
+        "false positives": [
+          "class-hierarchy dispatch from production code into test doubles (overrides defined in tests or in function bodies)",
+          "decorator wrappers context-insensitive: every wrapper reached every decorated function (litellm track_llm_api_timing), and async functions entered sync wrappers",
+          "asyncio.run/run_until_complete reached through sync bridges that check for a running loop"
+        ],
+        "false negatives": [
+          "tempfile.TemporaryDirectory (oracle, litellm)"
+        ],
+        "noise": [
+          "awaited calls and constructors of known classes listed as unresolved"
+        ],
+        "speed": [
+          "resolving the bases of every class in every indexed library file ran type inference on whole library modules"
+        ]
+      },
+      "change": "overrides from test code/local classes only for callers in tests/same file; decorated calls link to the original when a wrapper calls it, async/sync wrapper matching, decorated functions no longer flow into decorator parameters; catalog `direct` sink groups (event-loop: only direct calls from loop code); unresolved excludes awaited calls and known-class constructors; library class bases resolved lazily for ancestors of project classes and of looked-up classes; HYDROID_TIMINGS phase timings; catalog: TemporaryDirectory",
+      "train_recall": "116/116",
+      "train_fp": 0,
+      "corpora_release_ms_r3_to_final": {
+        "template": [
+          1554,
+          1142
+        ],
+        "polar": [
+          10784,
+          10337
+        ],
+        "mealie": [
+          3916,
+          3536
+        ],
+        "lnbits": [
+          2484,
+          2250
+        ],
+        "dispatch": [
+          3507,
+          3145
+        ],
+        "open-webui": [
+          5543,
+          4901
+        ],
+        "litellm": [
+          48338,
+          46834
+        ]
+      },
+      "diagnostics": "unchanged on 6 corpora (Polar 100, mealie 191, lnbits 246, dispatch 6, open-webui 67, template 0); litellm 9534 -> 8336 (non-test 2478 -> 2062), removed ones reviewed: test-double dispatch, decorator fan-out, guarded asyncio.run",
+      "unresolved": {
+        "polar": [
+          6477,
+          3671
+        ],
+        "mealie": [
+          205,
+          139
+        ],
+        "lnbits": [
+          3302,
+          1554
+        ],
+        "dispatch": [
+          43,
+          38
+        ],
+        "open-webui": [
+          4171,
+          3011
+        ],
+        "litellm": [
+          33420,
+          23240
+        ]
+      }
     }
   ]
 }
