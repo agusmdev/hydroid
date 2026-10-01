@@ -3,6 +3,7 @@
 //! Files are extracted in parallel (one database handle per thread); the results are merged
 //! sequentially, interning every definition they mention into dense ids.
 
+mod cache;
 mod db;
 mod extract;
 mod index;
@@ -12,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use hydroid_core::catalog::qualname_matches;
-use hydroid_core::facts::{Call, Class, ClassId, Facts, FnId, Flow, Function, Origin, Slot, Value};
+use hydroid_core::facts::{Call, Class, ClassId, Facts, FnId, Flow, Function, Origin, Slot, Store, Value};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use ruff_db::files::{File, system_path_to_file};
@@ -38,6 +39,10 @@ pub struct ExtractOptions<'a> {
     pub follow: &'a (dyn Fn(&str) -> bool + Sync),
     /// Gitignore-style globs, relative to `root`, of project files to skip.
     pub exclude: &'a [String],
+    /// Reuse (and save) the facts of an unchanged project in `<root>/.hydroid_cache`.
+    /// `cache_salt` must capture everything else the extraction depends on (`follow`).
+    pub cache: bool,
+    pub cache_salt: &'a str,
 }
 
 fn system_path(path: &Path) -> anyhow::Result<SystemPathBuf> {
@@ -80,16 +85,41 @@ pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
     let root = system_path(options.root)?;
     let python = options.python.map(python_path).transpose()?;
     let db = HydroidDb::new(&root, python.as_deref())?;
+    let fingerprint = if options.cache {
+        let settings = format!("{:?} {:?} {}", options.follow_libs, options.exclude, options.cache_salt);
+        let (layout, version) = (db.layout(), db.python_version());
+        // Read the entry while the project is being fingerprinted.
+        let (fingerprint, entry) = rayon::join(
+            || cache::fingerprint(layout, &version, &settings),
+            || cache::load(root.as_std_path()),
+        );
+        let fingerprint = fingerprint?;
+        if let Some((stored, entry)) = entry
+            && stored == fingerprint
+        {
+            return Ok(Extraction { facts: entry.facts, files: entry.files });
+        }
+        Some(fingerprint)
+    } else {
+        None
+    };
     let files = project_files(&db, &root, options.exclude)?;
 
     let indexes = Indexes::default();
     let mut merger = Merger::new(&db, &indexes);
     let units: Vec<(File, Option<FxHashSet<u32>>)> = files.iter().map(|&f| (f, None)).collect();
-    let mut round = run(&db, &indexes, &units);
-    for &file in &files {
-        merger.add_file(file);
-    }
+    indexes.prebuild(&db, files.iter().copied().collect());
+    let mut round = run(&db, &indexes, &units, options.follow_libs);
+    let mut first = true;
     loop {
+        // Merging interns every definition the facts mention, indexing its file: index them
+        // all in parallel first.
+        indexes.prebuild(&db, referenced_files(&round));
+        if std::mem::take(&mut first) {
+            for &file in &files {
+                merger.add_file(file);
+            }
+        }
         for file_facts in round {
             merger.merge(file_facts);
         }
@@ -100,9 +130,15 @@ pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
         if next.is_empty() {
             break;
         }
-        round = run(&db, &indexes, &next);
+        round = run(&db, &indexes, &next, true);
     }
-    Ok(Extraction { facts: merger.finish(), files: files.len() })
+    let entry = cache::Entry { files: files.len(), facts: merger.finish() };
+    // Tearing down ty's caches takes seconds on large projects: do it off the critical path.
+    std::thread::spawn(move || drop((db, indexes)));
+    if let Some(fingerprint) = fingerprint {
+        cache::store(root.as_std_path(), fingerprint, &entry);
+    }
+    Ok(Extraction { facts: entry.facts, files: entry.files })
 }
 
 fn project_files(db: &HydroidDb, root: &SystemPath, exclude: &[String]) -> anyhow::Result<Vec<File>> {
@@ -144,9 +180,75 @@ impl Indexes {
         let index = Arc::new(FileIndex::build(db, file));
         self.0.lock().entry(file).or_insert(index).clone()
     }
+
+    /// Builds the indexes of `files`, and of the files defining the bases of every indexed
+    /// class, in parallel (building one runs type inference on its file).
+    fn prebuild(&self, db: &HydroidDb, files: FxHashSet<File>) {
+        let mut pending: Vec<File> = {
+            let built = self.0.lock();
+            let bases = built.values().flat_map(|i| i.classes.values().flat_map(|c| c.bases.iter().map(|b| b.0)));
+            let wanted: FxHashSet<File> = files.into_iter().chain(bases).collect();
+            wanted.into_iter().filter(|f| !built.contains_key(f)).collect()
+        };
+        while !pending.is_empty() {
+            let shared = Mutex::new(db.clone());
+            let built: Vec<(File, Arc<FileIndex>)> = pending
+                .par_iter()
+                .map_init(|| shared.lock().clone(), |db, &file| (file, Arc::new(FileIndex::build(db, file))))
+                .collect();
+            let mut map = self.0.lock();
+            let mut next = FxHashSet::default();
+            for (file, index) in built {
+                next.extend(index.classes.values().flat_map(|c| c.bases.iter().map(|b| b.0)));
+                map.entry(file).or_insert(index);
+            }
+            pending = next.into_iter().filter(|f| !map.contains_key(f)).collect();
+        }
+    }
+
+    /// Names of the properties defined in indexed files: only attribute reads with these names
+    /// can run code.
+    fn property_names(&self) -> FxHashSet<String> {
+        let map = self.0.lock();
+        map.values()
+            .flat_map(|i| i.functions.values())
+            .filter(|f| f.property.is_some())
+            .filter_map(|f| f.qualname.rsplit('.').next().map(str::to_string))
+            .collect()
+    }
 }
 
-fn run(db: &HydroidDb, indexes: &Indexes, units: &[(File, Option<FxHashSet<u32>>)]) -> Vec<FileFacts> {
+/// Files defining something the extracted facts refer to.
+fn referenced_files(facts: &[FileFacts]) -> FxHashSet<File> {
+    let mut files = FxHashSet::default();
+    for f in facts {
+        files.extend(f.calls.iter().flat_map(|c| c.targets.iter().map(|(key, _)| key.0)));
+        files.extend(f.decorators.iter().flat_map(|(_, d)| d.iter().map(|key| key.0)));
+        for store in &f.stores {
+            files.insert(store.class.0);
+            if let RawValue::Function((file, _)) | RawValue::Class((file, _)) = store.value {
+                files.insert(file);
+            }
+        }
+        for flow in &f.flows {
+            files.insert(flow.into.0);
+            if let RawValue::Function((file, _)) | RawValue::Class((file, _)) = flow.value {
+                files.insert(file);
+            }
+        }
+    }
+    files
+}
+
+/// `all_properties`: check every attribute read for a property call (library properties
+/// included), not only reads of names defined as properties in the files indexed so far.
+fn run(
+    db: &HydroidDb,
+    indexes: &Indexes,
+    units: &[(File, Option<FxHashSet<u32>>)],
+    all_properties: bool,
+) -> Vec<FileFacts> {
+    let properties = (!all_properties).then(|| indexes.property_names());
     let shared = Mutex::new(db.clone());
     units
         .par_iter()
@@ -154,7 +256,7 @@ fn run(db: &HydroidDb, indexes: &Indexes, units: &[(File, Option<FxHashSet<u32>>
             || shared.lock().clone(),
             |db, (file, wanted)| {
                 let index = indexes.get(db, *file);
-                extract_file(db, &index, wanted.as_ref())
+                extract_file(db, &index, wanted.as_ref(), properties.as_ref())
             },
         )
         .collect()
@@ -206,7 +308,9 @@ impl<'a> Merger<'a> {
             origin: index.origin,
             kind: entry.kind,
             is_async: entry.is_async,
-            is_property: entry.is_property,
+            property: entry.property,
+            is_generator: entry.is_generator,
+            is_validator: entry.is_validator,
             params: entry.params.clone(),
             parent: None,
             class: None,
@@ -257,13 +361,15 @@ impl<'a> Merger<'a> {
         for raw in file_facts.calls {
             let Some(caller) = self.fn_id((file, raw.caller)) else { continue };
             let mut targets: Vec<FnId> = raw.targets.iter().filter_map(|&(k, _)| self.fn_id(k)).collect();
-            if raw.property_access {
-                targets.retain(|t| self.facts.function(*t).is_property);
+            if let Some(accessor) = raw.accessor {
+                targets.retain(|t| self.facts.function(*t).property == Some(accessor));
                 if targets.is_empty() {
                     continue;
                 }
             }
             let param = raw.param.and_then(|(owner, name)| Some((self.fn_id((file, owner))?, name)));
+            let constructs = raw.constructs.and_then(|k| self.class_id(k));
+            let attribute = raw.attribute.and_then(|(k, name)| Some((self.class_id(k)?, name)));
             self.facts.calls.push(Call {
                 caller,
                 location: raw.location,
@@ -277,18 +383,21 @@ impl<'a> Merger<'a> {
                 virtual_dispatch: raw.virtual_dispatch,
                 param,
                 awaited: raw.awaited,
+                iterates: raw.iterates,
+                constructs,
+                attribute,
             });
+        }
+        for raw in file_facts.stores {
+            let Some(class) = self.class_id(raw.class) else { continue };
+            let Some(value) = self.value(file, raw.value) else { continue };
+            self.facts.stores.push(Store { class, name: raw.name, value });
         }
         for raw in file_facts.flows {
             let (Some(caller), Some(into)) = (self.fn_id((file, raw.caller)), self.fn_id(raw.into)) else {
                 continue;
             };
-            let value = match raw.value {
-                RawValue::Function(k) => self.fn_id(k).map(Value::Function),
-                RawValue::Class(k) => self.class_id(k).map(Value::Class),
-                RawValue::Param(owner, name) => self.fn_id((file, owner)).map(|o| Value::Param(o, name)),
-            };
-            let Some(value) = value else { continue };
+            let Some(value) = self.value(file, raw.value) else { continue };
             let slot = match raw.slot {
                 RawSlot::Decorated => Slot::Decorated,
                 RawSlot::Keyword(name) => Slot::Param(name),
@@ -300,6 +409,14 @@ impl<'a> Merger<'a> {
                 }
             };
             self.facts.flows.push(Flow { location: raw.location, caller, into, slot, value, literal: raw.literal });
+        }
+    }
+
+    fn value(&mut self, file: File, value: RawValue) -> Option<Value> {
+        match value {
+            RawValue::Function(k) => self.fn_id(k).map(Value::Function),
+            RawValue::Class(k) => self.class_id(k).map(Value::Class),
+            RawValue::Param(owner, name) => self.fn_id((file, owner)).map(|o| Value::Param(o, name)),
         }
     }
 

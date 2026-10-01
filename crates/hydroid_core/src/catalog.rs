@@ -1,9 +1,8 @@
 //! What hydroid knows about functions it does not analyze: which block, which move work off the
 //! event loop, which schedule callbacks on it, and which register FastAPI entry points.
 
-use std::collections::HashMap;
-
 use anyhow::Context;
+use rustc_hash::FxHashMap as HashMap;
 use serde::Deserialize;
 
 use crate::report::Sink;
@@ -58,7 +57,7 @@ struct Patterns<T> {
 
 impl<T: Clone> Default for Patterns<T> {
     fn default() -> Self {
-        Self { exact: HashMap::new(), globs: Vec::new() }
+        Self { exact: HashMap::default(), globs: Vec::new() }
     }
 }
 
@@ -78,11 +77,10 @@ impl<T: Clone> Patterns<T> {
         if self.globs.is_empty() {
             return None;
         }
-        let segments: Vec<&str> = qualname.split('.').collect();
+        let segments = qualname.split('.').count();
         self.globs.iter().find_map(|(pattern, value)| {
-            (pattern.len() == segments.len()
-                && pattern.iter().zip(&segments).all(|(p, s)| segment_matches(p, s)))
-            .then_some(value)
+            (pattern.len() == segments && pattern.iter().zip(qualname.split('.')).all(|(p, s)| segment_matches(p, s)))
+                .then_some(value)
         })
     }
 
@@ -105,14 +103,15 @@ pub fn qualname_matches(pattern: &str, qualname: &str) -> bool {
 
 /// `*` matches any run of characters inside one segment.
 fn segment_matches(pattern: &str, segment: &str) -> bool {
-    let mut parts = pattern.split('*');
-    let first = parts.next().unwrap_or_default();
+    let Some((first, parts)) = pattern.split_once('*') else {
+        return pattern == segment;
+    };
     let Some(mut rest) = segment.strip_prefix(first) else {
         return false;
     };
-    let parts: Vec<&str> = parts.collect();
-    for (i, part) in parts.iter().enumerate() {
-        if i == parts.len() - 1 {
+    let mut parts = parts.split('*').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
             return rest.ends_with(part);
         }
         match rest.find(part) {
@@ -120,7 +119,7 @@ fn segment_matches(pattern: &str, segment: &str) -> bool {
             None => return false,
         }
     }
-    rest.is_empty()
+    true
 }
 
 #[derive(Default)]

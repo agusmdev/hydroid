@@ -1,7 +1,7 @@
 //! Walks function bodies and records calls (with their resolved callees) and callable flows.
 
-use hydroid_core::facts::Location;
-use ruff_db::files::File;
+use hydroid_core::facts::{Accessor, Location};
+use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::visitor::source_order::{SourceOrderVisitor, walk_expr, walk_stmt};
 use ruff_python_ast::{self as ast, AtomicNodeIndex, Expr, ExprContext, Stmt};
@@ -26,9 +26,20 @@ pub struct RawCall {
     pub virtual_dispatch: bool,
     pub param: Option<(u32, String)>,
     pub awaited: bool,
+    pub iterates: bool,
+    /// The class called (or validated into), see [`hydroid_core::facts::Call::constructs`].
+    pub constructs: Option<Key>,
     pub unresolved: Option<String>,
-    /// An attribute read; only kept if a target turns out to be a property.
-    pub property_access: bool,
+    /// An attribute access; only kept if a target turns out to be this part of a property.
+    pub accessor: Option<Accessor>,
+    /// See [`hydroid_core::facts::Call::attribute`].
+    pub attribute: Option<(Key, String)>,
+}
+
+pub struct RawStore {
+    pub class: Key,
+    pub name: String,
+    pub value: RawValue,
 }
 
 #[derive(Clone)]
@@ -59,11 +70,17 @@ pub struct FileFacts {
     pub file: File,
     pub calls: Vec<RawCall>,
     pub flows: Vec<RawFlow>,
+    pub stores: Vec<RawStore>,
     pub decorators: Vec<(u32, Vec<Key>)>,
 }
 
 /// Extracts the bodies of `wanted` functions (every function and the module body when `None`).
-pub fn extract_file(db: &HydroidDb, index: &FileIndex, wanted: Option<&FxHashSet<u32>>) -> FileFacts {
+pub fn extract_file(
+    db: &HydroidDb,
+    index: &FileIndex,
+    wanted: Option<&FxHashSet<u32>>,
+    properties: Option<&FxHashSet<String>>,
+) -> FileFacts {
     let program_file = ty_python_semantic::Db::program_file(db, index.file);
     let model = SemanticModel::new(db, program_file);
     let parsed = parsed_module(db, model.python_file()).load(db);
@@ -71,10 +88,18 @@ pub fn extract_file(db: &HydroidDb, index: &FileIndex, wanted: Option<&FxHashSet
         model: &model,
         index,
         wanted,
+        properties,
         current: MODULE_KEY,
         awaited: FxHashSet::default(),
+        iterated: FxHashSet::default(),
         callees: FxHashSet::default(),
-        out: FileFacts { file: index.file, calls: Vec::new(), flows: Vec::new(), decorators: Vec::new() },
+        out: FileFacts {
+            file: index.file,
+            calls: Vec::new(),
+            flows: Vec::new(),
+            stores: Vec::new(),
+            decorators: Vec::new(),
+        },
     };
     extractor.visit_body(&parsed.syntax().body);
     extractor.out
@@ -83,15 +108,32 @@ pub fn extract_file(db: &HydroidDb, index: &FileIndex, wanted: Option<&FxHashSet
 struct Resolution {
     targets: Vec<(Key, bool)>,
     virtual_dispatch: bool,
+    constructs: Option<Key>,
     reason: String,
 }
+
+/// Builtins that iterate their positional arguments during the call.
+const CONSUMERS: &[&str] = &[
+    "list", "tuple", "set", "frozenset", "dict", "sorted", "sum", "min", "max", "any", "all", "next", "iter", "join",
+    "extend", "update", "reduce",
+];
+
+/// Builtins returning lazy iterators over their arguments: iterating one iterates those.
+const LAZY: &[&str] = &["map", "filter", "zip", "enumerate", "reversed", "iter"];
+
+/// Pydantic classmethods that validate input into the model (running its validators).
+const VALIDATES: &[&str] = &["model_validate", "model_validate_json", "model_validate_strings", "parse_obj", "parse_raw"];
 
 struct Extractor<'a, 'db> {
     model: &'a SemanticModel<'db>,
     index: &'a FileIndex,
     wanted: Option<&'a FxHashSet<u32>>,
+    /// Only attribute reads with these names can be property calls (`None`: any name).
+    properties: Option<&'a FxHashSet<String>>,
     current: u32,
     awaited: FxHashSet<u32>,
+    /// Calls whose result is iterated right away (see [`Extractor::iterate`]).
+    iterated: FxHashSet<u32>,
     /// Ranges of callee expressions (attribute reads there are calls, not property reads).
     callees: FxHashSet<(u32, u32)>,
     out: FileFacts,
@@ -119,11 +161,27 @@ impl<'db> Extractor<'_, 'db> {
         let is_function = match def.kind(db) {
             DefinitionKind::Function(_) => true,
             DefinitionKind::Class(_) => false,
+            DefinitionKind::Assignment(assignment) => return self.alias_key(def, assignment.value(&parsed_module(db, def.python_file(db)).load(db))),
             _ => return None,
         };
         let module = parsed_module(db, def.python_file(db)).load(db);
         let range = def.focus_range(db, &module);
         Some(((range.file(), range.start().to_u32()), is_function))
+    }
+
+    /// `__enter__ = acquire` in a class body: the function an alias names.
+    fn alias_key(&self, def: Definition<'db>, value: &Expr) -> Option<(Key, bool)> {
+        let Expr::Name(name) = value else { return None };
+        let db = self.model.db();
+        let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, def.file(db)));
+        definitions_for_name(&model, &name.id, value.into(), ImportAliasResolution::ResolveAliases)
+            .into_iter()
+            .find_map(|d| match d {
+                ResolvedDefinition::Definition(def) if matches!(def.kind(db), DefinitionKind::Function(_)) => {
+                    self.def_key(def)
+                }
+                _ => None,
+            })
     }
 
     fn function_key(&self, def: Definition<'db>) -> Option<Key> {
@@ -172,7 +230,8 @@ impl<'db> Extractor<'_, 'db> {
         let db = self.model.db();
         let env = self.model.program_environment();
         let ty = callee.inferred_type(self.model);
-        let mut resolution = Resolution { targets: Vec::new(), virtual_dispatch: false, reason: String::new() };
+        let mut resolution =
+            Resolution { targets: Vec::new(), virtual_dispatch: false, constructs: None, reason: String::new() };
         match ty {
             Some(ty @ (Type::FunctionLiteral(_) | Type::BoundMethod(_))) => {
                 if let Some(TypeDefinition::Function(def)) = ty.definition(db, &env)
@@ -198,6 +257,9 @@ impl<'db> Extractor<'_, 'db> {
                     }
                     resolution.virtual_dispatch = matches!(callee, Expr::Attribute(_)) && !is_class_object(&ty);
                 }
+                if is_class_object(&ty) {
+                    resolution.constructs = self.class_key(&ty);
+                }
                 resolution.reason = match ty {
                     Type::Dynamic(_) => "the callee's type is unknown".to_string(),
                     Type::Callable(_) => "the callee is a callable type without a definition".to_string(),
@@ -210,8 +272,16 @@ impl<'db> Extractor<'_, 'db> {
             }
             None => resolution.reason = "the callee has no inferred type".to_string(),
         }
-        if resolution.targets.is_empty() {
-            // Decorated functions often lose their identity in the type; go-to-definition keeps it.
+        if let Expr::Attribute(attr) = callee
+            && VALIDATES.contains(&attr.attr.as_str())
+            && let Some(receiver) = attr.value.inferred_type(self.model)
+            && is_class_object(&receiver)
+        {
+            resolution.constructs = self.class_key(&receiver);
+        }
+        // Decorated functions often lose their identity in the type (or become callable objects,
+        // like `functools.lru_cache` wrappers); go-to-definition keeps it.
+        if resolution.targets.is_empty() || matches!(ty, Some(Type::NominalInstance(_))) {
             let keys = match callee {
                 Expr::Name(name) => self.resolved_function_keys(definitions_for_name(
                     self.model,
@@ -223,9 +293,143 @@ impl<'db> Extractor<'_, 'db> {
                 _ => Vec::new(),
             };
             let bound = self.receiver_bound(callee);
-            resolution.targets = keys.into_iter().map(|k| (k, bound)).collect();
+            for key in keys {
+                if !resolution.targets.iter().any(|(k, _)| *k == key) {
+                    resolution.targets.push((key, bound));
+                }
+            }
         }
         resolution
+    }
+
+    fn class_key(&self, ty: &Type<'db>) -> Option<Key> {
+        match ty.definition(self.model.db(), &self.model.program_environment())? {
+            TypeDefinition::StaticClass(def) => self.def_key(def).map(|(k, _)| k),
+            _ => None,
+        }
+    }
+
+    /// The name of a builtin (or `functools.reduce`) the resolved call targets.
+    fn builtin_name<'e>(&self, func: &'e Expr, resolution: &Resolution) -> Option<&'e str> {
+        let db = self.model.db();
+        let is_builtin = |file: File| match file.path(db) {
+            FilePath::Vendored(path) => matches!(path.as_str(), "stdlib/builtins.pyi" | "stdlib/functools.pyi"),
+            _ => false,
+        };
+        // Builtin classes like `tuple` have no constructor definition: check the class itself.
+        let by_targets =
+            !resolution.targets.is_empty() && resolution.targets.iter().all(|((file, _), _)| is_builtin(*file));
+        if !by_targets && !resolution.constructs.is_some_and(|(file, _)| is_builtin(file)) {
+            return None;
+        }
+        match func {
+            Expr::Name(name) => Some(name.id.as_str()),
+            Expr::Attribute(attr) => Some(attr.attr.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Iterating `expr` right away: its `__iter__` runs, and, for a generator created by a call,
+    /// the generator's body. Lazy builtins (`map(f, xs)`) iterate their own arguments.
+    fn iterate(&mut self, expr: &Expr) {
+        if let Expr::Call(call) = expr {
+            if let Expr::Name(name) = &*call.func
+                && LAZY.contains(&name.id.as_str())
+            {
+                let skip = usize::from(matches!(name.id.as_str(), "map" | "filter"));
+                for argument in call.arguments.args.iter().skip(skip) {
+                    self.iterate(argument);
+                }
+                return;
+            }
+            self.iterated.insert(call.start().to_u32());
+        }
+        let text = format!("for ... in {}", self.text(expr.range()));
+        self.implicit_call(expr, "__iter__", text, false, true);
+    }
+
+    /// A callable argument the callee calls during the call (`sorted(xs, key=f)`).
+    fn call_value(&mut self, call: &ast::ExprCall, value: &Expr) {
+        let (targets, param) = match self.value_of(value) {
+            Some(RawValue::Function(key)) => (vec![(key, false)], None),
+            Some(RawValue::Param(owner, name)) => (Vec::new(), Some((owner, name))),
+            _ => return,
+        };
+        self.out.calls.push(RawCall {
+            caller: self.current,
+            location: self.index.location(call.start()),
+            text: self.text(value.range()),
+            targets,
+            virtual_dispatch: false,
+            param,
+            awaited: false,
+            iterates: false,
+            constructs: None,
+            unresolved: None,
+            accessor: None,
+            attribute: None,
+        });
+    }
+
+    /// `obj.name(...)` where `name` is no method of `obj`'s class: an attribute holding a callable.
+    fn attribute_slot(&self, callee: &Expr) -> Option<(Key, String)> {
+        let Expr::Attribute(attr) = callee else { return None };
+        if let Some(class) = self.self_class(&attr.value) {
+            return Some((class, attr.attr.to_string()));
+        }
+        let receiver = attr.value.inferred_type(self.model)?;
+        if !matches!(receiver, Type::NominalInstance(_)) {
+            return None;
+        }
+        Some((self.class_key(&receiver)?, attr.attr.to_string()))
+    }
+
+    /// The class of the current method when `expr` is its first parameter (`self`, typed by ty as
+    /// a `Self` type variable).
+    fn self_class(&self, expr: &Expr) -> Option<Key> {
+        let Expr::Name(name) = expr else { return None };
+        let entry = self.index.functions.get(&self.current)?;
+        (entry.params.first()? == name.id.as_str()).then_some((self.index.file, entry.class?))
+    }
+
+    /// `self.name = value` in a method: records callables stored on instances of the class.
+    fn store(&mut self, target: &Expr, value: &Expr) {
+        let Expr::Attribute(attr) = target else { return };
+        let Some(class) = self.self_class(&attr.value) else { return };
+        if let Some(value) = self.value_of(value) {
+            self.out.stores.push(RawStore { class, name: attr.attr.to_string(), value });
+        }
+    }
+
+    /// What builtins do with their arguments: iterate them, call them.
+    fn builtin_call(&mut self, name: &str, call: &ast::ExprCall) {
+        let args = &call.arguments.args;
+        match name {
+            "map" | "filter" | "reduce" => {
+                if let Some(f) = args.first() {
+                    self.call_value(call, f);
+                }
+                if name == "reduce"
+                    && let Some(xs) = args.get(1)
+                {
+                    self.iterate(xs);
+                }
+                return;
+            }
+            "sorted" | "min" | "max" | "sort" => {
+                for keyword in &call.arguments.keywords {
+                    if keyword.arg.as_ref().is_some_and(|a| a.as_str() == "key") {
+                        self.call_value(call, &keyword.value);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if CONSUMERS.contains(&name) {
+            for argument in args.iter().take_while(|a| !a.is_starred_expr()) {
+                self.iterate(argument);
+            }
+        }
     }
 
     /// The callable an argument evaluates to, if any.
@@ -287,7 +491,7 @@ impl<'db> Extractor<'_, 'db> {
         }
     }
 
-    fn implicit_call(&mut self, receiver: &Expr, dunder: &str, text: String, awaited: bool) {
+    fn implicit_call(&mut self, receiver: &Expr, dunder: &str, text: String, awaited: bool, iterates: bool) {
         let member = self.synthesized_member(receiver, dunder);
         let keys = self.resolved_function_keys(definitions_for_attribute(self.model, &member));
         if keys.is_empty() {
@@ -301,8 +505,11 @@ impl<'db> Extractor<'_, 'db> {
             virtual_dispatch: true,
             param: None,
             awaited,
+            iterates,
+            constructs: None,
             unresolved: None,
-            property_access: false,
+            accessor: None,
+            attribute: None,
         });
     }
 
@@ -338,6 +545,10 @@ impl<'db> Extractor<'_, 'db> {
                 });
             }
         }
+        if let Some(name) = self.builtin_name(&call.func, &resolution) {
+            self.builtin_call(name, call);
+        }
+        let attribute = if resolution.targets.is_empty() { self.attribute_slot(&call.func) } else { None };
         let unresolved =
             (resolution.targets.is_empty() && param.is_none()).then_some(resolution.reason);
         self.out.calls.push(RawCall {
@@ -348,8 +559,11 @@ impl<'db> Extractor<'_, 'db> {
             virtual_dispatch: resolution.virtual_dispatch,
             param,
             awaited: self.awaited.contains(&call.start().to_u32()),
+            iterates: self.iterated.contains(&call.start().to_u32()),
+            constructs: resolution.constructs,
             unresolved,
-            property_access: false,
+            accessor: None,
+            attribute,
         });
     }
 
@@ -406,19 +620,34 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                 }
                 self.in_scope(key, |this| this.visit_body(&def.body));
             }
+            Stmt::Assign(assign) if self.recording() => {
+                for target in &assign.targets {
+                    self.store(target, &assign.value);
+                }
+                walk_stmt(self, stmt);
+            }
+            Stmt::AnnAssign(assign) if self.recording() => {
+                if let Some(value) = &assign.value {
+                    self.store(&assign.target, value);
+                }
+                walk_stmt(self, stmt);
+            }
             Stmt::With(with) if self.recording() => {
                 let (enter, exit) = if with.is_async { ("__aenter__", "__aexit__") } else { ("__enter__", "__exit__") };
                 for item in &with.items {
                     let text = format!("{}with {}", if with.is_async { "async " } else { "" }, self.text(item.context_expr.range()));
-                    self.implicit_call(&item.context_expr, enter, text.clone(), with.is_async);
-                    self.implicit_call(&item.context_expr, exit, text, with.is_async);
+                    self.implicit_call(&item.context_expr, enter, text.clone(), with.is_async, false);
+                    self.implicit_call(&item.context_expr, exit, text, with.is_async, false);
                 }
                 walk_stmt(self, stmt);
             }
             Stmt::For(for_stmt) if self.recording() => {
-                let dunder = if for_stmt.is_async { "__aiter__" } else { "__iter__" };
-                let text = format!("for ... in {}", self.text(for_stmt.iter.range()));
-                self.implicit_call(&for_stmt.iter, dunder, text, false);
+                if for_stmt.is_async {
+                    let text = format!("async for ... in {}", self.text(for_stmt.iter.range()));
+                    self.implicit_call(&for_stmt.iter, "__aiter__", text, false, false);
+                } else {
+                    self.iterate(&for_stmt.iter);
+                }
                 walk_stmt(self, stmt);
             }
             _ => walk_stmt(self, stmt),
@@ -439,6 +668,26 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                 }
                 self.in_scope(lambda.start().to_u32(), |this| this.visit_expr(&lambda.body));
             }
+            Expr::ListComp(ast::ExprListComp { generators, .. })
+            | Expr::SetComp(ast::ExprSetComp { generators, .. })
+            | Expr::Generator(ast::ExprGenerator { generators, .. })
+                if self.recording() =>
+            {
+                for generator in generators.iter().filter(|g| !g.is_async) {
+                    self.iterate(&generator.iter);
+                }
+                walk_expr(self, expr);
+            }
+            Expr::DictComp(ast::ExprDictComp { generators, .. }) if self.recording() => {
+                for generator in generators.iter().filter(|g| !g.is_async) {
+                    self.iterate(&generator.iter);
+                }
+                walk_expr(self, expr);
+            }
+            Expr::YieldFrom(yield_from) if self.recording() => {
+                self.iterate(&yield_from.value);
+                walk_expr(self, expr);
+            }
             Expr::Call(call) => {
                 self.callees.insert((call.func.start().to_u32(), call.func.end().to_u32()));
                 if self.recording() {
@@ -447,10 +696,15 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                 walk_expr(self, expr);
             }
             Expr::Attribute(attr)
-                if attr.ctx == ExprContext::Load
-                    && self.recording()
+                if self.recording()
+                    && self.properties.is_none_or(|p| p.contains(attr.attr.as_str()))
                     && !self.callees.contains(&(attr.start().to_u32(), attr.end().to_u32())) =>
             {
+                let accessor = match attr.ctx {
+                    ExprContext::Store => Accessor::Set,
+                    ExprContext::Del => Accessor::Delete,
+                    _ => Accessor::Get,
+                };
                 let keys = self.resolved_function_keys(definitions_for_attribute(self.model, attr));
                 if !keys.is_empty() {
                     self.out.calls.push(RawCall {
@@ -461,8 +715,11 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                         virtual_dispatch: true,
                         param: None,
                         awaited: false,
+                        iterates: false,
+                        constructs: None,
                         unresolved: None,
-                        property_access: true,
+                        accessor: Some(accessor),
+                        attribute: None,
                     });
                 }
                 walk_expr(self, expr);

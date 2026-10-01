@@ -1,0 +1,79 @@
+{
+  "flow": "hydroid adversarial recall + Polar speed",
+  "goal": {
+    "recall": {
+      "target": "train/holdout recall on tests/adversarial",
+      "direction": "higher",
+      "hold": [
+        "false_positives == 0",
+        "cargo test --workspace green"
+      ]
+    },
+    "speed": {
+      "target": "Polar server wall time (tests: target/corpus/polar/server)",
+      "direction": "lower",
+      "goal_ms": 500,
+      "hold": [
+        "Polar diagnostics unchanged unless reviewed"
+      ]
+    }
+  },
+  "split": "tests/adversarial/split.json (sha1(name) % 3 == 0 -> holdout); holdout read only in aggregate",
+  "harness_paths": [
+    "scripts/hillclimb/score.py",
+    "tests/adversarial/cases",
+    "tests/adversarial/split.json"
+  ],
+  "approve_each_round": false,
+  "machine": "4 vCPU container, 15 GB",
+  "rounds": [
+    {
+      "round": 0,
+      "change": "baseline",
+      "train_recall": "15/73",
+      "train_fp": 2,
+      "holdout_recall": "4/27",
+      "holdout_fp": 0,
+      "polar_ms": [
+        19502,
+        18823,
+        16987
+      ],
+      "polar_extract_ms": 16231,
+      "polar_analyze_ms": 446,
+      "polar_diagnostics": 52,
+      "reference": "ty 0.0.15 check on Polar: 10.6 s wall, 23 s CPU"
+    },
+    {
+      "round": 1,
+      "lever": "speed",
+      "change": "parallel prebuild of library indexes before merge (merge was 8 s single-threaded); background teardown of ty's db; property checks gated by known property names; memoized overrides + Fx hashing + precomputed catalog flags in analysis; persistent fact cache (.hydroid_cache, chunked parallel bincode, overlapped with fingerprinting)",
+      "rejected": [
+        "mimalloc: +2.5 s slower on this box (A/B, 3 runs each)"
+      ],
+      "polar_cold_ms": "~12300 (iterate build, quiet machine)",
+      "polar_warm_ms": [
+        404,
+        348,
+        442,
+        395,
+        353,
+        333,
+        316
+      ],
+      "polar_analyze_ms": "446 -> ~170",
+      "polar_diagnostics": "52, identical incl. chains and unresolved"
+    },
+    {
+      "round": 2,
+      "lever": "recall",
+      "change": "iteration contexts (comprehensions, consuming builtins, yield from) + generator semantics (calling runs nothing, iterating runs the body); builtins calling their args (sorted/min/max key, map, filter, reduce, list.sort); constructors run __post_init__/model_post_init/pydantic validators; property setters/deleters; class-body aliases (__enter__ = acquire); callable objects (lru_cache) resolved through go-to-definition; callables stored on self; catalog: file, network, synchronization, SQLAlchemy Query/scoped_session/Connection",
+      "train_recall": "73/73",
+      "train_fp": 0,
+      "holdout_recall": "7/27",
+      "holdout_fp": 0,
+      "polar_diagnostics": "52 -> 100 (48 new, all reviewed: @functools.cache functions doing file I/O on the loop, one tempfile.mkdtemp in an async script; 0 lost)",
+      "polar_unresolved": "8341 -> 6520"
+    }
+  ]
+}

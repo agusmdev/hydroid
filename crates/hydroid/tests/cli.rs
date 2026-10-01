@@ -112,3 +112,23 @@ fn exit_status() {
     let missing = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cli-does-not-exist");
     assert_eq!(hydroid(&missing, &[]).status.code(), Some(2));
 }
+
+#[test]
+fn unchanged_projects_reuse_cached_facts() {
+    let dir = project("cache", &[("app.py", "import time\n\n\nasync def handler():\n    time.sleep(1)\n")]);
+    let first = json(&hydroid(&dir, &["--format", "json"]));
+    assert!(dir.join(".hydroid_cache/facts.bin").is_file());
+    let second = json(&hydroid(&dir, &["--format", "json"]));
+    assert_eq!(first["diagnostics"], second["diagnostics"]);
+    assert_eq!(second["diagnostics"].as_array().unwrap().len(), 1);
+
+    // Any change to a source file is a miss: the new code is analyzed.
+    std::fs::write(dir.join("app.py"), "import asyncio\n\n\nasync def handler():\n    await asyncio.sleep(1)\n").unwrap();
+    let edited = json(&hydroid(&dir, &["--format", "json"]));
+    assert_eq!(edited["diagnostics"].as_array().unwrap().len(), 0);
+
+    // `--no-cache` neither reads nor writes it.
+    let dir = project("no-cache", &[("app.py", "async def handler():\n    pass\n")]);
+    hydroid(&dir, &["--no-cache"]);
+    assert!(!dir.join(".hydroid_cache").exists());
+}

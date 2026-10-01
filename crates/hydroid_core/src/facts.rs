@@ -3,23 +3,23 @@
 //! Extraction (`hydroid_ty`) produces [`Facts`]; analysis consumes them. Nothing in here knows
 //! about ty, so the analysis can be reasoned about (and tested) as a pure graph problem.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FnId(pub u32);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ClassId(pub u32);
 
 /// A 1-based source position. `path` is relative to the project root when inside it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Location {
     pub path: String,
     pub line: u32,
     pub column: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Origin {
     Project,
@@ -27,7 +27,7 @@ pub enum Origin {
     Stdlib,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FunctionKind {
     Def,
@@ -37,7 +37,19 @@ pub enum FunctionKind {
     Module,
 }
 
-#[derive(Clone, Debug, Serialize)]
+/// The role of a function in a property: which attribute access runs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Accessor {
+    /// `obj.attr` (`@property`, `@cached_property`).
+    Get,
+    /// `obj.attr = value` (`@attr.setter`).
+    Set,
+    /// `del obj.attr` (`@attr.deleter`).
+    Delete,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Function {
     /// `module.Class.method`, `module.outer.<locals>.inner`, `module.<lambda:LINE>`.
     pub qualname: String,
@@ -45,7 +57,12 @@ pub struct Function {
     pub origin: Origin,
     pub kind: FunctionKind,
     pub is_async: bool,
-    pub is_property: bool,
+    pub property: Option<Accessor>,
+    /// An undecorated generator function: calling it only creates the generator, iterating the
+    /// generator runs the body.
+    pub is_generator: bool,
+    /// A pydantic validator: constructing or validating its model runs it.
+    pub is_validator: bool,
     pub params: Vec<String>,
     /// Lexically enclosing function (closures read its parameters).
     pub parent: Option<FnId>,
@@ -57,7 +74,7 @@ pub struct Function {
     pub analyzed: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Class {
     pub qualname: String,
     pub bases: Vec<ClassId>,
@@ -66,7 +83,7 @@ pub struct Class {
     pub methods: Vec<(String, FnId)>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Call {
     pub caller: FnId,
     pub location: Location,
@@ -78,12 +95,29 @@ pub struct Call {
     /// The callee is a parameter of this or an enclosing function: `(owner, name)`.
     pub param: Option<(FnId, String)>,
     pub awaited: bool,
+    /// The generator created by this call is iterated right away (`for x in gen()`,
+    /// `list(gen())`), or the call is an implicit `__iter__` of an iteration.
+    pub iterates: bool,
+    /// Calling a class (or validating into a pydantic model): its `__post_init__` and
+    /// validators run too.
+    pub constructs: Option<ClassId>,
+    /// `obj.name(...)` on an instance of the class, where `name` is not a method: whatever
+    /// callables the class stores in that attribute (see [`Facts::stores`]).
+    pub attribute: Option<(ClassId, String)>,
     /// Why nothing was resolved (only set when `targets` is empty and `param` is `None`).
     pub unresolved: Option<String>,
 }
 
+/// `self.name = value` in a method of `class`, with a callable (or a parameter) as the value.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Store {
+    pub class: ClassId,
+    pub name: String,
+    pub value: Value,
+}
+
 /// A callable flowing into a parameter: `to_thread(f)`, `Depends(get_db)`, `@router.get(...)`.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Flow {
     pub location: Location,
     pub caller: FnId,
@@ -95,7 +129,7 @@ pub struct Flow {
     pub literal: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Slot {
     Param(String),
     /// Applied as a decorator (the decorated function flows into the first parameter).
@@ -104,7 +138,7 @@ pub enum Slot {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Value {
     Function(FnId),
     Class(ClassId),
@@ -112,12 +146,13 @@ pub enum Value {
     Param(FnId, String),
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Facts {
     pub functions: Vec<Function>,
     pub classes: Vec<Class>,
     pub calls: Vec<Call>,
     pub flows: Vec<Flow>,
+    pub stores: Vec<Store>,
     /// Lines carrying a `# hydroid: ignore` comment.
     pub suppressed: Vec<(String, u32)>,
 }

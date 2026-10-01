@@ -1,0 +1,3 @@
+# Large reports stay local; state and per-round results are committed.
+polar_*.json
+*-holdout/

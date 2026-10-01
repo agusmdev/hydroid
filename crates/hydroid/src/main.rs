@@ -30,6 +30,9 @@ struct Cli {
     /// Gitignore-style glob of files to skip (repeatable).
     #[arg(long)]
     exclude: Vec<String>,
+    /// Do not read or write the fact cache (`<PATH>/.hydroid_cache`).
+    #[arg(long)]
+    no_cache: bool,
     #[arg(long, value_enum, default_value_t = Format::Human)]
     format: Format,
 }
@@ -51,6 +54,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         cpu: cli.cpu || config.cpu,
         catalogs,
         exclude: config.exclude.into_iter().chain(cli.exclude).collect(),
+        cache: !cli.no_cache,
         root: cli.path,
     };
     let report = check(&options)?;

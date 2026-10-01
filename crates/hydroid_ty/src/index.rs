@@ -1,7 +1,7 @@
 //! Per-file index of function and class definitions: qualified names, parameters, nesting.
 //! Built for project files and for every file a call resolves into.
 
-use hydroid_core::facts::{FunctionKind, Location, Origin};
+use hydroid_core::facts::{Accessor, FunctionKind, Location, Origin};
 use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::{line_index, source_text};
@@ -26,7 +26,9 @@ pub struct FnEntry {
     pub kind: FunctionKind,
     pub location: Location,
     pub is_async: bool,
-    pub is_property: bool,
+    pub property: Option<Accessor>,
+    pub is_generator: bool,
+    pub is_validator: bool,
     pub params: Vec<String>,
     /// How many of `params` can be passed positionally.
     pub positional: usize,
@@ -87,7 +89,9 @@ impl FileIndex {
             kind: FunctionKind::Module,
             location: index.location(TextSize::new(0)),
             is_async: false,
-            is_property: false,
+            property: None,
+            is_generator: false,
+            is_validator: false,
             params: Vec::new(),
             positional: 0,
             parent: None,
@@ -211,13 +215,55 @@ impl Builder<'_, '_> {
     }
 }
 
-fn is_property_decorator(decorator: &ast::Decorator) -> bool {
-    let name = match &decorator.expression {
-        Expr::Name(name) => name.id.as_str(),
-        Expr::Attribute(attr) => attr.attr.as_str(),
-        _ => return false,
+/// The last name of a decorator: `property`, `setter` (`@x.setter`), `field_validator` (`@field_validator("x")`).
+fn decorator_name(decorator: &ast::Decorator) -> Option<&str> {
+    let expr = match &decorator.expression {
+        Expr::Call(call) => &*call.func,
+        expr => expr,
     };
-    matches!(name, "property" | "cached_property")
+    match expr {
+        Expr::Name(name) => Some(name.id.as_str()),
+        Expr::Attribute(attr) => Some(attr.attr.as_str()),
+        _ => None,
+    }
+}
+
+fn accessor(def: &ast::StmtFunctionDef) -> Option<Accessor> {
+    def.decorator_list.iter().find_map(|d| match decorator_name(d)? {
+        "property" | "cached_property" => Some(Accessor::Get),
+        "setter" => Some(Accessor::Set),
+        "deleter" => Some(Accessor::Delete),
+        _ => None,
+    })
+}
+
+fn is_validator(def: &ast::StmtFunctionDef) -> bool {
+    def.decorator_list
+        .iter()
+        .any(|d| matches!(decorator_name(d), Some("field_validator" | "model_validator" | "validator" | "root_validator")))
+}
+
+/// Whether a body yields (in its own scope: not in nested functions or classes).
+fn yields(body: &[Stmt]) -> bool {
+    struct Finder(bool);
+    impl<'ast> SourceOrderVisitor<'ast> for Finder {
+        fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+            if !self.0 && !matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                walk_stmt(self, stmt);
+            }
+        }
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            match expr {
+                Expr::Yield(_) | Expr::YieldFrom(_) => self.0 = true,
+                Expr::Lambda(_) => {}
+                _ if !self.0 => walk_expr(self, expr),
+                _ => {}
+            }
+        }
+    }
+    let mut finder = Finder(false);
+    finder.visit_body(body);
+    finder.0
 }
 
 fn is_protocol_base(base: &Expr) -> bool {
@@ -252,7 +298,11 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                         kind: FunctionKind::Def,
                         location: self.index.location(def.name.start()),
                         is_async: def.is_async,
-                        is_property: def.decorator_list.iter().any(is_property_decorator),
+                        property: accessor(def),
+                        // A decorated generator (`@contextmanager`) is called through its
+                        // decorator, which decides when the body runs.
+                        is_generator: !def.is_async && def.decorator_list.is_empty() && yields(&def.body),
+                        is_validator: is_validator(def),
                         params,
                         positional,
                         parent: self.enclosing_function(),
@@ -301,7 +351,9 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     kind: FunctionKind::Lambda,
                     location,
                     is_async: false,
-                    is_property: false,
+                    property: None,
+                    is_generator: false,
+                    is_validator: false,
                     params,
                     positional,
                     parent: self.enclosing_function(),

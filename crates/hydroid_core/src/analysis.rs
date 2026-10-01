@@ -7,10 +7,12 @@
 //! recursion, any depth). Diagnostics are the call sites inside loop code (`async def` bodies and
 //! callbacks scheduled on the loop) whose callee blocks.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
+
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::catalog::Catalog;
-use crate::facts::{Call, ClassId, Facts, FnId, Flow, FunctionKind, Location, Origin, Slot, Value};
+use crate::facts::{Call, ClassId, Facts, FnId, Flow, FunctionKind, Origin, Slot, Value};
 use crate::report::{Diagnostic, Frame, ReachedFrom, Report, Sink, Unresolved};
 
 pub fn analyze(facts: &Facts, catalog: &Catalog) -> Report {
@@ -84,9 +86,21 @@ struct Graph<'a> {
     sink: Vec<Option<Sink>>,
     /// See [`Graph::called_params`].
     called: HashSet<ParamKey>,
+    /// Catalog offload APIs, by function.
+    offload: Vec<bool>,
 }
 
 type ParamKey = (FnId, String);
+
+/// What [`Graph::effective_targets`] reads besides the call.
+#[derive(Clone, Copy)]
+struct Context<'g> {
+    nested: &'g [Vec<FnId>],
+    params: &'g HashMap<ParamKey, BTreeSet<FnId>>,
+    called: &'g HashSet<ParamKey>,
+    hierarchy: &'g Hierarchy,
+    stored: &'g HashMap<(ClassId, String), BTreeSet<FnId>>,
+}
 
 impl<'a> Graph<'a> {
     fn new(facts: &'a Facts, catalog: &'a Catalog) -> Self {
@@ -105,29 +119,36 @@ impl<'a> Graph<'a> {
                 })
             })
             .collect();
-        let mut graph = Self { facts, catalog, calls_of, targets: Vec::new(), sink, called: HashSet::new() };
+        let offload = facts.functions.iter().map(|f| catalog.is_offload(&f.qualname)).collect();
+        let mut graph =
+            Self { facts, catalog, calls_of, targets: Vec::new(), sink, called: HashSet::default(), offload };
         let nested = graph.nested_functions();
         let params = graph.parameter_values(&nested);
+        let stored = graph.stored_values(&params);
         graph.called = graph.called_params();
         let called = &graph.called;
         let hierarchy = Hierarchy::new(facts);
-        let mut flows_at: HashMap<(FnId, &Location), Vec<&Flow>> = HashMap::new();
+        // A caller's calls are all in one file: line and column identify the call.
+        let mut flows_at: HashMap<(FnId, u32, u32), Vec<&Flow>> = HashMap::default();
         for flow in &facts.flows {
-            flows_at.entry((flow.caller, &flow.location)).or_default().push(flow);
+            flows_at.entry((flow.caller, flow.location.line, flow.location.column)).or_default().push(flow);
         }
+        let cx = Context { nested: &nested, params: &params, called, hierarchy: &hierarchy, stored: &stored };
+        let mut runs = HashMap::default();
         graph.targets = facts
             .calls
             .iter()
             .map(|call| {
-                let flows = flows_at.get(&(call.caller, &call.location)).map_or(&[][..], |f| &f[..]);
-                graph.effective_targets(call, flows, &nested, &params, called, &hierarchy)
+                let at = (call.caller, call.location.line, call.location.column);
+                let flows = flows_at.get(&at).map_or(&[][..], |f| &f[..]);
+                graph.effective_targets(call, flows, &cx, &mut runs)
             })
             .collect();
         graph
     }
 
     fn is_offload(&self, f: FnId) -> bool {
-        self.catalog.is_offload(&self.facts.function(f).qualname)
+        self.offload[f.0 as usize]
     }
 
     /// Functions defined (at any depth) inside each function.
@@ -162,8 +183,8 @@ impl<'a> Graph<'a> {
 
     /// Which functions each parameter can hold, to a fixpoint over forwarded parameters.
     fn parameter_values(&self, nested: &[Vec<FnId>]) -> HashMap<ParamKey, BTreeSet<FnId>> {
-        let mut values: HashMap<ParamKey, BTreeSet<FnId>> = HashMap::new();
-        let mut forwards: HashMap<ParamKey, Vec<ParamKey>> = HashMap::new();
+        let mut values: HashMap<ParamKey, BTreeSet<FnId>> = HashMap::default();
+        let mut forwards: HashMap<ParamKey, Vec<ParamKey>> = HashMap::default();
         for flow in &self.facts.flows {
             if self.is_offload(flow.into) {
                 continue;
@@ -225,34 +246,49 @@ impl<'a> Graph<'a> {
         }
     }
 
+    /// `runs` memoizes, per target, what calling it runs (itself or decorator wrappers) and its
+    /// overrides.
     fn effective_targets(
         &self,
         call: &Call,
         flows: &[&Flow],
-        nested: &[Vec<FnId>],
-        params: &HashMap<ParamKey, BTreeSet<FnId>>,
-        called: &HashSet<ParamKey>,
-        hierarchy: &Hierarchy,
+        cx: &Context,
+        runs: &mut HashMap<FnId, (Vec<FnId>, Vec<FnId>)>,
     ) -> Vec<FnId> {
-        let mut out = BTreeSet::new();
+        let Context { nested, params, called, hierarchy, stored } = *cx;
+        let mut out = Vec::new();
         for &t in &call.targets {
-            // Calling a function decorated by project code runs the decorator's wrapper, which
-            // reaches the original through the decorator's parameter.
-            let wrappers: Vec<FnId> = self
-                .facts
-                .function(t)
-                .decorators
-                .iter()
-                .filter(|d| self.facts.function(**d).analyzed)
-                .flat_map(|d| nested[d.0 as usize].iter().copied())
-                .collect();
-            if wrappers.is_empty() {
-                out.insert(t);
-            } else {
-                out.extend(wrappers);
-            }
+            let (body, overrides) = runs.entry(t).or_insert_with(|| {
+                // Calling a function decorated by project code runs the decorator's wrapper,
+                // which reaches the original through the decorator's parameter.
+                let wrappers: Vec<FnId> = self
+                    .facts
+                    .function(t)
+                    .decorators
+                    .iter()
+                    .filter(|d| self.facts.function(**d).analyzed)
+                    .flat_map(|d| nested[d.0 as usize].iter().copied())
+                    .collect();
+                let body = if wrappers.is_empty() { vec![t] } else { wrappers };
+                (body, hierarchy.overrides(self.facts, t))
+            });
+            out.extend(body.iter().copied());
             if call.virtual_dispatch {
-                out.extend(hierarchy.overrides(self.facts, t));
+                out.extend(overrides.iter().copied());
+            }
+        }
+        if let Some(class) = call.constructs {
+            out.extend(self.construction_hooks(class));
+        }
+        // A callable stored in an attribute of the class or of one of its bases.
+        if let Some((class, name)) = &call.attribute {
+            let mut seen = HashSet::from_iter([*class]);
+            let mut queue = VecDeque::from([*class]);
+            while let Some(c) = queue.pop_front() {
+                if let Some(values) = stored.get(&(c, name.clone())) {
+                    out.extend(values);
+                }
+                queue.extend(self.facts.class(c).bases.iter().filter(|b| seen.insert(**b)));
             }
         }
         // Callables passed here that the callee calls during this call.
@@ -261,7 +297,7 @@ impl<'a> Graph<'a> {
                 && called.contains(&(flow.into, slot.clone()))
                 && !self.is_offload(flow.into)
             {
-                out.insert(*f);
+                out.push(*f);
             }
         }
         // A called parameter: closures (decorator wrappers) and `async def`s see every callable
@@ -273,7 +309,53 @@ impl<'a> Graph<'a> {
         {
             out.extend(values);
         }
-        out.into_iter().filter(|&t| !self.is_offload(t)).collect()
+        out.sort_unstable();
+        out.dedup();
+        out.retain(|&t| !self.is_offload(t));
+        out
+    }
+
+    /// The callables each `(class, attribute)` can hold: stored directly, or through a parameter
+    /// of the storing method (`self.fetch = fetch` in `__init__`).
+    fn stored_values(
+        &self,
+        params: &HashMap<ParamKey, BTreeSet<FnId>>,
+    ) -> HashMap<(ClassId, String), BTreeSet<FnId>> {
+        let mut stored: HashMap<(ClassId, String), BTreeSet<FnId>> = HashMap::default();
+        for store in &self.facts.stores {
+            let values = stored.entry((store.class, store.name.clone())).or_default();
+            match &store.value {
+                Value::Function(f) => {
+                    values.insert(*f);
+                }
+                Value::Param(owner, name) => values.extend(params.get(&(*owner, name.clone())).into_iter().flatten()),
+                Value::Class(_) => {}
+            }
+        }
+        stored
+    }
+
+    /// What constructing `class` runs besides `__init__`: dataclass `__post_init__`, pydantic
+    /// `model_post_init` and validators (of the class and its bases).
+    fn construction_hooks(&self, class: ClassId) -> Vec<FnId> {
+        let mut hooks: Vec<FnId> = ["__post_init__", "model_post_init"]
+            .iter()
+            .filter_map(|name| Hierarchy::lookup(self.facts, class, name))
+            .collect();
+        let mut seen = HashSet::from_iter([class]);
+        let mut queue = VecDeque::from([class]);
+        while let Some(c) = queue.pop_front() {
+            let cls = self.facts.class(c);
+            hooks.extend(cls.methods.iter().map(|(_, m)| *m).filter(|m| self.facts.function(*m).is_validator));
+            queue.extend(cls.bases.iter().filter(|b| seen.insert(**b)));
+        }
+        hooks
+    }
+
+    /// Whether calling `target` at `call` runs its body now: calling a generator function only
+    /// creates the generator, unless the call site iterates it right away.
+    fn runs_body(&self, call: usize, target: FnId) -> bool {
+        !self.facts.function(target).is_generator || self.facts.calls[call].iterates
     }
 
     /// Loop code: every analyzed `async def`, plus sync callables scheduled on the loop.
@@ -318,7 +400,7 @@ impl<'a> Graph<'a> {
                         next[call.caller.0 as usize] = Some((1, i, t));
                         queue.push_back(call.caller);
                     }
-                } else if !self.facts.function(t).is_async {
+                } else if !self.facts.function(t).is_async && self.runs_body(i, t) {
                     callers_of[t.0 as usize].push((call.caller, i));
                 }
             }
@@ -343,7 +425,7 @@ impl<'a> Graph<'a> {
             .filter_map(|&t| {
                 if self.sink[t.0 as usize].is_some() {
                     (!c.awaited).then_some((0, t))
-                } else if self.facts.function(t).is_async {
+                } else if self.facts.function(t).is_async || !self.runs_body(call, t) {
                     None
                 } else {
                     next[t.0 as usize].map(|(d, _, _)| (d, t))
@@ -422,7 +504,7 @@ impl<'a> Graph<'a> {
         while let Some(f) = queue.pop_front() {
             for &call in &self.calls_of[f.0 as usize] {
                 for &t in &self.targets[call] {
-                    if reach[t.0 as usize].is_none() && self.runs_inline(f, t) {
+                    if reach[t.0 as usize].is_none() && self.runs_inline(f, t) && self.runs_body(call, t) {
                         reach[t.0 as usize] = Some(Reach::Via(f, call));
                         queue.push_back(t);
                     }
@@ -443,7 +525,11 @@ impl<'a> Graph<'a> {
             for &call in &self.calls_of[f.0 as usize] {
                 for &t in &self.targets[call] {
                     let target = self.facts.function(t);
-                    if !on_loop[t.0 as usize] && !target.is_async && self.sink[t.0 as usize].is_none() {
+                    if !on_loop[t.0 as usize]
+                        && !target.is_async
+                        && self.sink[t.0 as usize].is_none()
+                        && self.runs_body(call, t)
+                    {
                         on_loop[t.0 as usize] = true;
                         queue.push_back(t);
                     }
@@ -591,7 +677,7 @@ impl Hierarchy {
             c.methods.iter().filter(|(n, m)| n == name && facts.function(*m).analyzed).map(|(_, m)| *m).collect()
         };
         let mut out = Vec::new();
-        let mut seen = HashSet::from([class]);
+        let mut seen = HashSet::from_iter([class]);
         let mut queue = VecDeque::from([class]);
         while let Some(c) = queue.pop_front() {
             for &sub in &self.subclasses[c.0 as usize] {
@@ -616,7 +702,7 @@ impl Hierarchy {
 
     /// `class.name` through the bases (breadth-first approximation of the MRO).
     fn lookup(facts: &Facts, class: ClassId, name: &str) -> Option<FnId> {
-        let mut seen = HashSet::from([class]);
+        let mut seen = HashSet::from_iter([class]);
         let mut queue = VecDeque::from([class]);
         while let Some(c) = queue.pop_front() {
             let cls = facts.class(c);
