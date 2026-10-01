@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use hydroid_core::facts::{Call, Class, Facts, Flow, Function, Store};
+use hydroid_core::facts::{Call, Class, Facts, FnId, Flow, Function, Store, Value};
 use rayon::prelude::*;
 use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,7 @@ struct Head {
     functions: Vec<Function>,
     classes: Vec<Class>,
     stores: Vec<Store>,
+    returns: Vec<(FnId, Value)>,
     suppressed: Vec<(String, u32)>,
 }
 
@@ -145,6 +146,7 @@ pub fn load(root: &Path) -> Option<(u64, Entry)> {
         calls: calls?,
         flows: flows?,
         stores: head.stores,
+        returns: head.returns,
         suppressed: head.suppressed,
     };
     Some((
@@ -216,6 +218,7 @@ pub fn store(root: &Path, fingerprint: u64, entry: &Entry) {
             functions: facts.functions.clone(),
             classes: facts.classes.clone(),
             stores: facts.stores.clone(),
+            returns: facts.returns.clone(),
             suppressed: facts.suppressed.clone(),
         };
         let mut sections = vec![bincode::serialize(&head)?];

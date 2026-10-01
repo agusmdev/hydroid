@@ -74,6 +74,24 @@
       "holdout_fp": 0,
       "polar_diagnostics": "52 -> 100 (48 new, all reviewed: @functools.cache functions doing file I/O on the loop, one tempfile.mkdtemp in an async script; 0 lost)",
       "polar_unresolved": "8341 -> 6520"
+    },
+    {
+      "round": 3,
+      "lever": "recall",
+      "protocol": "holdout batch 1 unsealed into train (it was scored once per round, never read); a new sealed holdout batch 2 (9 cases, new mechanisms) written before any round-3 change and scored only in aggregate",
+      "ground_truth_fix": "event_handlers used app.add_event_handler, which FastAPI 0.141 / Starlette 1.x no longer has (AttributeError at runtime): replaced by app.router.add_event_handler",
+      "change": "callables in list/tuple literals flow (on_startup=[f]); offload APIs that are also sinks stay targets (Executor.map); operator dunders ([] get/set/del, in, len, binary operators) on instances of non-stdlib classes, gated by dunder names defined in the code; __getattr__ on undefined attributes; callables returned by functions (get_loader()(), nap = make(); nap()); classes returned by unannotated functions (ty leaves those Unknown) for method and dunder lookups; implicit calls never reported as unresolved; catalog: redis Lock and PubSub, Executor.__exit__/map, as_completed, Pool.starmap",
+      "train_recall": "100/100",
+      "train_fp": 0,
+      "holdout2_recall": "5/13 before -> 5/13 after",
+      "holdout2_fp": 0,
+      "polar_diagnostics": "100, identical",
+      "polar_unresolved": "6520 -> 6477",
+      "polar_cold_ms": [
+        12514,
+        12947,
+        14384
+      ]
     }
   ]
 }

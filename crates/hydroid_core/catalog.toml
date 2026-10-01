@@ -260,6 +260,18 @@ functions = [
     "redis.client.Redis.execute_command",
     "redis.client.Pipeline.execute",
     "redis.commands.core.*Commands.*",
+    "redis.lock.Lock.__enter__",
+    "redis.lock.Lock.acquire",
+    "redis.lock.Lock.release",
+    "redis.lock.Lock.extend",
+    "redis.lock.Lock.reacquire",
+    "redis.client.PubSub.execute_command",
+    "redis.client.PubSub.subscribe",
+    "redis.client.PubSub.psubscribe",
+    "redis.client.PubSub.unsubscribe",
+    "redis.client.PubSub.get_message",
+    "redis.client.PubSub.listen",
+    "redis.client.PubSub.ping",
 ]
 
 [[sink]]
@@ -287,8 +299,12 @@ functions = [
     "concurrent.futures._base.Future.result",
     "concurrent.futures._base.wait",
     "concurrent.futures._base.Executor.shutdown",
+    "concurrent.futures._base.Executor.__exit__",
+    "concurrent.futures._base.Executor.map",
+    "concurrent.futures._base.as_completed",
     "multiprocessing.pool.Pool.map",
     "multiprocessing.pool.Pool.apply",
+    "multiprocessing.pool.Pool.starmap",
 ]
 
 [[sink]]

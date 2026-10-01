@@ -21,7 +21,7 @@ def close_db():
 
 
 app = FastAPI(on_startup=[warm_cache])
-app.add_event_handler("startup", init_db)
+app.router.add_event_handler("startup", init_db)
 router = APIRouter(on_shutdown=[flush])
-app.router.add_event_handler("shutdown", close_db)
+router.add_event_handler("shutdown", close_db)
 app.include_router(router)

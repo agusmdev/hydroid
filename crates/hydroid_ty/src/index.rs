@@ -238,9 +238,9 @@ fn accessor(def: &ast::StmtFunctionDef) -> Option<Accessor> {
 }
 
 fn is_validator(def: &ast::StmtFunctionDef) -> bool {
-    def.decorator_list
-        .iter()
-        .any(|d| matches!(decorator_name(d), Some("field_validator" | "model_validator" | "validator" | "root_validator")))
+    def.decorator_list.iter().any(|d| {
+        matches!(decorator_name(d), Some("field_validator" | "model_validator" | "validator" | "root_validator"))
+    })
 }
 
 /// Whether a body yields (in its own scope: not in nested functions or classes).

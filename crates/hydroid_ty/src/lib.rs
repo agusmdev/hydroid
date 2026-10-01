@@ -206,14 +206,17 @@ impl Indexes {
         }
     }
 
-    /// Names of the properties defined in indexed files: only attribute reads with these names
-    /// can run code.
-    fn property_names(&self) -> FxHashSet<String> {
+    /// Names of the properties and of the dunder methods defined in indexed files: only
+    /// attribute accesses and operators with these names can run code.
+    fn implicit_names(&self) -> FxHashSet<String> {
         let map = self.0.lock();
         map.values()
             .flat_map(|i| i.functions.values())
-            .filter(|f| f.property.is_some())
-            .filter_map(|f| f.qualname.rsplit('.').next().map(str::to_string))
+            .filter(|f| f.class.is_some())
+            .filter_map(|f| {
+                let name = f.qualname.rsplit('.').next()?;
+                (f.property.is_some() || (name.starts_with("__") && name.ends_with("__"))).then(|| name.to_string())
+            })
             .collect()
     }
 }
@@ -224,6 +227,13 @@ fn referenced_files(facts: &[FileFacts]) -> FxHashSet<File> {
     for f in facts {
         files.extend(f.calls.iter().flat_map(|c| c.targets.iter().map(|(key, _)| key.0)));
         files.extend(f.decorators.iter().flat_map(|(_, d)| d.iter().map(|key| key.0)));
+        for (_, value) in &f.returns {
+            if let RawValue::Function((file, _)) | RawValue::Class((file, _)) = value {
+                files.insert(*file);
+            }
+        }
+        files.extend(f.calls.iter().flat_map(|c| c.returned_by.iter().map(|key| key.0)));
+        files.extend(f.calls.iter().filter_map(|c| c.attribute.as_ref().map(|(key, _)| key.0)));
         for store in &f.stores {
             files.insert(store.class.0);
             if let RawValue::Function((file, _)) | RawValue::Class((file, _)) = store.value {
@@ -240,15 +250,16 @@ fn referenced_files(facts: &[FileFacts]) -> FxHashSet<File> {
     files
 }
 
-/// `all_properties`: check every attribute read for a property call (library properties
-/// included), not only reads of names defined as properties in the files indexed so far.
+/// `all_implicit`: check every attribute access and operator for implicit calls (library
+/// properties and dunders included), not only those named after definitions in the files
+/// indexed so far.
 fn run(
     db: &HydroidDb,
     indexes: &Indexes,
     units: &[(File, Option<FxHashSet<u32>>)],
-    all_properties: bool,
+    all_implicit: bool,
 ) -> Vec<FileFacts> {
-    let properties = (!all_properties).then(|| indexes.property_names());
+    let implicit = (!all_implicit).then(|| indexes.implicit_names());
     let shared = Mutex::new(db.clone());
     units
         .par_iter()
@@ -256,7 +267,7 @@ fn run(
             || shared.lock().clone(),
             |db, (file, wanted)| {
                 let index = indexes.get(db, *file);
-                extract_file(db, &index, wanted.as_ref(), properties.as_ref())
+                extract_file(db, &index, wanted.as_ref(), implicit.as_ref())
             },
         )
         .collect()
@@ -363,18 +374,19 @@ impl<'a> Merger<'a> {
             let mut targets: Vec<FnId> = raw.targets.iter().filter_map(|&(k, _)| self.fn_id(k)).collect();
             if let Some(accessor) = raw.accessor {
                 targets.retain(|t| self.facts.function(*t).property == Some(accessor));
-                if targets.is_empty() {
-                    continue;
-                }
+            }
+            if raw.implicit && targets.is_empty() && raw.attribute.is_none() {
+                continue;
             }
             let param = raw.param.and_then(|(owner, name)| Some((self.fn_id((file, owner))?, name)));
             let constructs = raw.constructs.and_then(|k| self.class_id(k));
             let attribute = raw.attribute.and_then(|(k, name)| Some((self.class_id(k)?, name)));
+            let returned_by = raw.returned_by.into_iter().filter_map(|k| self.fn_id(k)).collect();
             self.facts.calls.push(Call {
                 caller,
                 location: raw.location,
                 text: raw.text,
-                unresolved: if targets.is_empty() && param.is_none() {
+                unresolved: if targets.is_empty() && param.is_none() && !raw.implicit {
                     Some(raw.unresolved.unwrap_or_else(|| "the callee is not a function definition".into()))
                 } else {
                     None
@@ -386,7 +398,14 @@ impl<'a> Merger<'a> {
                 iterates: raw.iterates,
                 constructs,
                 attribute,
+                returned_by,
             });
+        }
+        for (function, value) in file_facts.returns {
+            let (Some(function), Some(value)) = (self.fn_id((file, function)), self.value(file, value)) else {
+                continue;
+            };
+            self.facts.returns.push((function, value));
         }
         for raw in file_facts.stores {
             let Some(class) = self.class_id(raw.class) else { continue };

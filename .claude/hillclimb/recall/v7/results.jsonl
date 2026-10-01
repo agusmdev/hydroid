@@ -1,0 +1,24 @@
+{"case": "async_lookalikes", "split": "train", "hits": [], "misses": [], "false_positives": [], "seconds": 0.925}
+{"case": "attribute_callables", "split": "train", "hits": ["app.py:22 requests.api.get", "app.py:35 requests.api.get"], "misses": [], "false_positives": [], "seconds": 0.233}
+{"case": "callable_builtins", "split": "train", "hits": ["app.py:20 os.stat", "app.py:21 genericpath.getsize", "app.py:22 os.stat", "app.py:23 builtins.open", "app.py:24 genericpath.exists", "app.py:25 builtins.open", "app.py:26 os.stat"], "misses": [], "false_positives": [], "seconds": 0.323}
+{"case": "callable_instance", "split": "train", "hits": ["app.py:22 requests.api.get", "app.py:23 requests.api.get", "app.py:25 requests.api.get"], "misses": [], "false_positives": [], "seconds": 0.218}
+{"case": "comprehension_iter", "split": "train", "hits": ["app.py:22 requests.api.get", "app.py:23 requests.api.get", "app.py:24 requests.api.get", "app.py:25 requests.api.get", "app.py:32 requests.api.get", "app.py:33 requests.api.get", "app.py:34 requests.api.get", "app.py:46 time.sleep"], "misses": [], "false_positives": [], "seconds": 0.228}
+{"case": "dataclass_post_init", "split": "train", "hits": ["app.py:35 builtins.open", "app.py:36 _sqlite3.connect"], "misses": [], "false_positives": [], "seconds": 0.224}
+{"case": "decorated_cache", "split": "train", "hits": ["app.py:44 builtins.open", "app.py:45 requests.api.get", "app.py:46 builtins.open", "app.py:49 requests.api.post", "app.py:50 requests.api.get"], "misses": [], "false_positives": [], "seconds": 0.265}
+{"case": "event_handlers", "split": "train", "hits": ["app.py:8 time.sleep", "app.py:12 _sqlite3.connect", "app.py:16 time.sleep", "app.py:20 time.sleep"], "misses": [], "false_positives": [], "seconds": 0.366}
+{"case": "executor_with", "split": "train", "hits": ["app.py:16 *", "app.py:18 *", "app.py:20 *"], "misses": [], "false_positives": [], "seconds": 0.235}
+{"case": "file_ops", "split": "train", "hits": ["app.py:17 *", "app.py:18 *", "app.py:19 *", "app.py:20 *", "app.py:21 *", "app.py:22 *", "app.py:23 *", "app.py:24 *", "app.py:25 *", "app.py:26 *", "app.py:27 *", "app.py:28 *", "app.py:29 *", "app.py:30 *", "app.py:31 *"], "misses": [], "false_positives": [], "seconds": 0.322}
+{"case": "generator_not_iterated", "split": "train", "hits": ["app.py:35 time.sleep"], "misses": [], "false_positives": [], "seconds": 0.209}
+{"case": "getattr_proxy", "split": "train", "hits": ["app.py:24 builtins.open"], "misses": [], "false_positives": [], "seconds": 0.212}
+{"case": "inherited_init", "split": "train", "hits": ["app.py:30 _sqlite3.connect", "app.py:31 _sqlite3.connect", "app.py:32 _sqlite3.connect"], "misses": [], "false_positives": [], "seconds": 0.247}
+{"case": "network_ops", "split": "train", "hits": ["app.py:13 *", "app.py:14 smtplib.SMTP.send_message", "app.py:16 *", "app.py:17 builtins.open", "app.py:17 *", "app.py:19 *", "app.py:20 *", "app.py:21 *"], "misses": [], "false_positives": [], "seconds": 0.26}
+{"case": "operator_dunders", "split": "train", "hits": ["app.py:27 *", "app.py:28 *", "app.py:29 *", "app.py:30 *"], "misses": [], "false_positives": [], "seconds": 0.434}
+{"case": "partial_direct", "split": "train", "hits": ["app.py:12 time.sleep", "app.py:14 requests.api.get", "app.py:16 time.sleep"], "misses": [], "false_positives": [], "seconds": 0.269}
+{"case": "property_setter", "split": "train", "hits": ["app.py:41 requests.api.put", "app.py:42 requests.api.delete"], "misses": [], "false_positives": [], "seconds": 0.273}
+{"case": "pydantic_validators", "split": "train", "hits": ["app.py:41 requests.api.head", "app.py:42 genericpath.exists"], "misses": [], "false_positives": [], "seconds": 0.45}
+{"case": "redis_lock_pubsub", "split": "train", "hits": ["app.py:10 *", "app.py:13 *", "app.py:14 *", "app.py:21 *", "app.py:22 *", "app.py:23 *"], "misses": [], "false_positives": [], "seconds": 0.608}
+{"case": "returned_callables", "split": "train", "hits": ["app.py:27 requests.api.get", "app.py:29 time.sleep"], "misses": [], "false_positives": [], "seconds": 0.258}
+{"case": "scoped_session", "split": "train", "hits": ["app.py:12 *", "app.py:13 *", "app.py:14 *"], "misses": [], "false_positives": [], "seconds": 0.692}
+{"case": "sqlalchemy_query_iter", "split": "train", "hits": ["app.py:22 *", "app.py:24 *", "app.py:25 *", "app.py:26 *", "app.py:27 *", "app.py:28 sqlalchemy.engine.base.Engine.connect", "app.py:29 *"], "misses": [], "false_positives": [], "seconds": 1.524}
+{"case": "sync_primitives", "split": "train", "hits": ["app.py:19 *", "app.py:20 *", "app.py:21 *", "app.py:24 *"], "misses": [], "false_positives": [], "seconds": 0.213}
+{"case": "thread_primitives_with", "split": "train", "hits": ["app.py:15 *", "app.py:17 *", "app.py:19 *", "app.py:21 *", "app.py:23 *"], "misses": [], "false_positives": [], "seconds": 0.217}

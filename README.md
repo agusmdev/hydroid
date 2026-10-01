@@ -78,10 +78,12 @@ functions = ["acme.client.Client.fetch"]
 1. **Facts** (`crates/hydroid_ty`, the only crate that touches ty): every function body is walked
    in parallel; each call is resolved to its definitions through ty (types, then
    go-to-definition), including implicit calls (`with`, `for` and comprehensions, properties
-   and their setters, constructors with `__post_init__` and pydantic validators, builtins that
-   iterate or call their arguments like `sorted(xs, key=f)`). Callables passed as arguments are
-   recorded as flows (`to_thread(f)`, `Depends(dep)`, decorators), and so are callables stored on
-   `self`. The facts of an unchanged project are reused from `.hydroid_cache/` (keyed by the
+   and their setters, operators like `x[k]` and `k in x` on user classes, `__getattr__`,
+   constructors with `__post_init__` and pydantic validators, builtins that iterate or call their
+   arguments like `sorted(xs, key=f)`). Callables passed as arguments are recorded as flows
+   (`to_thread(f)`, `Depends(dep)`, `on_startup=[f]`, decorators), and so are callables stored
+   on `self` and returned by functions. When ty does not know a value's type because it comes
+   from an unannotated function, the class that function returns is used. The facts of an unchanged project are reused from `.hydroid_cache/` (keyed by the
    binary, the options, the installed packages and every source file's contents).
 2. **Analysis** (`crates/hydroid_core`, plain graph code): where code runs is a property of the
    call, so "does calling `f` block?" is computed once per function by a backwards BFS from
@@ -100,8 +102,9 @@ Sync `def` endpoints and dependencies are not reported: FastAPI runs them in a t
 
 Python is dynamic: calls through `getattr`, untyped parameters, or containers of callables cannot
 always be resolved. They are never silently dropped — `--strict` lists every one reachable on the
-loop. Not modeled yet: operator dunders (`__add__`, `__getitem__`), `__getattr__` proxies, and
-`.pyi`-only libraries under `--follow-libs`. A change to any source file re-extracts the whole
+loop. Not modeled yet: descriptors (`__get__`), `functools.singledispatch` registrations,
+`@overload`ed project functions (the implementation is not followed), the `__next__` of custom
+iterators, and `.pyi`-only libraries under `--follow-libs`. A change to any source file re-extracts the whole
 project (no per-file incremental cache yet).
 
 ## Development

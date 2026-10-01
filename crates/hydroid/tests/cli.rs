@@ -123,7 +123,8 @@ fn unchanged_projects_reuse_cached_facts() {
     assert_eq!(second["diagnostics"].as_array().unwrap().len(), 1);
 
     // Any change to a source file is a miss: the new code is analyzed.
-    std::fs::write(dir.join("app.py"), "import asyncio\n\n\nasync def handler():\n    await asyncio.sleep(1)\n").unwrap();
+    let fixed = "import asyncio\n\n\nasync def handler():\n    await asyncio.sleep(1)\n";
+    std::fs::write(dir.join("app.py"), fixed).unwrap();
     let edited = json(&hydroid(&dir, &["--format", "json"]));
     assert_eq!(edited["diagnostics"].as_array().unwrap().len(), 0);
 

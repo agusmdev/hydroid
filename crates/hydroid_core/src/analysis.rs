@@ -100,6 +100,7 @@ struct Context<'g> {
     called: &'g HashSet<ParamKey>,
     hierarchy: &'g Hierarchy,
     stored: &'g HashMap<(ClassId, String), BTreeSet<FnId>>,
+    returned: &'g HashMap<FnId, BTreeSet<FnId>>,
 }
 
 impl<'a> Graph<'a> {
@@ -125,6 +126,7 @@ impl<'a> Graph<'a> {
         let nested = graph.nested_functions();
         let params = graph.parameter_values(&nested);
         let stored = graph.stored_values(&params);
+        let returned = graph.returned_values(&params);
         graph.called = graph.called_params();
         let called = &graph.called;
         let hierarchy = Hierarchy::new(facts);
@@ -133,7 +135,14 @@ impl<'a> Graph<'a> {
         for flow in &facts.flows {
             flows_at.entry((flow.caller, flow.location.line, flow.location.column)).or_default().push(flow);
         }
-        let cx = Context { nested: &nested, params: &params, called, hierarchy: &hierarchy, stored: &stored };
+        let cx = Context {
+            nested: &nested,
+            params: &params,
+            called,
+            hierarchy: &hierarchy,
+            stored: &stored,
+            returned: &returned,
+        };
         let mut runs = HashMap::default();
         graph.targets = facts
             .calls
@@ -255,7 +264,7 @@ impl<'a> Graph<'a> {
         cx: &Context,
         runs: &mut HashMap<FnId, (Vec<FnId>, Vec<FnId>)>,
     ) -> Vec<FnId> {
-        let Context { nested, params, called, hierarchy, stored } = *cx;
+        let Context { nested, params, called, hierarchy, stored, returned } = *cx;
         let mut out = Vec::new();
         for &t in &call.targets {
             let (body, overrides) = runs.entry(t).or_insert_with(|| {
@@ -280,8 +289,13 @@ impl<'a> Graph<'a> {
         if let Some(class) = call.constructs {
             out.extend(self.construction_hooks(class));
         }
-        // A callable stored in an attribute of the class or of one of its bases.
+        for f in &call.returned_by {
+            out.extend(returned.get(f).into_iter().flatten());
+        }
+        // The method, when ty could not type the receiver; else a callable stored in an
+        // attribute of the class or of one of its bases.
         if let Some((class, name)) = &call.attribute {
+            out.extend(Hierarchy::lookup(self.facts, *class, name));
             let mut seen = HashSet::from_iter([*class]);
             let mut queue = VecDeque::from([*class]);
             while let Some(c) = queue.pop_front() {
@@ -311,7 +325,9 @@ impl<'a> Graph<'a> {
         }
         out.sort_unstable();
         out.dedup();
-        out.retain(|&t| !self.is_offload(t));
+        // Offload APIs run what they are given elsewhere; some also block themselves
+        // (`Executor.map` results are waited for).
+        out.retain(|&t| !self.is_offload(t) || self.sink[t.0 as usize].is_some());
         out
     }
 
@@ -333,6 +349,22 @@ impl<'a> Graph<'a> {
             }
         }
         stored
+    }
+
+    /// The callables each function can return: directly, or a parameter's values.
+    fn returned_values(&self, params: &HashMap<ParamKey, BTreeSet<FnId>>) -> HashMap<FnId, BTreeSet<FnId>> {
+        let mut returned: HashMap<FnId, BTreeSet<FnId>> = HashMap::default();
+        for (function, value) in &self.facts.returns {
+            let values = returned.entry(*function).or_default();
+            match value {
+                Value::Function(f) => {
+                    values.insert(*f);
+                }
+                Value::Param(owner, name) => values.extend(params.get(&(*owner, name.clone())).into_iter().flatten()),
+                Value::Class(_) => {}
+            }
+        }
+        returned
     }
 
     /// What constructing `class` runs besides `__init__`: dataclass `__post_init__`, pydantic

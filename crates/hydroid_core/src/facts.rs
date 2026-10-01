@@ -104,6 +104,9 @@ pub struct Call {
     /// `obj.name(...)` on an instance of the class, where `name` is not a method: whatever
     /// callables the class stores in that attribute (see [`Facts::stores`]).
     pub attribute: Option<(ClassId, String)>,
+    /// The callee is the value returned by calling these functions (`get_loader()()`,
+    /// `nap = make_sleeper(); nap()`), see [`Facts::returns`].
+    pub returned_by: Vec<FnId>,
     /// Why nothing was resolved (only set when `targets` is empty and `param` is `None`).
     pub unresolved: Option<String>,
 }
@@ -153,6 +156,8 @@ pub struct Facts {
     pub calls: Vec<Call>,
     pub flows: Vec<Flow>,
     pub stores: Vec<Store>,
+    /// Callables (or parameters) a function returns.
+    pub returns: Vec<(FnId, Value)>,
     /// Lines carrying a `# hydroid: ignore` comment.
     pub suppressed: Vec<(String, u32)>,
 }
