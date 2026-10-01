@@ -158,6 +158,9 @@ pub struct Facts {
     pub stores: Vec<Store>,
     /// Callables (or parameters) a function returns.
     pub returns: Vec<(FnId, Value)>,
+    /// `(dispatcher, implementation)`: calling the dispatcher may run the implementation
+    /// (`@render.register` on a `functools.singledispatch` function).
+    pub dispatches: Vec<(FnId, FnId)>,
     /// Lines carrying a `# hydroid: ignore` comment.
     pub suppressed: Vec<(String, u32)>,
 }

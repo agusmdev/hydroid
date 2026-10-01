@@ -22,7 +22,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use ty_module_resolver::{ModuleName, resolve_module_confident};
 
 use crate::db::HydroidDb;
-use crate::extract::{FileFacts, RawSlot, RawValue, extract_file};
+use crate::extract::{FileFacts, Implicit, RawSlot, RawValue, extract_file};
 use crate::index::{FileIndex, Key};
 
 pub struct Extraction {
@@ -206,18 +206,45 @@ impl Indexes {
         }
     }
 
-    /// Names of the properties and of the dunder methods defined in indexed files: only
-    /// attribute accesses and operators with these names can run code.
-    fn implicit_names(&self) -> FxHashSet<String> {
+    /// What can run implicitly, from the indexed files: see [`Implicit`].
+    fn implicit(&self) -> Implicit {
         let map = self.0.lock();
-        map.values()
+        let mut names: FxHashSet<String> = map
+            .values()
             .flat_map(|i| i.functions.values())
             .filter(|f| f.class.is_some())
             .filter_map(|f| {
                 let name = f.qualname.rsplit('.').next()?;
                 (f.property.is_some() || (name.starts_with("__") && name.ends_with("__"))).then(|| name.to_string())
             })
-            .collect()
+            .collect();
+        if ["__get__", "__set__", "__delete__"].iter().any(|d| names.contains(*d)) {
+            names.extend(map.values().flat_map(|i| i.class_attributes.iter().cloned()));
+        }
+        // Classes whose MRO (as far as it is indexed) defines `__getattr__`.
+        let defines = |key: &Key| {
+            let class = map.get(&key.0).and_then(|i| i.classes.get(&key.1));
+            class.is_some_and(|c| c.methods.iter().any(|(n, _)| n == "__getattr__"))
+        };
+        let mut getattr_classes: FxHashSet<Key> = FxHashSet::default();
+        for (file, index) in map.iter() {
+            for &offset in index.classes.keys() {
+                let mut queue = vec![(*file, offset)];
+                let mut seen = FxHashSet::default();
+                while let Some(key) = queue.pop() {
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    if defines(&key) {
+                        getattr_classes.insert((*file, offset));
+                        break;
+                    }
+                    let bases = map.get(&key.0).and_then(|i| i.classes.get(&key.1)).map(|c| c.bases.clone());
+                    queue.extend(bases.into_iter().flatten());
+                }
+            }
+        }
+        Implicit { names, getattr_classes }
     }
 }
 
@@ -233,6 +260,7 @@ fn referenced_files(facts: &[FileFacts]) -> FxHashSet<File> {
             }
         }
         files.extend(f.calls.iter().flat_map(|c| c.returned_by.iter().map(|key| key.0)));
+        files.extend(f.dispatches.iter().map(|(key, _)| key.0));
         files.extend(f.calls.iter().filter_map(|c| c.attribute.as_ref().map(|(key, _)| key.0)));
         for store in &f.stores {
             files.insert(store.class.0);
@@ -259,7 +287,7 @@ fn run(
     units: &[(File, Option<FxHashSet<u32>>)],
     all_implicit: bool,
 ) -> Vec<FileFacts> {
-    let implicit = (!all_implicit).then(|| indexes.implicit_names());
+    let implicit = (!all_implicit).then(|| indexes.implicit());
     let shared = Mutex::new(db.clone());
     units
         .par_iter()
@@ -400,6 +428,13 @@ impl<'a> Merger<'a> {
                 attribute,
                 returned_by,
             });
+        }
+        for (dispatcher, implementation) in file_facts.dispatches {
+            let (Some(dispatcher), Some(implementation)) = (self.fn_id(dispatcher), self.fn_id((file, implementation)))
+            else {
+                continue;
+            };
+            self.facts.dispatches.push((dispatcher, implementation));
         }
         for (function, value) in file_facts.returns {
             let (Some(function), Some(value)) = (self.fn_id((file, function)), self.value(file, value)) else {

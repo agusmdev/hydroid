@@ -101,6 +101,7 @@ struct Context<'g> {
     hierarchy: &'g Hierarchy,
     stored: &'g HashMap<(ClassId, String), BTreeSet<FnId>>,
     returned: &'g HashMap<FnId, BTreeSet<FnId>>,
+    dispatches: &'g HashMap<FnId, Vec<FnId>>,
 }
 
 impl<'a> Graph<'a> {
@@ -127,6 +128,10 @@ impl<'a> Graph<'a> {
         let params = graph.parameter_values(&nested);
         let stored = graph.stored_values(&params);
         let returned = graph.returned_values(&params);
+        let mut dispatches: HashMap<FnId, Vec<FnId>> = HashMap::default();
+        for &(dispatcher, implementation) in &facts.dispatches {
+            dispatches.entry(dispatcher).or_default().push(implementation);
+        }
         graph.called = graph.called_params();
         let called = &graph.called;
         let hierarchy = Hierarchy::new(facts);
@@ -142,6 +147,7 @@ impl<'a> Graph<'a> {
             hierarchy: &hierarchy,
             stored: &stored,
             returned: &returned,
+            dispatches: &dispatches,
         };
         let mut runs = HashMap::default();
         graph.targets = facts
@@ -264,7 +270,7 @@ impl<'a> Graph<'a> {
         cx: &Context,
         runs: &mut HashMap<FnId, (Vec<FnId>, Vec<FnId>)>,
     ) -> Vec<FnId> {
-        let Context { nested, params, called, hierarchy, stored, returned } = *cx;
+        let Context { nested, params, called, hierarchy, stored, returned, dispatches } = *cx;
         let mut out = Vec::new();
         for &t in &call.targets {
             let (body, overrides) = runs.entry(t).or_insert_with(|| {
@@ -282,6 +288,7 @@ impl<'a> Graph<'a> {
                 (body, hierarchy.overrides(self.facts, t))
             });
             out.extend(body.iter().copied());
+            out.extend(dispatches.get(&t).into_iter().flatten());
             if call.virtual_dispatch {
                 out.extend(overrides.iter().copied());
             }

@@ -169,6 +169,12 @@ functions = [
     "shutil.copyfile",
     "shutil.copytree",
     "shutil.move",
+    "shutil.copyfileobj",
+    "typing.IO.read",
+    "typing.IO.readline",
+    "typing.IO.readlines",
+    "typing.IO.write",
+    "typing.IO.writelines",
     "shutil._RmtreeType.__call__",
 ]
 

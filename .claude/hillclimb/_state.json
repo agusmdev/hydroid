@@ -92,6 +92,22 @@
         12947,
         14384
       ]
+    },
+    {
+      "round": 4,
+      "lever": "recall",
+      "protocol": "holdout batch 2 unsealed into train after its round-3 score (5/13) was recorded; no sealed cases remain: the next out-of-sample measure needs new cases (scripts/hillclimb/adversary.py with an API key, or a reviewer)",
+      "change": "iteration also runs __next__ (iterators returning self); descriptors (__get__/__set__/__delete__ of class attributes assigned an instance), gated on class attributes assigned a call, only when the code defines a descriptor; contextlib: ExitStack.enter_context/callback, closing(x) -> x.close(); lambdas bound to names; functools.singledispatch implementations registered with @f.register; catalog: typing.IO read/write (UploadFile.file), shutil.copyfileobj; __getattr__ checked only on instances of classes defining it (an open gate cost ~1.5 s cold on Polar)",
+      "train_recall": "113/113",
+      "train_fp": 0,
+      "polar_diagnostics": "100, identical incl. chains",
+      "polar_unresolved": 6477,
+      "polar_cold_ms": [
+        12945,
+        12399,
+        12348
+      ],
+      "polar_warm_ms_median": 365
     }
   ]
 }

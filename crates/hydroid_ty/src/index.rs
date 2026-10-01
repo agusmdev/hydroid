@@ -50,6 +50,9 @@ pub struct FileIndex {
     pub classes: FxHashMap<u32, ClassEntry>,
     /// Lines with a `# hydroid: ignore` comment (project files only).
     pub suppressed: Vec<u32>,
+    /// Class attributes assigned the result of a call (`flags = FromFile(...)`): the only ones
+    /// that can hold a descriptor.
+    pub class_attributes: Vec<String>,
     display_path: String,
     lines: LineIndex,
     source: ruff_db::source::SourceText,
@@ -80,6 +83,7 @@ impl FileIndex {
             functions: FxHashMap::default(),
             classes: FxHashMap::default(),
             suppressed,
+            class_attributes: Vec::new(),
             display_path,
             lines,
             source,
@@ -333,6 +337,21 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                 self.scopes.push((Scope::Class(key), qualname));
                 walk_stmt(self, stmt);
                 self.scopes.pop();
+            }
+            Stmt::Assign(ast::StmtAssign { targets, value, .. }) if self.direct_class().is_some() => {
+                if value.is_call_expr() {
+                    let names = targets.iter().filter_map(|t| t.as_name_expr()).map(|n| n.id.to_string());
+                    self.index.class_attributes.extend(names);
+                }
+                walk_stmt(self, stmt);
+            }
+            Stmt::AnnAssign(ast::StmtAnnAssign { target, value: Some(value), .. })
+                if self.direct_class().is_some() && value.is_call_expr() =>
+            {
+                if let Some(name) = target.as_name_expr() {
+                    self.index.class_attributes.push(name.id.to_string());
+                }
+                walk_stmt(self, stmt);
             }
             _ => walk_stmt(self, stmt),
         }

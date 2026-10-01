@@ -41,6 +41,16 @@ pub struct RawCall {
     pub returned_by: Vec<Key>,
 }
 
+/// What code can run implicitly, from the definitions indexed so far.
+#[derive(Default)]
+pub struct Implicit {
+    /// Names of properties, of dunder methods, and of class attributes that may hold a
+    /// descriptor: attribute accesses and operators with other names run nothing.
+    pub names: FxHashSet<String>,
+    /// Classes defining (or inheriting) `__getattr__`.
+    pub getattr_classes: FxHashSet<Key>,
+}
+
 pub struct RawStore {
     pub class: Key,
     pub name: String,
@@ -77,6 +87,8 @@ pub struct FileFacts {
     pub flows: Vec<RawFlow>,
     pub stores: Vec<RawStore>,
     pub returns: Vec<(u32, RawValue)>,
+    /// `(dispatcher, implementation defined in this file)`.
+    pub dispatches: Vec<(Key, u32)>,
     pub decorators: Vec<(u32, Vec<Key>)>,
 }
 
@@ -85,7 +97,7 @@ pub fn extract_file(
     db: &HydroidDb,
     index: &FileIndex,
     wanted: Option<&FxHashSet<u32>>,
-    implicit: Option<&FxHashSet<String>>,
+    implicit: Option<&Implicit>,
 ) -> FileFacts {
     let program_file = ty_python_semantic::Db::program_file(db, index.file);
     let model = SemanticModel::new(db, program_file);
@@ -106,6 +118,7 @@ pub fn extract_file(
             flows: Vec::new(),
             stores: Vec::new(),
             returns: Vec::new(),
+            dispatches: Vec::new(),
             decorators: Vec::new(),
         },
     };
@@ -137,9 +150,8 @@ struct Extractor<'a, 'db> {
     model: &'a SemanticModel<'db>,
     index: &'a FileIndex,
     wanted: Option<&'a FxHashSet<u32>>,
-    /// Names of properties and of operator dunders defined in the code: only attribute accesses
-    /// and operators with these names can run code (`None`: any name).
-    implicit: Option<&'a FxHashSet<String>>,
+    /// `None`: anything may run code (`--follow-libs`, where library definitions count too).
+    implicit: Option<&'a Implicit>,
     current: u32,
     awaited: FxHashSet<u32>,
     /// Calls whose result is iterated right away (see [`Extractor::iterate`]).
@@ -184,10 +196,13 @@ impl<'db> Extractor<'_, 'db> {
         Some(((range.file(), range.start().to_u32()), is_function))
     }
 
-    /// `__enter__ = acquire` in a class body: the function an alias names.
+    /// `__enter__ = acquire` in a class body, `load = lambda: ...`: the function a name is bound to.
     fn alias_key(&self, def: Definition<'db>, value: &Expr) -> Option<(Key, bool)> {
-        let Expr::Name(name) = value else { return None };
         let db = self.model.db();
+        if let Expr::Lambda(lambda) = value {
+            return Some(((def.file(db), lambda.start().to_u32()), true));
+        }
+        let Expr::Name(name) = value else { return None };
         let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, def.file(db)));
         definitions_for_name(&model, &name.id, value.into(), ImportAliasResolution::ResolveAliases)
             .into_iter()
@@ -328,7 +343,9 @@ impl<'db> Extractor<'_, 'db> {
     fn builtin_name<'e>(&self, func: &'e Expr, resolution: &Resolution) -> Option<&'e str> {
         let db = self.model.db();
         let is_builtin = |file: File| match file.path(db) {
-            FilePath::Vendored(path) => matches!(path.as_str(), "stdlib/builtins.pyi" | "stdlib/functools.pyi"),
+            FilePath::Vendored(path) => {
+                matches!(path.as_str(), "stdlib/builtins.pyi" | "stdlib/functools.pyi" | "stdlib/contextlib.pyi")
+            }
             _ => false,
         };
         // Builtin classes like `tuple` have no constructor definition: check the class itself.
@@ -360,7 +377,11 @@ impl<'db> Extractor<'_, 'db> {
             self.iterated.insert(call.start().to_u32());
         }
         let text = format!("for ... in {}", self.text(expr.range()));
-        self.implicit_call(expr, "__iter__", text, false, true);
+        self.implicit_call(expr, "__iter__", text.clone(), false, true);
+        // Iterators returning themselves from `__iter__` do the work in `__next__`.
+        if self.operator_may_run(expr, "__next__") {
+            self.implicit_call(expr, "__next__", text, false, true);
+        }
     }
 
     /// A callable argument the callee calls during the call (`sorted(xs, key=f)`).
@@ -389,7 +410,17 @@ impl<'db> Extractor<'_, 'db> {
     }
 
     fn may_run(&self, name: &str) -> bool {
-        self.implicit.is_none_or(|names| names.contains(name))
+        self.implicit.is_none_or(|implicit| implicit.names.contains(name))
+    }
+
+    /// Whether reading an attribute `attr` does not define may run `__getattr__`.
+    fn may_run_getattr(&self, attr: &ast::ExprAttribute) -> bool {
+        let Some(implicit) = self.implicit else { return true };
+        if implicit.getattr_classes.is_empty() {
+            return false;
+        }
+        let Some(ty @ Type::NominalInstance(_)) = attr.value.inferred_type(self.model) else { return false };
+        self.class_key(&ty).is_some_and(|class| implicit.getattr_classes.contains(&class))
     }
 
     /// Whether an operator on `operand` may call a user-defined `dunder`: the dunder is defined
@@ -498,6 +529,49 @@ impl<'db> Extractor<'_, 'db> {
         }
     }
 
+    /// Class attributes holding a descriptor: accessing them runs `__get__` (`__set__`,
+    /// `__delete__`) of the descriptor's class.
+    fn descriptor_calls(
+        &mut self,
+        attr: &ast::ExprAttribute,
+        accessor: Accessor,
+        definitions: &[ResolvedDefinition<'db>],
+    ) {
+        let dunder = match accessor {
+            Accessor::Get => "__get__",
+            Accessor::Set => "__set__",
+            Accessor::Delete => "__delete__",
+        };
+        if !self.may_run(dunder) {
+            return;
+        }
+        let db = self.model.db();
+        for definition in definitions {
+            let ResolvedDefinition::Definition(def) = definition else { continue };
+            let DefinitionKind::Assignment(assignment) = def.kind(db) else { continue };
+            let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, def.file(db)));
+            let module = parsed_module(db, model.python_file()).load(db);
+            let Some(ty @ Type::NominalInstance(_)) = assignment.value(&module).inferred_type(&model) else { continue };
+            let Some(class) = self.class_key(&ty) else { continue };
+            self.out.calls.push(RawCall {
+                caller: self.current,
+                location: self.index.location(attr.start()),
+                text: self.text(attr.range()),
+                targets: Vec::new(),
+                virtual_dispatch: false,
+                param: None,
+                awaited: false,
+                iterates: false,
+                constructs: None,
+                unresolved: None,
+                accessor: None,
+                implicit: true,
+                attribute: Some((class, dunder.to_string())),
+                returned_by: Vec::new(),
+            });
+        }
+    }
+
     /// What builtins do with their arguments: iterate them, call them.
     fn builtin_call(&mut self, name: &str, call: &ast::ExprCall) {
         let args = &call.arguments.args;
@@ -510,6 +584,28 @@ impl<'db> Extractor<'_, 'db> {
                     && let Some(xs) = args.get(1)
                 {
                     self.iterate(xs);
+                }
+                return;
+            }
+            // contextlib: `stack.enter_context(cm)` enters `cm`, `closing(x)` closes `x`.
+            "enter_context" => {
+                if let Some(cm) = args.first() {
+                    let text = format!("enter_context({})", self.text(cm.range()));
+                    self.implicit_call(cm, "__enter__", text.clone(), false, false);
+                    self.implicit_call(cm, "__exit__", text, false, false);
+                }
+                return;
+            }
+            "closing" => {
+                if let Some(x) = args.first() {
+                    let text = format!("closing({})", self.text(x.range()));
+                    self.implicit_call(x, "close", text, false, false);
+                }
+                return;
+            }
+            "callback" => {
+                if let Some(f) = args.first() {
+                    self.call_value(call, f);
                 }
                 return;
             }
@@ -600,6 +696,9 @@ impl<'db> Extractor<'_, 'db> {
         let keys = self.resolved_function_keys(definitions_for_attribute(self.model, &member));
         // An instance ty knows nothing about: look the dunder up in the class it came from.
         let attribute = if keys.is_empty() {
+            if !matches!(receiver.inferred_type(self.model), Some(Type::Dynamic(_))) {
+                return;
+            }
             let Some(class) = self.receiver_class(receiver) else { return };
             Some((class, dunder.to_string()))
         } else {
@@ -698,6 +797,21 @@ impl<'db> Extractor<'_, 'db> {
                 expr => (expr, None),
             };
             let resolution = self.resolve(callee, call);
+            // `@render.register`: an implementation of a `functools.singledispatch` function.
+            if let Expr::Attribute(attr) = callee
+                && attr.attr.as_str() == "register"
+                && let Expr::Name(dispatcher) = &*attr.value
+            {
+                let definitions = definitions_for_name(
+                    self.model,
+                    &dispatcher.id,
+                    (&*attr.value).into(),
+                    ImportAliasResolution::ResolveAliases,
+                );
+                for dispatcher in self.resolved_function_keys(definitions) {
+                    self.out.dispatches.push((dispatcher, key));
+                }
+            }
             let literal = call.and_then(first_string_literal);
             for &(into, bound) in &resolution.targets {
                 decorators.push(into);
@@ -858,7 +972,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
             }
             Expr::Attribute(attr)
                 if self.recording()
-                    && (self.may_run(attr.attr.as_str()) || self.may_run("__getattr__"))
+                    && (self.may_run(attr.attr.as_str()) || self.may_run_getattr(attr))
                     && !self.callees.contains(&(attr.start().to_u32(), attr.end().to_u32())) =>
             {
                 let accessor = match attr.ctx {
@@ -867,11 +981,9 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                     _ => Accessor::Get,
                 };
                 let definitions = definitions_for_attribute(self.model, attr);
+                self.descriptor_calls(attr, accessor, &definitions);
                 // No such attribute: `__getattr__` computes it (lazy settings, proxies).
-                if definitions.is_empty()
-                    && accessor == Accessor::Get
-                    && matches!(attr.value.inferred_type(self.model), Some(Type::NominalInstance(_)))
-                {
+                if definitions.is_empty() && accessor == Accessor::Get && self.may_run_getattr(attr) {
                     let text = self.text(attr.range());
                     self.implicit_call(&attr.value, "__getattr__", text, false, false);
                 }

@@ -36,6 +36,7 @@ struct Head {
     classes: Vec<Class>,
     stores: Vec<Store>,
     returns: Vec<(FnId, Value)>,
+    dispatches: Vec<(FnId, FnId)>,
     suppressed: Vec<(String, u32)>,
 }
 
@@ -147,6 +148,7 @@ pub fn load(root: &Path) -> Option<(u64, Entry)> {
         flows: flows?,
         stores: head.stores,
         returns: head.returns,
+        dispatches: head.dispatches,
         suppressed: head.suppressed,
     };
     Some((
@@ -219,6 +221,7 @@ pub fn store(root: &Path, fingerprint: u64, entry: &Entry) {
             classes: facts.classes.clone(),
             stores: facts.stores.clone(),
             returns: facts.returns.clone(),
+            dispatches: facts.dispatches.clone(),
             suppressed: facts.suppressed.clone(),
         };
         let mut sections = vec![bincode::serialize(&head)?];
