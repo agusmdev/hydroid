@@ -15,8 +15,8 @@ error[blocking-http]: `requests.api.get` blocks the event loop
    = help: use an async client (`httpx.AsyncClient`, `aiohttp`) or `await asyncio.to_thread(...)`
 ```
 
-**New here? Read the [usage guide](docs/GUIDE.md).** To add it to CI, or have a coding agent
-set it up for you, see [AGENT_SETUP.md](docs/AGENT_SETUP.md).
+**New here? Read the [usage guide](docs/GUIDE.md).** Adding it to CI, or letting a coding agent
+set it up: [CI/CD and agent setup](#cicd-and-agent-setup).
 
 Written in Rust on top of [ty](https://github.com/astral-sh/ty)'s semantic model (types, imports,
 go-to-definition). Polar's server (1,854 files, 108k call sites) takes about as long as ty needs
@@ -73,6 +73,43 @@ category = "sdk"
 advice = "use the async client"
 functions = ["acme.client.Client.fetch"]
 ```
+
+## CI/CD and agent setup
+
+hydroid exits `1` when it finds blocking calls, so it can gate a build as is. On GitHub,
+`--format sarif` puts each blocking chain on the pull request through code scanning:
+
+```yaml
+# .github/workflows/hydroid.yml
+name: hydroid
+on: [push, pull_request]
+jobs:
+  hydroid:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync                      # hydroid needs the project's dependencies installed
+      - run: >-
+          uvx --from hydroid-cli --find-links https://github.com/agusmdev/hydroid/releases/expanded_assets/v0.1.0
+          hydroid . --format sarif > hydroid.sarif || [ $? -eq 1 ]
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: hydroid.sarif
+```
+
+`|| [ $? -eq 1 ]` reports findings without failing the job (exit `2`, an error, still fails it);
+drop it and the upload step to fail the build instead.
+
+[docs/AGENT_SETUP.md](docs/AGENT_SETUP.md) has:
+
+- **a prompt to paste into a coding agent** (Claude Code, Cursor, Codex…) that installs hydroid
+  in your repository, configures `[tool.hydroid]`, triages the existing findings (fix,
+  `# hydroid: ignore` with a reason, or report to you) and adds the CI job;
+- configs for GitLab CI, pre-commit, monorepos, projects not using uv, and other CI systems;
+- a path for adopting it on a code base with existing findings: report-only first, then gate.
 
 ## How it works
 
