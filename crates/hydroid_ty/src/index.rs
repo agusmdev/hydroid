@@ -1,7 +1,7 @@
 //! Per-file index of function and class definitions: qualified names, parameters, nesting.
 //! Built for project files and for every file a call resolves into.
 
-use hydroid_core::facts::{FunctionKind, Location, Origin};
+use hydroid_core::facts::{Accessor, FunctionKind, Location, Origin};
 use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::{line_index, source_text};
@@ -26,7 +26,9 @@ pub struct FnEntry {
     pub kind: FunctionKind,
     pub location: Location,
     pub is_async: bool,
-    pub is_property: bool,
+    pub property: Option<Accessor>,
+    pub is_generator: bool,
+    pub is_validator: bool,
     pub params: Vec<String>,
     /// How many of `params` can be passed positionally.
     pub positional: usize,
@@ -36,6 +38,8 @@ pub struct FnEntry {
 
 pub struct ClassEntry {
     pub qualname: String,
+    /// Project classes only: resolving bases runs type inference on the module, which is costly
+    /// on large libraries. Library bases are resolved on demand, see [`class_bases`].
     pub bases: Vec<Key>,
     pub is_protocol: bool,
     pub methods: Vec<(String, u32)>,
@@ -48,6 +52,9 @@ pub struct FileIndex {
     pub classes: FxHashMap<u32, ClassEntry>,
     /// Lines with a `# hydroid: ignore` comment (project files only).
     pub suppressed: Vec<u32>,
+    /// Class attributes assigned the result of a call (`flags = FromFile(...)`): the only ones
+    /// that can hold a descriptor.
+    pub class_attributes: Vec<String>,
     display_path: String,
     lines: LineIndex,
     source: ruff_db::source::SourceText,
@@ -78,6 +85,7 @@ impl FileIndex {
             functions: FxHashMap::default(),
             classes: FxHashMap::default(),
             suppressed,
+            class_attributes: Vec::new(),
             display_path,
             lines,
             source,
@@ -87,7 +95,9 @@ impl FileIndex {
             kind: FunctionKind::Module,
             location: index.location(TextSize::new(0)),
             is_async: false,
-            is_property: false,
+            property: None,
+            is_generator: false,
+            is_validator: false,
             params: Vec::new(),
             positional: 0,
             parent: None,
@@ -198,26 +208,98 @@ impl Builder<'_, '_> {
         (positional.into_iter().chain(rest).collect(), count)
     }
 
-    fn resolve_base(&self, base: &Expr) -> Option<Key> {
-        let db = self.model.db();
-        let ty = base.inferred_type(self.model)?;
-        let def = match ty.definition(db, &self.model.program_environment())? {
-            TypeDefinition::StaticClass(def) | TypeDefinition::DynamicClass(def) => def,
-            _ => return None,
-        };
-        let module = parsed_module(db, def.python_file(db)).load(db);
-        let range = def.focus_range(db, &module);
-        Some((range.file(), range.start().to_u32()))
+}
+
+fn resolve_base(model: &SemanticModel<'_>, base: &Expr) -> Option<Key> {
+    let db = model.db();
+    let ty = base.inferred_type(model)?;
+    let def = match ty.definition(db, &model.program_environment())? {
+        TypeDefinition::StaticClass(def) | TypeDefinition::DynamicClass(def) => def,
+        _ => return None,
+    };
+    let module = parsed_module(db, def.python_file(db)).load(db);
+    let range = def.focus_range(db, &module);
+    Some((range.file(), range.start().to_u32()))
+}
+
+/// The bases of the class whose name starts at `class.1` in `class.0`.
+pub fn class_bases(db: &HydroidDb, class: Key) -> Vec<Key> {
+    struct Finder<'a> {
+        offset: u32,
+        found: Option<&'a ast::StmtClassDef>,
+    }
+    impl<'a> SourceOrderVisitor<'a> for Finder<'a> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if self.found.is_some() || !stmt.range().contains(TextSize::new(self.offset)) {
+                return;
+            }
+            if let Stmt::ClassDef(def) = stmt
+                && def.name.start().to_u32() == self.offset
+            {
+                self.found = Some(def);
+                return;
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, _: &'a Expr) {}
+    }
+    let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, class.0));
+    let parsed = parsed_module(db, model.python_file()).load(db);
+    let mut finder = Finder { offset: class.1, found: None };
+    finder.visit_body(&parsed.syntax().body);
+    let Some(def) = finder.found else { return Vec::new() };
+    def.bases().iter().filter_map(|b| resolve_base(&model, b)).collect()
+}
+
+/// The last name of a decorator: `property`, `setter` (`@x.setter`), `field_validator` (`@field_validator("x")`).
+fn decorator_name(decorator: &ast::Decorator) -> Option<&str> {
+    let expr = match &decorator.expression {
+        Expr::Call(call) => &*call.func,
+        expr => expr,
+    };
+    match expr {
+        Expr::Name(name) => Some(name.id.as_str()),
+        Expr::Attribute(attr) => Some(attr.attr.as_str()),
+        _ => None,
     }
 }
 
-fn is_property_decorator(decorator: &ast::Decorator) -> bool {
-    let name = match &decorator.expression {
-        Expr::Name(name) => name.id.as_str(),
-        Expr::Attribute(attr) => attr.attr.as_str(),
-        _ => return false,
-    };
-    matches!(name, "property" | "cached_property")
+fn accessor(def: &ast::StmtFunctionDef) -> Option<Accessor> {
+    def.decorator_list.iter().find_map(|d| match decorator_name(d)? {
+        "property" | "cached_property" => Some(Accessor::Get),
+        "setter" => Some(Accessor::Set),
+        "deleter" => Some(Accessor::Delete),
+        _ => None,
+    })
+}
+
+fn is_validator(def: &ast::StmtFunctionDef) -> bool {
+    def.decorator_list.iter().any(|d| {
+        matches!(decorator_name(d), Some("field_validator" | "model_validator" | "validator" | "root_validator"))
+    })
+}
+
+/// Whether a body yields (in its own scope: not in nested functions or classes).
+fn yields(body: &[Stmt]) -> bool {
+    struct Finder(bool);
+    impl<'ast> SourceOrderVisitor<'ast> for Finder {
+        fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+            if !self.0 && !matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                walk_stmt(self, stmt);
+            }
+        }
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            match expr {
+                Expr::Yield(_) | Expr::YieldFrom(_) => self.0 = true,
+                Expr::Lambda(_) => {}
+                _ if !self.0 => walk_expr(self, expr),
+                _ => {}
+            }
+        }
+    }
+    let mut finder = Finder(false);
+    finder.visit_body(body);
+    finder.0
 }
 
 fn is_protocol_base(base: &Expr) -> bool {
@@ -252,7 +334,11 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                         kind: FunctionKind::Def,
                         location: self.index.location(def.name.start()),
                         is_async: def.is_async,
-                        is_property: def.decorator_list.iter().any(is_property_decorator),
+                        property: accessor(def),
+                        // A decorated generator (`@contextmanager`) is called through its
+                        // decorator, which decides when the body runs.
+                        is_generator: !def.is_async && def.decorator_list.is_empty() && yields(&def.body),
+                        is_validator: is_validator(def),
                         params,
                         positional,
                         parent: self.enclosing_function(),
@@ -274,7 +360,11 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
             Stmt::ClassDef(def) => {
                 let key = def.name.start().to_u32();
                 let qualname = format!("{}.{}", self.prefix(), def.name);
-                let bases = def.bases().iter().filter_map(|b| self.resolve_base(b)).collect();
+                let bases = if self.index.origin == Origin::Project {
+                    def.bases().iter().filter_map(|b| resolve_base(self.model, b)).collect()
+                } else {
+                    Vec::new()
+                };
                 let is_protocol = def.bases().iter().any(is_protocol_base);
                 self.index.classes.insert(
                     key,
@@ -283,6 +373,21 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                 self.scopes.push((Scope::Class(key), qualname));
                 walk_stmt(self, stmt);
                 self.scopes.pop();
+            }
+            Stmt::Assign(ast::StmtAssign { targets, value, .. }) if self.direct_class().is_some() => {
+                if value.is_call_expr() {
+                    let names = targets.iter().filter_map(|t| t.as_name_expr()).map(|n| n.id.to_string());
+                    self.index.class_attributes.extend(names);
+                }
+                walk_stmt(self, stmt);
+            }
+            Stmt::AnnAssign(ast::StmtAnnAssign { target, value: Some(value), .. })
+                if self.direct_class().is_some() && value.is_call_expr() =>
+            {
+                if let Some(name) = target.as_name_expr() {
+                    self.index.class_attributes.push(name.id.to_string());
+                }
+                walk_stmt(self, stmt);
             }
             _ => walk_stmt(self, stmt),
         }
@@ -301,7 +406,9 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     kind: FunctionKind::Lambda,
                     location,
                     is_async: false,
-                    is_property: false,
+                    property: None,
+                    is_generator: false,
+                    is_validator: false,
                     params,
                     positional,
                     parent: self.enclosing_function(),

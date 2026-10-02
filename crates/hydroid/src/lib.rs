@@ -22,6 +22,8 @@ pub struct Options {
     pub catalogs: Vec<String>,
     /// Gitignore-style globs of project files to skip, relative to `root`.
     pub exclude: Vec<String>,
+    /// Reuse the facts of an unchanged project from `<root>/.hydroid_cache` (and save them).
+    pub cache: bool,
 }
 
 pub fn check(options: &Options) -> anyhow::Result<Report> {
@@ -37,6 +39,9 @@ pub fn check(options: &Options) -> anyhow::Result<Report> {
         follow_libs: options.follow_libs,
         follow: &follow,
         exclude: &options.exclude,
+        cache: options.cache,
+        // With --follow-libs, which library bodies get extracted depends on the catalogs.
+        cache_salt: &format!("{} {:?}", options.cpu, options.catalogs),
     })?;
     let extracted = Instant::now();
     let mut report = analyze(&extraction.facts, &catalog);

@@ -110,6 +110,7 @@ Awaiting an API is never blocking: `await redis.asyncio.Redis().get(k)` is fine,
 | `--cpu` | `cpu` | also report CPU-heavy calls (bcrypt, pbkdf2, scrypt) |
 | `--strict` | `strict` | list calls hydroid could not resolve, and fail on them |
 | `--exclude GLOB` | `exclude` | skip files, e.g. `migrations/**` (repeatable) |
+| `--no-cache` | | do not reuse or save extracted facts in `.hydroid_cache/` |
 | `--format human\|json\|sarif` | | output format |
 
 Flags win over `pyproject.toml`:

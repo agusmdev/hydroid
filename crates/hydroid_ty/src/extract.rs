@@ -1,12 +1,14 @@
 //! Walks function bodies and records calls (with their resolved callees) and callable flows.
 
-use hydroid_core::facts::Location;
-use ruff_db::files::File;
+use hydroid_core::facts::{Accessor, Location};
+use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::visitor::source_order::{SourceOrderVisitor, walk_expr, walk_stmt};
 use ruff_python_ast::{self as ast, AtomicNodeIndex, Expr, ExprContext, Stmt};
 use ruff_text_size::{Ranged, TextRange};
-use rustc_hash::FxHashSet;
+use std::cell::RefCell;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 use ty_python_core::definition::{Definition, DefinitionKind};
 use ty_python_semantic::types::ide_support::{ResolvedDefinition, call_signature_details};
 use ty_python_semantic::types::{Type, TypeDefinition};
@@ -26,9 +28,33 @@ pub struct RawCall {
     pub virtual_dispatch: bool,
     pub param: Option<(u32, String)>,
     pub awaited: bool,
+    pub iterates: bool,
+    /// The class called (or validated into), see [`hydroid_core::facts::Call::constructs`].
+    pub constructs: Option<Key>,
     pub unresolved: Option<String>,
-    /// An attribute read; only kept if a target turns out to be a property.
-    pub property_access: bool,
+    /// An attribute access; only kept if a target turns out to be this part of a property.
+    pub accessor: Option<Accessor>,
+    /// Implicit (`with`, `for`, operators): dropped when nothing it may run is known.
+    pub implicit: bool,
+    /// See [`hydroid_core::facts::Call::attribute`].
+    pub attribute: Option<(Key, String)>,
+    pub returned_by: Vec<Key>,
+}
+
+/// What code can run implicitly, from the definitions indexed so far.
+#[derive(Default)]
+pub struct Implicit {
+    /// Names of properties, of dunder methods, and of class attributes that may hold a
+    /// descriptor: attribute accesses and operators with other names run nothing.
+    pub names: FxHashSet<String>,
+    /// Classes defining (or inheriting) `__getattr__`.
+    pub getattr_classes: FxHashSet<Key>,
+}
+
+pub struct RawStore {
+    pub class: Key,
+    pub name: String,
+    pub value: RawValue,
 }
 
 #[derive(Clone)]
@@ -59,11 +85,20 @@ pub struct FileFacts {
     pub file: File,
     pub calls: Vec<RawCall>,
     pub flows: Vec<RawFlow>,
+    pub stores: Vec<RawStore>,
+    pub returns: Vec<(u32, RawValue)>,
+    /// `(dispatcher, implementation defined in this file)`.
+    pub dispatches: Vec<(Key, u32)>,
     pub decorators: Vec<(u32, Vec<Key>)>,
 }
 
 /// Extracts the bodies of `wanted` functions (every function and the module body when `None`).
-pub fn extract_file(db: &HydroidDb, index: &FileIndex, wanted: Option<&FxHashSet<u32>>) -> FileFacts {
+pub fn extract_file(
+    db: &HydroidDb,
+    index: &FileIndex,
+    wanted: Option<&FxHashSet<u32>>,
+    implicit: Option<&Implicit>,
+) -> FileFacts {
     let program_file = ty_python_semantic::Db::program_file(db, index.file);
     let model = SemanticModel::new(db, program_file);
     let parsed = parsed_module(db, model.python_file()).load(db);
@@ -71,10 +106,21 @@ pub fn extract_file(db: &HydroidDb, index: &FileIndex, wanted: Option<&FxHashSet
         model: &model,
         index,
         wanted,
+        implicit,
         current: MODULE_KEY,
         awaited: FxHashSet::default(),
+        iterated: FxHashSet::default(),
+        returned_classes: RefCell::default(),
         callees: FxHashSet::default(),
-        out: FileFacts { file: index.file, calls: Vec::new(), flows: Vec::new(), decorators: Vec::new() },
+        out: FileFacts {
+            file: index.file,
+            calls: Vec::new(),
+            flows: Vec::new(),
+            stores: Vec::new(),
+            returns: Vec::new(),
+            dispatches: Vec::new(),
+            decorators: Vec::new(),
+        },
     };
     extractor.visit_body(&parsed.syntax().body);
     extractor.out
@@ -83,15 +129,35 @@ pub fn extract_file(db: &HydroidDb, index: &FileIndex, wanted: Option<&FxHashSet
 struct Resolution {
     targets: Vec<(Key, bool)>,
     virtual_dispatch: bool,
+    constructs: Option<Key>,
     reason: String,
 }
+
+/// Builtins that iterate their positional arguments during the call.
+const CONSUMERS: &[&str] = &[
+    "list", "tuple", "set", "frozenset", "dict", "sorted", "sum", "min", "max", "any", "all", "next", "iter", "join",
+    "extend", "update", "reduce",
+];
+
+/// Builtins returning lazy iterators over their arguments: iterating one iterates those.
+const LAZY: &[&str] = &["map", "filter", "zip", "enumerate", "reversed", "iter"];
+
+/// Pydantic classmethods that validate input into the model (running its validators).
+const VALIDATES: &[&str] =
+    &["model_validate", "model_validate_json", "model_validate_strings", "parse_obj", "parse_raw"];
 
 struct Extractor<'a, 'db> {
     model: &'a SemanticModel<'db>,
     index: &'a FileIndex,
     wanted: Option<&'a FxHashSet<u32>>,
+    /// `None`: anything may run code (`--follow-libs`, where library definitions count too).
+    implicit: Option<&'a Implicit>,
     current: u32,
     awaited: FxHashSet<u32>,
+    /// Calls whose result is iterated right away (see [`Extractor::iterate`]).
+    iterated: FxHashSet<u32>,
+    /// See [`Extractor::returned_classes`].
+    returned_classes: RefCell<FxHashMap<Key, Vec<Key>>>,
     /// Ranges of callee expressions (attribute reads there are calls, not property reads).
     callees: FxHashSet<(u32, u32)>,
     out: FileFacts,
@@ -119,11 +185,33 @@ impl<'db> Extractor<'_, 'db> {
         let is_function = match def.kind(db) {
             DefinitionKind::Function(_) => true,
             DefinitionKind::Class(_) => false,
+            DefinitionKind::Assignment(assignment) => {
+                let module = parsed_module(db, def.python_file(db)).load(db);
+                return self.alias_key(def, assignment.value(&module));
+            }
             _ => return None,
         };
         let module = parsed_module(db, def.python_file(db)).load(db);
         let range = def.focus_range(db, &module);
         Some(((range.file(), range.start().to_u32()), is_function))
+    }
+
+    /// `__enter__ = acquire` in a class body, `load = lambda: ...`: the function a name is bound to.
+    fn alias_key(&self, def: Definition<'db>, value: &Expr) -> Option<(Key, bool)> {
+        let db = self.model.db();
+        if let Expr::Lambda(lambda) = value {
+            return Some(((def.file(db), lambda.start().to_u32()), true));
+        }
+        let Expr::Name(name) = value else { return None };
+        let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, def.file(db)));
+        definitions_for_name(&model, &name.id, value.into(), ImportAliasResolution::ResolveAliases)
+            .into_iter()
+            .find_map(|d| match d {
+                ResolvedDefinition::Definition(def) if matches!(def.kind(db), DefinitionKind::Function(_)) => {
+                    self.def_key(def)
+                }
+                _ => None,
+            })
     }
 
     fn function_key(&self, def: Definition<'db>) -> Option<Key> {
@@ -172,7 +260,8 @@ impl<'db> Extractor<'_, 'db> {
         let db = self.model.db();
         let env = self.model.program_environment();
         let ty = callee.inferred_type(self.model);
-        let mut resolution = Resolution { targets: Vec::new(), virtual_dispatch: false, reason: String::new() };
+        let mut resolution =
+            Resolution { targets: Vec::new(), virtual_dispatch: false, constructs: None, reason: String::new() };
         match ty {
             Some(ty @ (Type::FunctionLiteral(_) | Type::BoundMethod(_))) => {
                 if let Some(TypeDefinition::Function(def)) = ty.definition(db, &env)
@@ -198,6 +287,9 @@ impl<'db> Extractor<'_, 'db> {
                     }
                     resolution.virtual_dispatch = matches!(callee, Expr::Attribute(_)) && !is_class_object(&ty);
                 }
+                if is_class_object(&ty) {
+                    resolution.constructs = self.class_key(&ty);
+                }
                 resolution.reason = match ty {
                     Type::Dynamic(_) => "the callee's type is unknown".to_string(),
                     Type::Callable(_) => "the callee is a callable type without a definition".to_string(),
@@ -210,8 +302,16 @@ impl<'db> Extractor<'_, 'db> {
             }
             None => resolution.reason = "the callee has no inferred type".to_string(),
         }
-        if resolution.targets.is_empty() {
-            // Decorated functions often lose their identity in the type; go-to-definition keeps it.
+        if let Expr::Attribute(attr) = callee
+            && VALIDATES.contains(&attr.attr.as_str())
+            && let Some(receiver) = attr.value.inferred_type(self.model)
+            && is_class_object(&receiver)
+        {
+            resolution.constructs = self.class_key(&receiver);
+        }
+        // Decorated functions often lose their identity in the type (or become callable objects,
+        // like `functools.lru_cache` wrappers); go-to-definition keeps it.
+        if resolution.targets.is_empty() || matches!(ty, Some(Type::NominalInstance(_))) {
             let keys = match callee {
                 Expr::Name(name) => self.resolved_function_keys(definitions_for_name(
                     self.model,
@@ -223,9 +323,313 @@ impl<'db> Extractor<'_, 'db> {
                 _ => Vec::new(),
             };
             let bound = self.receiver_bound(callee);
-            resolution.targets = keys.into_iter().map(|k| (k, bound)).collect();
+            for key in keys {
+                if !resolution.targets.iter().any(|(k, _)| *k == key) {
+                    resolution.targets.push((key, bound));
+                }
+            }
         }
         resolution
+    }
+
+    fn class_key(&self, ty: &Type<'db>) -> Option<Key> {
+        match ty.definition(self.model.db(), &self.model.program_environment())? {
+            TypeDefinition::StaticClass(def) => self.def_key(def).map(|(k, _)| k),
+            _ => None,
+        }
+    }
+
+    /// The name of a builtin (or `functools.reduce`) the resolved call targets.
+    fn builtin_name<'e>(&self, func: &'e Expr, resolution: &Resolution) -> Option<&'e str> {
+        let db = self.model.db();
+        let is_builtin = |file: File| match file.path(db) {
+            FilePath::Vendored(path) => {
+                matches!(path.as_str(), "stdlib/builtins.pyi" | "stdlib/functools.pyi" | "stdlib/contextlib.pyi")
+            }
+            _ => false,
+        };
+        // Builtin classes like `tuple` have no constructor definition: check the class itself.
+        let by_targets =
+            !resolution.targets.is_empty() && resolution.targets.iter().all(|((file, _), _)| is_builtin(*file));
+        if !by_targets && !resolution.constructs.is_some_and(|(file, _)| is_builtin(file)) {
+            return None;
+        }
+        match func {
+            Expr::Name(name) => Some(name.id.as_str()),
+            Expr::Attribute(attr) => Some(attr.attr.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Iterating `expr` right away: its `__iter__` runs, and, for a generator created by a call,
+    /// the generator's body. Lazy builtins (`map(f, xs)`) iterate their own arguments.
+    fn iterate(&mut self, expr: &Expr) {
+        if let Expr::Call(call) = expr {
+            if let Expr::Name(name) = &*call.func
+                && LAZY.contains(&name.id.as_str())
+            {
+                let skip = usize::from(matches!(name.id.as_str(), "map" | "filter"));
+                for argument in call.arguments.args.iter().skip(skip) {
+                    self.iterate(argument);
+                }
+                return;
+            }
+            self.iterated.insert(call.start().to_u32());
+        }
+        let text = format!("for ... in {}", self.text(expr.range()));
+        self.implicit_call(expr, "__iter__", text.clone(), false, true);
+        // Iterators returning themselves from `__iter__` do the work in `__next__`.
+        if self.operator_may_run(expr, "__next__") {
+            self.implicit_call(expr, "__next__", text, false, true);
+        }
+    }
+
+    /// A callable argument the callee calls during the call (`sorted(xs, key=f)`).
+    fn call_value(&mut self, call: &ast::ExprCall, value: &Expr) {
+        let (targets, param) = match self.value_of(value) {
+            Some(RawValue::Function(key)) => (vec![(key, false)], None),
+            Some(RawValue::Param(owner, name)) => (Vec::new(), Some((owner, name))),
+            _ => return,
+        };
+        self.out.calls.push(RawCall {
+            caller: self.current,
+            location: self.index.location(call.start()),
+            text: self.text(value.range()),
+            targets,
+            virtual_dispatch: false,
+            param,
+            awaited: false,
+            iterates: false,
+            constructs: None,
+            unresolved: None,
+            accessor: None,
+            implicit: false,
+            attribute: None,
+            returned_by: Vec::new(),
+        });
+    }
+
+    fn may_run(&self, name: &str) -> bool {
+        self.implicit.is_none_or(|implicit| implicit.names.contains(name))
+    }
+
+    /// Whether reading an attribute `attr` does not define may run `__getattr__`.
+    fn may_run_getattr(&self, attr: &ast::ExprAttribute) -> bool {
+        let Some(implicit) = self.implicit else { return true };
+        if implicit.getattr_classes.is_empty() {
+            return false;
+        }
+        let Some(ty @ Type::NominalInstance(_)) = attr.value.inferred_type(self.model) else { return false };
+        self.class_key(&ty).is_some_and(|class| implicit.getattr_classes.contains(&class))
+    }
+
+    /// Whether an operator on `operand` may call a user-defined `dunder`: the dunder is defined
+    /// somewhere, and the operand is an instance of a class outside the standard library.
+    fn operator_may_run(&self, operand: &Expr, dunder: &str) -> bool {
+        if !self.may_run(dunder) {
+            return false;
+        }
+        let Some(ty @ Type::NominalInstance(_)) = operand.inferred_type(self.model) else { return false };
+        self.class_key(&ty).is_some_and(|(file, _)| !file.path(self.model.db()).is_vendored_path())
+    }
+
+    /// The functions whose return value `callee` is: `make()` in `make()()`, or the call a local
+    /// variable was assigned from (`nap = make(); nap()`).
+    fn returned_by(&self, callee: &Expr) -> Vec<Key> {
+        let call = match callee {
+            Expr::Call(call) => call,
+            Expr::Name(name) => {
+                let db = self.model.db();
+                let definitions =
+                    definitions_for_name(self.model, &name.id, callee.into(), ImportAliasResolution::ResolveAliases);
+                let assigned = definitions.into_iter().find_map(|d| match d {
+                    ResolvedDefinition::Definition(def) if def.file(db) == self.index.file => match def.kind(db) {
+                        DefinitionKind::Assignment(a) => {
+                            Some(a.value(&parsed_module(db, def.python_file(db)).load(db)).range())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                });
+                let Some(range) = assigned else { return Vec::new() };
+                let parsed = parsed_module(db, self.model.python_file()).load(db);
+                let Some(call) = find_call(parsed.syntax(), range) else { return Vec::new() };
+                return self.resolve(&call.func, Some(call)).targets.into_iter().map(|(k, _)| k).collect();
+            }
+            _ => return Vec::new(),
+        };
+        self.resolve(&call.func, Some(call)).targets.into_iter().map(|(k, _)| k).collect()
+    }
+
+    /// `obj.name(...)` where `name` is no method of `obj`'s class: an attribute holding a callable.
+    fn attribute_slot(&self, callee: &Expr) -> Option<(Key, String)> {
+        let Expr::Attribute(attr) = callee else { return None };
+        Some((self.receiver_class(&attr.value)?, attr.attr.to_string()))
+    }
+
+    /// The class of an instance: its type, or, when ty does not know it (unannotated returns are
+    /// unknown to ty), the class the function it was returned from constructs.
+    fn receiver_class(&self, receiver: &Expr) -> Option<Key> {
+        if let Some(class) = self.self_class(receiver) {
+            return Some(class);
+        }
+        match receiver.inferred_type(self.model)? {
+            ty @ Type::NominalInstance(_) => self.class_key(&ty),
+            Type::Dynamic(_) => {
+                self.returned_by(receiver).into_iter().find_map(|f| self.returned_classes(f).first().copied())
+            }
+            _ => None,
+        }
+    }
+
+    /// Classes of the instances a function returns, from the types of its `return` values.
+    fn returned_classes(&self, function: Key) -> Vec<Key> {
+        if let Some(classes) = self.returned_classes.borrow().get(&function) {
+            return classes.clone();
+        }
+        let db = self.model.db();
+        let (file, offset) = function;
+        let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, file));
+        let parsed = parsed_module(db, model.python_file()).load(db);
+        let mut classes = Vec::new();
+        if let Some(def) = find_function(parsed.syntax(), offset) {
+            for value in return_values(&def.body) {
+                let types = match value.inferred_type(&model) {
+                    Some(Type::Union(union)) => union.elements(db).to_vec(),
+                    Some(ty) => vec![ty],
+                    None => Vec::new(),
+                };
+                for ty in types.iter().filter(|t| matches!(t, Type::NominalInstance(_))) {
+                    if let Some(class) = self.class_key(ty)
+                        && !classes.contains(&class)
+                    {
+                        classes.push(class);
+                    }
+                }
+            }
+        }
+        self.returned_classes.borrow_mut().insert(function, classes.clone());
+        classes
+    }
+
+    /// The class of the current method when `expr` is its first parameter (`self`, typed by ty as
+    /// a `Self` type variable).
+    fn self_class(&self, expr: &Expr) -> Option<Key> {
+        let Expr::Name(name) = expr else { return None };
+        let entry = self.index.functions.get(&self.current)?;
+        (entry.params.first()? == name.id.as_str()).then_some((self.index.file, entry.class?))
+    }
+
+    /// `self.name = value` in a method: records callables stored on instances of the class.
+    fn store(&mut self, target: &Expr, value: &Expr) {
+        let Expr::Attribute(attr) = target else { return };
+        let Some(class) = self.self_class(&attr.value) else { return };
+        if let Some(value) = self.value_of(value) {
+            self.out.stores.push(RawStore { class, name: attr.attr.to_string(), value });
+        }
+    }
+
+    /// Class attributes holding a descriptor: accessing them runs `__get__` (`__set__`,
+    /// `__delete__`) of the descriptor's class.
+    fn descriptor_calls(
+        &mut self,
+        attr: &ast::ExprAttribute,
+        accessor: Accessor,
+        definitions: &[ResolvedDefinition<'db>],
+    ) {
+        let dunder = match accessor {
+            Accessor::Get => "__get__",
+            Accessor::Set => "__set__",
+            Accessor::Delete => "__delete__",
+        };
+        if !self.may_run(dunder) {
+            return;
+        }
+        let db = self.model.db();
+        for definition in definitions {
+            let ResolvedDefinition::Definition(def) = definition else { continue };
+            let DefinitionKind::Assignment(assignment) = def.kind(db) else { continue };
+            let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, def.file(db)));
+            let module = parsed_module(db, model.python_file()).load(db);
+            let Some(ty @ Type::NominalInstance(_)) = assignment.value(&module).inferred_type(&model) else { continue };
+            let Some(class) = self.class_key(&ty) else { continue };
+            self.out.calls.push(RawCall {
+                caller: self.current,
+                location: self.index.location(attr.start()),
+                text: self.text(attr.range()),
+                targets: Vec::new(),
+                virtual_dispatch: false,
+                param: None,
+                awaited: false,
+                iterates: false,
+                constructs: None,
+                unresolved: None,
+                accessor: None,
+                implicit: true,
+                attribute: Some((class, dunder.to_string())),
+                returned_by: Vec::new(),
+            });
+        }
+    }
+
+    /// What builtins do with their arguments: iterate them, call them.
+    fn builtin_call(&mut self, name: &str, call: &ast::ExprCall) {
+        let args = &call.arguments.args;
+        match name {
+            "map" | "filter" | "reduce" => {
+                if let Some(f) = args.first() {
+                    self.call_value(call, f);
+                }
+                if name == "reduce"
+                    && let Some(xs) = args.get(1)
+                {
+                    self.iterate(xs);
+                }
+                return;
+            }
+            // contextlib: `stack.enter_context(cm)` enters `cm`, `closing(x)` closes `x`.
+            "enter_context" => {
+                if let Some(cm) = args.first() {
+                    let text = format!("enter_context({})", self.text(cm.range()));
+                    self.implicit_call(cm, "__enter__", text.clone(), false, false);
+                    self.implicit_call(cm, "__exit__", text, false, false);
+                }
+                return;
+            }
+            "closing" => {
+                if let Some(x) = args.first() {
+                    let text = format!("closing({})", self.text(x.range()));
+                    self.implicit_call(x, "close", text, false, false);
+                }
+                return;
+            }
+            "callback" => {
+                if let Some(f) = args.first() {
+                    self.call_value(call, f);
+                }
+                return;
+            }
+            "len" => {
+                if let Some(x) = args.first()
+                    && self.operator_may_run(x, "__len__")
+                {
+                    self.implicit_call(x, "__len__", format!("len({})", self.text(x.range())), false, false);
+                }
+            }
+            "sorted" | "min" | "max" | "sort" => {
+                for keyword in &call.arguments.keywords {
+                    if keyword.arg.as_ref().is_some_and(|a| a.as_str() == "key") {
+                        self.call_value(call, &keyword.value);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if CONSUMERS.contains(&name) {
+            for argument in args.iter().take_while(|a| !a.is_starred_expr()) {
+                self.iterate(argument);
+            }
+        }
     }
 
     /// The callable an argument evaluates to, if any.
@@ -287,12 +691,19 @@ impl<'db> Extractor<'_, 'db> {
         }
     }
 
-    fn implicit_call(&mut self, receiver: &Expr, dunder: &str, text: String, awaited: bool) {
+    fn implicit_call(&mut self, receiver: &Expr, dunder: &str, text: String, awaited: bool, iterates: bool) {
         let member = self.synthesized_member(receiver, dunder);
         let keys = self.resolved_function_keys(definitions_for_attribute(self.model, &member));
-        if keys.is_empty() {
-            return;
-        }
+        // An instance ty knows nothing about: look the dunder up in the class it came from.
+        let attribute = if keys.is_empty() {
+            if !matches!(receiver.inferred_type(self.model), Some(Type::Dynamic(_))) {
+                return;
+            }
+            let Some(class) = self.receiver_class(receiver) else { return };
+            Some((class, dunder.to_string()))
+        } else {
+            None
+        };
         self.out.calls.push(RawCall {
             caller: self.current,
             location: self.index.location(receiver.start()),
@@ -301,8 +712,13 @@ impl<'db> Extractor<'_, 'db> {
             virtual_dispatch: true,
             param: None,
             awaited,
+            iterates,
+            constructs: None,
             unresolved: None,
-            property_access: false,
+            accessor: None,
+            implicit: true,
+            attribute,
+            returned_by: Vec::new(),
         });
     }
 
@@ -325,19 +741,33 @@ impl<'db> Extractor<'_, 'db> {
                     .filter_map(|k| Some((RawSlot::Keyword(k.arg.as_ref()?.to_string()), &k.value))),
             );
         for (slot, argument) in arguments {
-            let Some(value) = self.value_of(argument) else { continue };
-            for &(into, bound) in &resolution.targets {
-                self.out.flows.push(RawFlow {
-                    caller: self.current,
-                    location: location.clone(),
-                    into,
-                    bound,
-                    slot: slot.clone(),
-                    value: value.clone(),
-                    literal: literal.clone(),
-                });
+            // Callables in a literal list flow too (`FastAPI(on_startup=[init])`).
+            let values: Vec<RawValue> = match argument {
+                Expr::List(ast::ExprList { elts, .. }) | Expr::Tuple(ast::ExprTuple { elts, .. }) => {
+                    elts.iter().filter_map(|e| self.value_of(e)).collect()
+                }
+                _ => self.value_of(argument).into_iter().collect(),
+            };
+            for value in values {
+                for &(into, bound) in &resolution.targets {
+                    self.out.flows.push(RawFlow {
+                        caller: self.current,
+                        location: location.clone(),
+                        into,
+                        bound,
+                        slot: slot.clone(),
+                        value: value.clone(),
+                        literal: literal.clone(),
+                    });
+                }
             }
         }
+        if let Some(name) = self.builtin_name(&call.func, &resolution) {
+            self.builtin_call(name, call);
+        }
+        let attribute = if resolution.targets.is_empty() { self.attribute_slot(&call.func) } else { None };
+        let returned_by =
+            if resolution.targets.is_empty() && param.is_none() { self.returned_by(&call.func) } else { Vec::new() };
         let unresolved =
             (resolution.targets.is_empty() && param.is_none()).then_some(resolution.reason);
         self.out.calls.push(RawCall {
@@ -348,8 +778,13 @@ impl<'db> Extractor<'_, 'db> {
             virtual_dispatch: resolution.virtual_dispatch,
             param,
             awaited: self.awaited.contains(&call.start().to_u32()),
+            iterates: self.iterated.contains(&call.start().to_u32()),
+            constructs: resolution.constructs,
             unresolved,
-            property_access: false,
+            accessor: None,
+            implicit: false,
+            attribute,
+            returned_by,
         });
     }
 
@@ -362,6 +797,21 @@ impl<'db> Extractor<'_, 'db> {
                 expr => (expr, None),
             };
             let resolution = self.resolve(callee, call);
+            // `@render.register`: an implementation of a `functools.singledispatch` function.
+            if let Expr::Attribute(attr) = callee
+                && attr.attr.as_str() == "register"
+                && let Expr::Name(dispatcher) = &*attr.value
+            {
+                let definitions = definitions_for_name(
+                    self.model,
+                    &dispatcher.id,
+                    (&*attr.value).into(),
+                    ImportAliasResolution::ResolveAliases,
+                );
+                for dispatcher in self.resolved_function_keys(definitions) {
+                    self.out.dispatches.push((dispatcher, key));
+                }
+            }
             let literal = call.and_then(first_string_literal);
             for &(into, bound) in &resolution.targets {
                 decorators.push(into);
@@ -406,19 +856,42 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                 }
                 self.in_scope(key, |this| this.visit_body(&def.body));
             }
+            Stmt::Assign(assign) if self.recording() => {
+                for target in &assign.targets {
+                    self.store(target, &assign.value);
+                }
+                walk_stmt(self, stmt);
+            }
+            Stmt::AnnAssign(assign) if self.recording() => {
+                if let Some(value) = &assign.value {
+                    self.store(&assign.target, value);
+                }
+                walk_stmt(self, stmt);
+            }
+            Stmt::Return(ast::StmtReturn { value: Some(value), .. })
+                if self.recording() && self.current != MODULE_KEY =>
+            {
+                if let Some(value) = self.value_of(value) {
+                    self.out.returns.push((self.current, value));
+                }
+                walk_stmt(self, stmt);
+            }
             Stmt::With(with) if self.recording() => {
                 let (enter, exit) = if with.is_async { ("__aenter__", "__aexit__") } else { ("__enter__", "__exit__") };
                 for item in &with.items {
                     let text = format!("{}with {}", if with.is_async { "async " } else { "" }, self.text(item.context_expr.range()));
-                    self.implicit_call(&item.context_expr, enter, text.clone(), with.is_async);
-                    self.implicit_call(&item.context_expr, exit, text, with.is_async);
+                    self.implicit_call(&item.context_expr, enter, text.clone(), with.is_async, false);
+                    self.implicit_call(&item.context_expr, exit, text, with.is_async, false);
                 }
                 walk_stmt(self, stmt);
             }
             Stmt::For(for_stmt) if self.recording() => {
-                let dunder = if for_stmt.is_async { "__aiter__" } else { "__iter__" };
-                let text = format!("for ... in {}", self.text(for_stmt.iter.range()));
-                self.implicit_call(&for_stmt.iter, dunder, text, false);
+                if for_stmt.is_async {
+                    let text = format!("async for ... in {}", self.text(for_stmt.iter.range()));
+                    self.implicit_call(&for_stmt.iter, "__aiter__", text, false, false);
+                } else {
+                    self.iterate(&for_stmt.iter);
+                }
                 walk_stmt(self, stmt);
             }
             _ => walk_stmt(self, stmt),
@@ -439,6 +912,57 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                 }
                 self.in_scope(lambda.start().to_u32(), |this| this.visit_expr(&lambda.body));
             }
+            Expr::ListComp(ast::ExprListComp { generators, .. })
+            | Expr::SetComp(ast::ExprSetComp { generators, .. })
+            | Expr::Generator(ast::ExprGenerator { generators, .. })
+                if self.recording() =>
+            {
+                for generator in generators.iter().filter(|g| !g.is_async) {
+                    self.iterate(&generator.iter);
+                }
+                walk_expr(self, expr);
+            }
+            Expr::DictComp(ast::ExprDictComp { generators, .. }) if self.recording() => {
+                for generator in generators.iter().filter(|g| !g.is_async) {
+                    self.iterate(&generator.iter);
+                }
+                walk_expr(self, expr);
+            }
+            Expr::Subscript(subscript) if self.recording() => {
+                let dunder = match subscript.ctx {
+                    ExprContext::Store => "__setitem__",
+                    ExprContext::Del => "__delitem__",
+                    _ => "__getitem__",
+                };
+                if self.operator_may_run(&subscript.value, dunder) {
+                    let text = self.text(subscript.range());
+                    self.implicit_call(&subscript.value, dunder, text, false, false);
+                }
+                walk_expr(self, expr);
+            }
+            Expr::Compare(compare) if self.recording() => {
+                for (op, right) in compare.ops.iter().zip(compare.comparators()) {
+                    if matches!(op, ast::CmpOp::In | ast::CmpOp::NotIn)
+                        && self.operator_may_run(right, "__contains__")
+                    {
+                        let text = self.text(compare.range());
+                        self.implicit_call(right, "__contains__", text, false, false);
+                    }
+                }
+                walk_expr(self, expr);
+            }
+            Expr::BinOp(binop) if self.recording() => {
+                let dunder = binop.op.dunder();
+                if self.operator_may_run(&binop.left, dunder) {
+                    let text = self.text(binop.range());
+                    self.implicit_call(&binop.left, dunder, text, false, false);
+                }
+                walk_expr(self, expr);
+            }
+            Expr::YieldFrom(yield_from) if self.recording() => {
+                self.iterate(&yield_from.value);
+                walk_expr(self, expr);
+            }
             Expr::Call(call) => {
                 self.callees.insert((call.func.start().to_u32(), call.func.end().to_u32()));
                 if self.recording() {
@@ -447,11 +971,23 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                 walk_expr(self, expr);
             }
             Expr::Attribute(attr)
-                if attr.ctx == ExprContext::Load
-                    && self.recording()
+                if self.recording()
+                    && (self.may_run(attr.attr.as_str()) || self.may_run_getattr(attr))
                     && !self.callees.contains(&(attr.start().to_u32(), attr.end().to_u32())) =>
             {
-                let keys = self.resolved_function_keys(definitions_for_attribute(self.model, attr));
+                let accessor = match attr.ctx {
+                    ExprContext::Store => Accessor::Set,
+                    ExprContext::Del => Accessor::Delete,
+                    _ => Accessor::Get,
+                };
+                let definitions = definitions_for_attribute(self.model, attr);
+                self.descriptor_calls(attr, accessor, &definitions);
+                // No such attribute: `__getattr__` computes it (lazy settings, proxies).
+                if definitions.is_empty() && accessor == Accessor::Get && self.may_run_getattr(attr) {
+                    let text = self.text(attr.range());
+                    self.implicit_call(&attr.value, "__getattr__", text, false, false);
+                }
+                let keys = self.resolved_function_keys(definitions);
                 if !keys.is_empty() {
                     self.out.calls.push(RawCall {
                         caller: self.current,
@@ -461,8 +997,13 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                         virtual_dispatch: true,
                         param: None,
                         awaited: false,
+                        iterates: false,
+                        constructs: None,
                         unresolved: None,
-                        property_access: true,
+                        accessor: Some(accessor),
+                        implicit: true,
+                        attribute: None,
+                        returned_by: Vec::new(),
                     });
                 }
                 walk_expr(self, expr);
@@ -470,4 +1011,78 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
             _ => walk_expr(self, expr),
         }
     }
+}
+
+/// The call expression spanning exactly `range` in a module.
+fn find_call(module: &ast::ModModule, range: TextRange) -> Option<&ast::ExprCall> {
+    struct Finder<'a> {
+        range: TextRange,
+        found: Option<&'a ast::ExprCall>,
+    }
+    impl<'a> SourceOrderVisitor<'a> for Finder<'a> {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if self.found.is_some() || !expr.range().contains_range(self.range) {
+                return;
+            }
+            if let Expr::Call(call) = expr
+                && call.range() == self.range
+            {
+                self.found = Some(call);
+                return;
+            }
+            walk_expr(self, expr);
+        }
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if self.found.is_none() && stmt.range().contains_range(self.range) {
+                walk_stmt(self, stmt);
+            }
+        }
+    }
+    let mut finder = Finder { range, found: None };
+    finder.visit_body(&module.body);
+    finder.found
+}
+
+/// The function whose name starts at `offset`.
+fn find_function(module: &ast::ModModule, offset: u32) -> Option<&ast::StmtFunctionDef> {
+    struct Finder<'a> {
+        offset: u32,
+        found: Option<&'a ast::StmtFunctionDef>,
+    }
+    impl<'a> SourceOrderVisitor<'a> for Finder<'a> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if self.found.is_some() || !stmt.range().contains(ruff_text_size::TextSize::new(self.offset)) {
+                return;
+            }
+            if let Stmt::FunctionDef(def) = stmt
+                && def.name.start().to_u32() == self.offset
+            {
+                self.found = Some(def);
+                return;
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, _: &'a Expr) {}
+    }
+    let mut finder = Finder { offset, found: None };
+    finder.visit_body(&module.body);
+    finder.found
+}
+
+/// The values a function body returns (in its own scope).
+fn return_values(body: &[Stmt]) -> Vec<&Expr> {
+    struct Returns<'a>(Vec<&'a Expr>);
+    impl<'a> SourceOrderVisitor<'a> for Returns<'a> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            match stmt {
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+                Stmt::Return(ast::StmtReturn { value: Some(value), .. }) => self.0.push(value),
+                _ => walk_stmt(self, stmt),
+            }
+        }
+        fn visit_expr(&mut self, _: &'a Expr) {}
+    }
+    let mut returns = Returns(Vec::new());
+    returns.visit_body(body);
+    returns.0
 }

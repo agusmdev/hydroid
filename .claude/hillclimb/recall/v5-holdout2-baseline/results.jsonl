@@ -1,0 +1,9 @@
+{"case": "abstract_property_dispatch", "split": "holdout", "hits": ["app.py:29 requests.api.get"], "misses": [], "false_positives": [], "seconds": 0.225}
+{"case": "custom_iterator_next", "split": "holdout", "hits": [], "misses": ["app.py:39 _socket.socket.recv (got [])"], "false_positives": [], "seconds": 0.214}
+{"case": "descriptor_get", "split": "holdout", "hits": [], "misses": ["app.py:25 builtins.open (got [])"], "false_positives": [], "seconds": 0.187}
+{"case": "exitstack_enter", "split": "holdout", "hits": [], "misses": ["app.py:19 _thread.lock.__enter__ (got [])", "app.py:20 requests.api.post (got [])"], "false_positives": [], "seconds": 0.22}
+{"case": "local_helpers", "split": "holdout", "hits": ["app.py:15 requests.api.get", "app.py:18 time.sleep"], "misses": ["app.py:16 builtins.open (got [])"], "false_positives": [], "seconds": 0.207}
+{"case": "overload_impl", "split": "holdout", "hits": ["app.py:19 builtins.open"], "misses": [], "false_positives": [], "seconds": 0.198}
+{"case": "singledispatch_impls", "split": "holdout", "hits": [], "misses": ["app.py:22 time.sleep (got [])"], "false_positives": [], "seconds": 0.244}
+{"case": "threadpool_negatives", "split": "holdout", "hits": [], "misses": [], "false_positives": [], "seconds": 0.235}
+{"case": "upload_file_io", "split": "holdout", "hits": ["app.py:11 builtins.open"], "misses": ["app.py:10 * (got [])", "app.py:12 * (got [])"], "false_positives": [], "seconds": 0.202}

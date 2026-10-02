@@ -1,0 +1,194 @@
+{
+  "flow": "hydroid adversarial recall + Polar speed",
+  "goal": {
+    "recall": {
+      "target": "train/holdout recall on tests/adversarial",
+      "direction": "higher",
+      "hold": [
+        "false_positives == 0",
+        "cargo test --workspace green"
+      ]
+    },
+    "speed": {
+      "target": "Polar server wall time (tests: target/corpus/polar/server)",
+      "direction": "lower",
+      "goal_ms": 500,
+      "hold": [
+        "Polar diagnostics unchanged unless reviewed"
+      ]
+    }
+  },
+  "split": "tests/adversarial/split.json (sha1(name) % 3 == 0 -> holdout); holdout read only in aggregate",
+  "harness_paths": [
+    "scripts/hillclimb/score.py",
+    "tests/adversarial/cases",
+    "tests/adversarial/split.json"
+  ],
+  "approve_each_round": false,
+  "machine": "4 vCPU container, 15 GB",
+  "rounds": [
+    {
+      "round": 0,
+      "change": "baseline",
+      "train_recall": "15/73",
+      "train_fp": 2,
+      "holdout_recall": "4/27",
+      "holdout_fp": 0,
+      "polar_ms": [
+        19502,
+        18823,
+        16987
+      ],
+      "polar_extract_ms": 16231,
+      "polar_analyze_ms": 446,
+      "polar_diagnostics": 52,
+      "reference": "ty 0.0.15 check on Polar: 10.6 s wall, 23 s CPU"
+    },
+    {
+      "round": 1,
+      "lever": "speed",
+      "change": "parallel prebuild of library indexes before merge (merge was 8 s single-threaded); background teardown of ty's db; property checks gated by known property names; memoized overrides + Fx hashing + precomputed catalog flags in analysis; persistent fact cache (.hydroid_cache, chunked parallel bincode, overlapped with fingerprinting)",
+      "rejected": [
+        "mimalloc: +2.5 s slower on this box (A/B, 3 runs each)"
+      ],
+      "polar_cold_ms": "~12300 (iterate build, quiet machine)",
+      "polar_warm_ms": [
+        404,
+        348,
+        442,
+        395,
+        353,
+        333,
+        316
+      ],
+      "polar_analyze_ms": "446 -> ~170",
+      "polar_diagnostics": "52, identical incl. chains and unresolved"
+    },
+    {
+      "round": 2,
+      "lever": "recall",
+      "change": "iteration contexts (comprehensions, consuming builtins, yield from) + generator semantics (calling runs nothing, iterating runs the body); builtins calling their args (sorted/min/max key, map, filter, reduce, list.sort); constructors run __post_init__/model_post_init/pydantic validators; property setters/deleters; class-body aliases (__enter__ = acquire); callable objects (lru_cache) resolved through go-to-definition; callables stored on self; catalog: file, network, synchronization, SQLAlchemy Query/scoped_session/Connection",
+      "train_recall": "73/73",
+      "train_fp": 0,
+      "holdout_recall": "7/27",
+      "holdout_fp": 0,
+      "polar_diagnostics": "52 -> 100 (48 new, all reviewed: @functools.cache functions doing file I/O on the loop, one tempfile.mkdtemp in an async script; 0 lost)",
+      "polar_unresolved": "8341 -> 6520"
+    },
+    {
+      "round": 3,
+      "lever": "recall",
+      "protocol": "holdout batch 1 unsealed into train (it was scored once per round, never read); a new sealed holdout batch 2 (9 cases, new mechanisms) written before any round-3 change and scored only in aggregate",
+      "ground_truth_fix": "event_handlers used app.add_event_handler, which FastAPI 0.141 / Starlette 1.x no longer has (AttributeError at runtime): replaced by app.router.add_event_handler",
+      "change": "callables in list/tuple literals flow (on_startup=[f]); offload APIs that are also sinks stay targets (Executor.map); operator dunders ([] get/set/del, in, len, binary operators) on instances of non-stdlib classes, gated by dunder names defined in the code; __getattr__ on undefined attributes; callables returned by functions (get_loader()(), nap = make(); nap()); classes returned by unannotated functions (ty leaves those Unknown) for method and dunder lookups; implicit calls never reported as unresolved; catalog: redis Lock and PubSub, Executor.__exit__/map, as_completed, Pool.starmap",
+      "train_recall": "100/100",
+      "train_fp": 0,
+      "holdout2_recall": "5/13 before -> 5/13 after",
+      "holdout2_fp": 0,
+      "polar_diagnostics": "100, identical",
+      "polar_unresolved": "6520 -> 6477",
+      "polar_cold_ms": [
+        12514,
+        12947,
+        14384
+      ]
+    },
+    {
+      "round": 4,
+      "lever": "recall",
+      "protocol": "holdout batch 2 unsealed into train after its round-3 score (5/13) was recorded; no sealed cases remain: the next out-of-sample measure needs new cases (scripts/hillclimb/adversary.py with an API key, or a reviewer)",
+      "change": "iteration also runs __next__ (iterators returning self); descriptors (__get__/__set__/__delete__ of class attributes assigned an instance), gated on class attributes assigned a call, only when the code defines a descriptor; contextlib: ExitStack.enter_context/callback, closing(x) -> x.close(); lambdas bound to names; functools.singledispatch implementations registered with @f.register; catalog: typing.IO read/write (UploadFile.file), shutil.copyfileobj; __getattr__ checked only on instances of classes defining it (an open gate cost ~1.5 s cold on Polar)",
+      "train_recall": "113/113",
+      "train_fp": 0,
+      "polar_diagnostics": "100, identical incl. chains",
+      "polar_unresolved": 6477,
+      "polar_cold_ms": [
+        12945,
+        12399,
+        12348
+      ],
+      "polar_warm_ms_median": 365
+    },
+    {
+      "round": 5,
+      "lever": "real-world corpora (precision, noise, speed)",
+      "corpora": "added mealie, lnbits, Netflix dispatch, litellm, open-webui to scripts/corpus.sh; scripts/hillclimb/oracle.py (naive syntactic second opinion) to look for misses",
+      "findings": {
+        "false positives": [
+          "class-hierarchy dispatch from production code into test doubles (overrides defined in tests or in function bodies)",
+          "decorator wrappers context-insensitive: every wrapper reached every decorated function (litellm track_llm_api_timing), and async functions entered sync wrappers",
+          "asyncio.run/run_until_complete reached through sync bridges that check for a running loop"
+        ],
+        "false negatives": [
+          "tempfile.TemporaryDirectory (oracle, litellm)"
+        ],
+        "noise": [
+          "awaited calls and constructors of known classes listed as unresolved"
+        ],
+        "speed": [
+          "resolving the bases of every class in every indexed library file ran type inference on whole library modules"
+        ]
+      },
+      "change": "overrides from test code/local classes only for callers in tests/same file; decorated calls link to the original when a wrapper calls it, async/sync wrapper matching, decorated functions no longer flow into decorator parameters; catalog `direct` sink groups (event-loop: only direct calls from loop code); unresolved excludes awaited calls and known-class constructors; library class bases resolved lazily for ancestors of project classes and of looked-up classes; HYDROID_TIMINGS phase timings; catalog: TemporaryDirectory",
+      "train_recall": "116/116",
+      "train_fp": 0,
+      "corpora_release_ms_r3_to_final": {
+        "template": [
+          1554,
+          1142
+        ],
+        "polar": [
+          10784,
+          10337
+        ],
+        "mealie": [
+          3916,
+          3536
+        ],
+        "lnbits": [
+          2484,
+          2250
+        ],
+        "dispatch": [
+          3507,
+          3145
+        ],
+        "open-webui": [
+          5543,
+          4901
+        ],
+        "litellm": [
+          48338,
+          46834
+        ]
+      },
+      "diagnostics": "unchanged on 6 corpora (Polar 100, mealie 191, lnbits 246, dispatch 6, open-webui 67, template 0); litellm 9534 -> 8336 (non-test 2478 -> 2062), removed ones reviewed: test-double dispatch, decorator fan-out, guarded asyncio.run",
+      "unresolved": {
+        "polar": [
+          6477,
+          3671
+        ],
+        "mealie": [
+          205,
+          139
+        ],
+        "lnbits": [
+          3302,
+          1554
+        ],
+        "dispatch": [
+          43,
+          38
+        ],
+        "open-webui": [
+          4171,
+          3011
+        ],
+        "litellm": [
+          33420,
+          23240
+        ]
+      }
+    }
+  ]
+}

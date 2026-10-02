@@ -19,6 +19,8 @@ ruff_source_file = { workspace = true }
 ruff_text_size = { workspace = true }
 salsa = { workspace = true }
 rustc-hash = { workspace = true }
+bincode = { workspace = true }
+serde = { workspace = true }
 ty_module_resolver = { workspace = true }
 ty_python_core = { workspace = true }
 ty_python_semantic = { workspace = true }

@@ -1,9 +1,8 @@
 //! What hydroid knows about functions it does not analyze: which block, which move work off the
 //! event loop, which schedule callbacks on it, and which register FastAPI entry points.
 
-use std::collections::HashMap;
-
 use anyhow::Context;
+use rustc_hash::FxHashMap as HashMap;
 use serde::Deserialize;
 
 use crate::report::Sink;
@@ -31,6 +30,10 @@ struct CatalogFile {
 struct SinkGroup {
     category: String,
     advice: String,
+    /// Only a call made directly from code on the loop counts: sync functions calling these do
+    /// not block because of them.
+    #[serde(default)]
+    direct: bool,
     #[serde(default)]
     opt_in: bool,
     functions: Vec<String>,
@@ -58,7 +61,7 @@ struct Patterns<T> {
 
 impl<T: Clone> Default for Patterns<T> {
     fn default() -> Self {
-        Self { exact: HashMap::new(), globs: Vec::new() }
+        Self { exact: HashMap::default(), globs: Vec::new() }
     }
 }
 
@@ -78,11 +81,10 @@ impl<T: Clone> Patterns<T> {
         if self.globs.is_empty() {
             return None;
         }
-        let segments: Vec<&str> = qualname.split('.').collect();
+        let segments = qualname.split('.').count();
         self.globs.iter().find_map(|(pattern, value)| {
-            (pattern.len() == segments.len()
-                && pattern.iter().zip(&segments).all(|(p, s)| segment_matches(p, s)))
-            .then_some(value)
+            (pattern.len() == segments && pattern.iter().zip(qualname.split('.')).all(|(p, s)| segment_matches(p, s)))
+                .then_some(value)
         })
     }
 
@@ -105,14 +107,15 @@ pub fn qualname_matches(pattern: &str, qualname: &str) -> bool {
 
 /// `*` matches any run of characters inside one segment.
 fn segment_matches(pattern: &str, segment: &str) -> bool {
-    let mut parts = pattern.split('*');
-    let first = parts.next().unwrap_or_default();
+    let Some((first, parts)) = pattern.split_once('*') else {
+        return pattern == segment;
+    };
     let Some(mut rest) = segment.strip_prefix(first) else {
         return false;
     };
-    let parts: Vec<&str> = parts.collect();
-    for (i, part) in parts.iter().enumerate() {
-        if i == parts.len() - 1 {
+    let mut parts = parts.split('*').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
             return rest.ends_with(part);
         }
         match rest.find(part) {
@@ -120,7 +123,7 @@ fn segment_matches(pattern: &str, segment: &str) -> bool {
             None => return false,
         }
     }
-    rest.is_empty()
+    true
 }
 
 #[derive(Default)]
@@ -128,6 +131,8 @@ pub struct Catalog {
     sinks: Patterns<usize>,
     blocking_decorators: Patterns<usize>,
     groups: Vec<(String, String)>,
+    /// Groups marked `direct`, by index.
+    direct: Vec<bool>,
     offload: Patterns<()>,
     loop_callbacks: Patterns<()>,
     entries: Patterns<usize>,
@@ -153,6 +158,7 @@ impl Catalog {
             }
             let index = self.groups.len();
             self.groups.push((group.category, group.advice));
+            self.direct.push(group.direct);
             let patterns = if blocking_decorator { &mut self.blocking_decorators } else { &mut self.sinks };
             for name in &group.functions {
                 patterns.insert(name, index);
@@ -178,6 +184,11 @@ impl Catalog {
         let &index = self.sinks.get(qualname)?;
         let (category, advice) = &self.groups[index];
         Some(Sink { qualname: qualname.to_string(), category: category.clone(), advice: advice.clone() })
+    }
+
+    /// Whether `qualname` is a sink only when called directly from loop code.
+    pub fn is_direct_sink(&self, qualname: &str) -> bool {
+        self.sinks.get(qualname).is_some_and(|&index| self.direct[index])
     }
 
     /// The blocking behavior a decorator gives the sync functions it decorates.

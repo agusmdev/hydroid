@@ -115,6 +115,10 @@ impl HydroidDb {
     pub fn layout(&self) -> &Layout {
         &self.layout
     }
+
+    pub fn python_version(&self) -> String {
+        self.settings.python_version.version.to_string()
+    }
 }
 
 #[salsa::db]
