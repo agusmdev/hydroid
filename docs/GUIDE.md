@@ -177,15 +177,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv sync
-      - run: cargo install --git https://github.com/agusmdev/hydroid hydroid
-      - run: hydroid . --format sarif > hydroid.sarif || true
+      - run: >-
+          uvx --from hydroid-cli --find-links https://github.com/agusmdev/hydroid/releases/expanded_assets/v0.1.0
+          hydroid . --format sarif > hydroid.sarif || [ $? -eq 1 ]
       - uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: hydroid.sarif
 ```
 
-Each blocking chain shows up as a code flow on the pull request. Drop `|| true` and the
+Each blocking chain shows up as a code flow on the pull request. Drop `|| [ $? -eq 1 ]` and the
 upload step to simply fail the build instead.
+
+GitLab, pre-commit, monorepos, adopting it on a project with existing findings, and a prompt that
+has a coding agent set all of this up for you: [AGENT_SETUP.md](AGENT_SETUP.md).
 
 ## 11. JSON output
 
