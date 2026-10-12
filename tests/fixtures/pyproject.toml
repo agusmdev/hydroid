@@ -10,6 +10,7 @@ dependencies = [
     "fastapi",
     "httpx",
     "pymysql",
+    "python-multipart",
     "redis",
     "requests",
     "slowlib",

@@ -18,11 +18,16 @@
       ]
     }
   },
-  "split": "tests/adversarial/split.json (sha1(name) % 3 == 0 -> holdout); holdout read only in aggregate",
+  "split": "tests/adversarial/split.json: sha1(name) % 3 == 0 -> holdout, else open (promote.py); open -> train once passing (gate.py --record); holdout scored only in aggregate",
   "harness_paths": [
-    "scripts/hillclimb/score.py",
-    "tests/adversarial/cases",
-    "tests/adversarial/split.json"
+    "scripts/hillclimb/",
+    "tests/adversarial/",
+    "tests/fixtures/pyproject.toml",
+    "tests/fixtures/uv.lock",
+    "crates/hydroid/tests/fixtures.rs",
+    "crates/hydroid/tests/common/",
+    ".claude/hillclimb/",
+    ".claude/skills/hydroid-self-improve/"
   ],
   "approve_each_round": false,
   "machine": "4 vCPU container, 15 GB",
@@ -190,5 +195,6 @@
         ]
       }
     }
-  ]
+  ],
+  "ground_truth": "scripts/hillclimb/oracle_runtime.py via check.py: a case is promoted only when the runtime proves every line where hydroid disagrees (verdict BREAKS), or with a reviewer's note"
 }
