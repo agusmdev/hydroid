@@ -10,8 +10,7 @@ Two parts:
 
 ## 1. Prompt for a coding agent
 
-Copy everything inside the block below into your agent, from the root of the repository. Change
-`v0.1.0` if a newer [release](https://github.com/agusmdev/hydroid/releases) exists.
+Copy everything inside the block below into your agent, from the root of the repository.
 
 ````markdown
 Set up hydroid in this repository. hydroid is a static analyzer that finds blocking calls
@@ -19,9 +18,9 @@ Set up hydroid in this repository. hydroid is a static analyzer that finds block
 asyncio event loop in FastAPI / asyncio apps, and prints the call chain that reaches each one.
 Docs: https://github.com/agusmdev/hydroid/blob/main/docs/GUIDE.md
 
-How to run it (prebuilt binaries, no Rust needed; it needs `uv`):
+How to run it (from PyPI, prebuilt wheels, no Rust needed; it needs `uv`):
 
-    uvx --from hydroid-cli --find-links https://github.com/agusmdev/hydroid/releases/expanded_assets/v0.1.0 hydroid <PROJECT_ROOT>
+    uvx --from hydroid-cli hydroid <PROJECT_ROOT>
 
 Facts you need:
 - It resolves imports like a type checker, so the project's dependencies must be installed in a
@@ -80,8 +79,8 @@ Do this, in order, and stop to ask me only if a step is genuinely ambiguous:
 8. Add a CI job using the CI system this repo already has (GitHub Actions, GitLab CI, …).
    Use the reference configs in
    https://github.com/agusmdev/hydroid/blob/main/docs/AGENT_SETUP.md#2-cicd-reference.
-   Pin the hydroid release (`v0.1.0` above). The job must install the dependencies exactly like
-   the existing test job does, then run hydroid.
+   Pin the latest `hydroid-cli` version from PyPI (`--from hydroid-cli==X.Y.Z`). The job must
+   install the dependencies exactly like the existing test job does, then run hydroid.
    - On GitHub with code scanning available: upload SARIF so findings appear on pull requests.
    - Gate mode (no known findings left): let the job fail on exit status 1.
    - Report-only mode (known findings left): do not fail on exit status 1, but always fail on 2.
@@ -92,9 +91,7 @@ Do this, in order, and stop to ask me only if a step is genuinely ambiguous:
 
 ## 2. CI/CD reference
 
-All examples install hydroid from the prebuilt wheels of a pinned GitHub release, which takes a
-few seconds. Building from source (`cargo install --git https://github.com/agusmdev/hydroid
-hydroid`) also works but takes minutes.
+All examples install hydroid from the prebuilt wheels on PyPI, which takes a few seconds.
 
 hydroid needs the project's dependencies installed, so run it after the same install step as your
 tests. Exit status `1` means findings, `2` means hydroid could not run: never ignore `2`.
@@ -109,8 +106,9 @@ on:
   push:
     branches: [main]
 
+# Optional: pin a version for reproducible builds, e.g. hydroid-cli==0.2.0
 env:
-  HYDROID: uvx --from hydroid-cli --find-links https://github.com/agusmdev/hydroid/releases/expanded_assets/v0.1.0 hydroid
+  HYDROID: uvx --from hydroid-cli hydroid
 
 jobs:
   hydroid:
@@ -192,7 +190,8 @@ report as an artifact and let the job status gate the merge request:
 hydroid:
   image: ghcr.io/astral-sh/uv:python3.12-bookworm
   variables:
-    HYDROID: uvx --from hydroid-cli --find-links https://github.com/agusmdev/hydroid/releases/expanded_assets/v0.1.0 hydroid
+    # Optional: pin a version for reproducible builds, e.g. hydroid-cli==0.2.0
+    HYDROID: uvx --from hydroid-cli hydroid
   script:
     - uv sync
     - $HYDROID . --format json > hydroid.json || true   # the report, kept as an artifact
@@ -209,7 +208,7 @@ Report-only: add `allow_failure: { exit_codes: [1] }` to the job.
 The same three steps everywhere: install `uv`, install the project's dependencies, run
 
 ```sh
-uvx --from hydroid-cli --find-links https://github.com/agusmdev/hydroid/releases/expanded_assets/v0.1.0 hydroid .
+uvx --from hydroid-cli hydroid .   # optional: pin a version, e.g. hydroid-cli==0.2.0
 ```
 
 and use the exit status. Azure DevOps and many other tools also ingest the `--format sarif`
@@ -224,7 +223,8 @@ repos:
     hooks:
       - id: hydroid
         name: hydroid
-        entry: uvx --from hydroid-cli --find-links https://github.com/agusmdev/hydroid/releases/expanded_assets/v0.1.0 hydroid .
+        # Optional: pin a version for reproducible builds, e.g. hydroid-cli==0.2.0
+        entry: uvx --from hydroid-cli hydroid .
         language: system
         types: [python]
         pass_filenames: false   # hydroid analyzes the whole project: blocking chains cross files

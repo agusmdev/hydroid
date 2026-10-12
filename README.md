@@ -25,22 +25,18 @@ facts are cached in `.hydroid_cache/`. `HYDROID_TIMINGS=1` prints where the time
 
 ## Install and run
 
-With [uv](https://docs.astral.sh/uv/), using the prebuilt binaries of the latest release
-(macOS, Linux, Windows; no Rust needed):
+With [uv](https://docs.astral.sh/uv/) (prebuilt wheels for macOS, Linux, Windows; no Rust needed):
 
 ```sh
-uvx --from hydroid-cli --find-links https://github.com/agusmdev/hydroid/releases/expanded_assets/v0.1.0 hydroid .
+uvx --from hydroid-cli hydroid .
 ```
 
-Or straight from the source on `main` (builds once with a Rust toolchain, then cached):
+To install the `hydroid` command permanently, run `uv tool install hydroid-cli`
+(without uv: `pipx install hydroid-cli` or `pip install hydroid-cli`), then run `hydroid .` anywhere.
 
-```sh
-uvx --from git+https://github.com/agusmdev/hydroid hydroid .
-```
-
-To install the `hydroid` command permanently, replace `uvx --from` with `uv tool install`
-(e.g. `uv tool install git+https://github.com/agusmdev/hydroid`), then run `hydroid .` anywhere.
-From a clone: `cargo install --path crates/hydroid`. More in the [guide](docs/GUIDE.md#1-install).
+From the source on `main` (builds once with a Rust toolchain, then cached):
+`uvx --from git+https://github.com/agusmdev/hydroid hydroid .`. From a clone:
+`cargo install --path crates/hydroid`. More in the [guide](docs/GUIDE.md#1-install).
 
 ```sh
 hydroid path/to/project                 # finds .venv / VIRTUAL_ENV like ty
@@ -92,8 +88,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv sync                      # hydroid needs the project's dependencies installed
+      # Optional: pin a version for reproducible builds, e.g. hydroid-cli==0.2.0
       - run: >-
-          uvx --from hydroid-cli --find-links https://github.com/agusmdev/hydroid/releases/expanded_assets/v0.1.0
+          uvx --from hydroid-cli
           hydroid . --format sarif > hydroid.sarif || [ $? -eq 1 ]
       - uses: github/codeql-action/upload-sarif@v3
         with:

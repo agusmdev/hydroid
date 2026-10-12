@@ -5,20 +5,21 @@ hydroid finds code that blocks the asyncio event loop in FastAPI apps: a `time.s
 
 ## 1. Install
 
-You need [uv](https://docs.astral.sh/uv/getting-started/installation/).
-
-**Prebuilt binaries** (macOS, Linux, Windows; no Rust needed), from the GitHub release:
+From PyPI with [uv](https://docs.astral.sh/uv/getting-started/installation/) (prebuilt wheels for
+macOS, Linux, Windows; no Rust needed):
 
 ```sh
-uvx --from hydroid-cli --find-links https://github.com/agusmdev/hydroid/releases/expanded_assets/v0.1.0 hydroid .
+uvx --from hydroid-cli hydroid .
 ```
 
-Install the `hydroid` command permanently the same way:
+Install the `hydroid` command permanently:
 
 ```sh
-uv tool install hydroid-cli --find-links https://github.com/agusmdev/hydroid/releases/expanded_assets/v0.1.0
+uv tool install hydroid-cli
 hydroid .
 ```
+
+Without uv: `pipx install hydroid-cli` or `pip install hydroid-cli`.
 
 **From source** (latest `main`; needs a Rust toolchain, `curl https://sh.rustup.rs -sSf | sh`;
 the first build takes about a minute, then it is cached):
@@ -28,8 +29,7 @@ uvx --from git+https://github.com/agusmdev/hydroid hydroid .
 uv tool install git+https://github.com/agusmdev/hydroid      # permanent
 ```
 
-Pin a version with `git+https://github.com/agusmdev/hydroid@v0.1.0`. From a clone,
-`cargo install --path crates/hydroid` also works.
+From a clone, `cargo install --path crates/hydroid` also works.
 
 ## 2. Prepare the project to check
 
@@ -177,8 +177,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv sync
+      # Optional: pin a version for reproducible builds, e.g. hydroid-cli==0.2.0
       - run: >-
-          uvx --from hydroid-cli --find-links https://github.com/agusmdev/hydroid/releases/expanded_assets/v0.1.0
+          uvx --from hydroid-cli
           hydroid . --format sarif > hydroid.sarif || [ $? -eq 1 ]
       - uses: github/codeql-action/upload-sarif@v3
         with:
