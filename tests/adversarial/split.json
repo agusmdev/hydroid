@@ -5,6 +5,7 @@
   "callable_builtins": "train",
   "callable_instance": "train",
   "comprehension_iter": "train",
+  "computed_field_io": "open",
   "custom_iterator_next": "train",
   "dataclass_post_init": "train",
   "decorated_cache": "train",

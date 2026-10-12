@@ -21,3 +21,6 @@ build/
 target/
 .venv/
 __pycache__/
+
+# Adversary work in progress (scripts/hillclimb/promote.py moves proven cases into the suite).
+tests/adversarial/candidates/

@@ -5,8 +5,12 @@ Each case is a small project with inline expectations, same syntax as tests/fixt
 `# expect: requests.api.get` (several names for several diagnostics; `*` matches any sink).
 Every diagnostic must be expected: an unexpected one is a false positive.
 
+Splits (tests/adversarial/split.json): `train` cases must pass (cargo test checks them), `open`
+cases are promoted but not fixed yet (scored with train; gate.py moves them to train once they
+pass), `holdout` cases are never shown to the fixer: score them with --quiet.
+
 Writes one JSON line per case to <out>/results.jsonl and prints a summary per split.
-Binary: $HYDROID_BIN (default target/release/hydroid).
+Binary: $HYDROID_BIN (default $CARGO_TARGET_DIR/release/hydroid, target/ when unset).
 Usage: scripts/hillclimb/score.py [--out DIR] [--split train|holdout|all] [--quiet]
 """
 
@@ -24,7 +28,8 @@ ROOT = Path(__file__).resolve().parents[2]
 CASES = ROOT / "tests/adversarial/cases"
 SPLIT = ROOT / "tests/adversarial/split.json"
 VENV = ROOT / "tests/fixtures/.venv"
-BINARY = Path(os.environ.get("HYDROID_BIN", ROOT / "target/release/hydroid"))
+TARGET = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
+BINARY = Path(os.environ.get("HYDROID_BIN", TARGET / "release/hydroid"))
 EXPECT = re.compile(r"# expect: (.*)$")
 
 
@@ -35,7 +40,7 @@ def expectations(case: Path) -> dict[tuple[str, int], list[str]]:
         for i, line in enumerate(path.read_text().splitlines(), 1):
             m = EXPECT.search(line)
             if m:
-                out[(rel, i)] = m.group(1).split()
+                out[(rel, i)] = m.group(1).split(" via ")[0].split()
     return out
 
 
@@ -73,7 +78,8 @@ def run_case(case: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path)
-    parser.add_argument("--split", default="all", choices=["train", "holdout", "all"])
+    parser.add_argument("--split", default="all", choices=["train", "holdout", "all"],
+                        help="train includes the open cases")
     parser.add_argument("--quiet", action="store_true", help="aggregate only (use for the holdout)")
     args = parser.parse_args()
     split = json.loads(SPLIT.read_text())
@@ -81,7 +87,7 @@ def main() -> int:
     rows = []
     for case in cases:
         which = split.get(case.name, "train")
-        if args.split != "all" and which != args.split:
+        if args.split != "all" and (which == "holdout") != (args.split == "holdout"):
             continue
         rows.append({"case": case.name, "split": which, **run_case(case)})
     if args.out:
@@ -90,7 +96,7 @@ def main() -> int:
             for row in rows:
                 f.write(json.dumps(row) + "\n")
     for name in ("train", "holdout"):
-        part = [r for r in rows if r["split"] == name]
+        part = [r for r in rows if (r["split"] == "holdout") == (name == "holdout")]
         if not part:
             continue
         h = sum(len(r.get("hits", [])) for r in part)
@@ -99,15 +105,18 @@ def main() -> int:
         errors = sum("error" in r for r in part)
         clean = sum(not r.get("misses") and not r.get("false_positives") and "error" not in r for r in part)
         recall = h / (h + m) if h + m else 1.0
+        still_open = sum(r["split"] == "open" for r in part)
         print(f"{name:8} recall {recall:6.1%} ({h}/{h + m})  false_positives {fp}  "
-              f"cases_clean {clean}/{len(part)}  errors {errors}")
+              f"cases_clean {clean}/{len(part)}  errors {errors}"
+              + (f"  (open cases {still_open})" if still_open else ""))
         if name == "train" and not args.quiet:
             for r in part:
                 for kind in ("error", "misses", "false_positives"):
                     items = r.get(kind)
                     if items:
                         for item in [items] if isinstance(items, str) else items:
-                            print(f"  {r['case']}: {kind[:-1] if kind.endswith('s') else kind}: {item}")
+                            label = {"misses": "miss", "false_positives": "false positive"}.get(kind, kind)
+                            print(f"  {r['case']}: {label}: {item}")
     return 0
 
 
