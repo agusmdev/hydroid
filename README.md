@@ -171,3 +171,5 @@ scripts/hillclimb/oracle.py PROJECT report.json   # naive syntactic scan: candid
 
 ty's crates are pinned to exact versions (`=0.0.15`); they have no API stability promise.
 The bundled typeshed stubs are Apache-2.0; hydroid is MIT.
+
+Releases: [docs/RELEASING.md](docs/RELEASING.md).
