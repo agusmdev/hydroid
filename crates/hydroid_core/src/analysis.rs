@@ -334,6 +334,9 @@ impl<'a> Graph<'a> {
         if let Some(class) = call.constructs {
             out.extend(self.construction_hooks(class));
         }
+        if let Some((class, names)) = &call.sets {
+            out.extend(self.attribute_hooks(*class, names));
+        }
         for f in &call.returned_by {
             out.extend(returned.get(f).into_iter().flatten());
         }
@@ -424,6 +427,25 @@ impl<'a> Graph<'a> {
         while let Some(c) = queue.pop_front() {
             let cls = self.facts.class(c);
             hooks.extend(cls.methods.iter().map(|(_, m)| *m).filter(|m| self.facts.function(*m).is_validator));
+            queue.extend(cls.bases.iter().filter(|b| seen.insert(**b)));
+        }
+        hooks
+    }
+
+    /// The SQLAlchemy validators setting `names` on an instance of `class` runs (of the class and
+    /// its bases).
+    fn attribute_hooks(&self, class: ClassId, names: &[String]) -> Vec<FnId> {
+        let mut hooks = Vec::new();
+        let mut seen = HashSet::from_iter([class]);
+        let mut queue = VecDeque::from([class]);
+        while let Some(c) = queue.pop_front() {
+            let cls = self.facts.class(c);
+            hooks.extend(
+                cls.methods
+                    .iter()
+                    .map(|(_, m)| *m)
+                    .filter(|m| self.facts.function(*m).validates.iter().any(|v| names.contains(v))),
+            );
             queue.extend(cls.bases.iter().filter(|b| seen.insert(**b)));
         }
         hooks

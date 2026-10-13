@@ -116,7 +116,11 @@ drop it and the upload step to fail the build instead.
    and their setters, descriptors, operators like `x[k]` and `k in x` on user classes,
    `__getattr__`, iterators' `__next__`, constructors with `__post_init__` and pydantic
    validators, builtins and `contextlib` helpers that iterate, enter or call their arguments like
-   `sorted(xs, key=f)` or `stack.enter_context(cm)`, `singledispatch` implementations). Callables passed as arguments are recorded as flows
+   `sorted(xs, key=f)` or `stack.enter_context(cm)`, `singledispatch` implementations, SQLAlchemy
+   `@validates` validators run by `Model(field=...)` and `obj.field = ...`, and reads of lazily
+   loaded `relationship()` attributes, which query through `Session.execute` unless the
+   relationship is eager (`lazy="selectin"`, ...) or the function loads it with an eager option
+   like `selectinload(Model.attr)`). Callables passed as arguments are recorded as flows
    (`to_thread(f)`, `Depends(dep)`, `on_startup=[f]`, decorators), and so are callables stored
    on `self` and returned by functions. Calls through dispatch tables (`TABLE[key](...)`, or
    `send = TABLE[key]; send(...)`, where `TABLE` is a dict, list or tuple literal) resolve to the

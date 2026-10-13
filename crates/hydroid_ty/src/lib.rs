@@ -22,7 +22,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use ty_module_resolver::{ModuleName, resolve_module_confident};
 
 use crate::db::HydroidDb;
-use crate::extract::{AppState, FileFacts, Implicit, RawSlot, RawValue, extract_file};
+use crate::extract::{AppState, FileFacts, Implicit, Orm, RawSlot, RawValue, extract_file};
 use crate::index::{FileIndex, Key, class_bases};
 
 pub struct Extraction {
@@ -314,6 +314,61 @@ impl Indexes {
         state
     }
 
+    /// What the project's SQLAlchemy models run implicitly: see [`Orm`].
+    fn orm(&self, db: &HydroidDb) -> Orm {
+        let mut orm = Orm::default();
+        let mut lazy_classes: Vec<Key> = Vec::new();
+        {
+            let map = self.0.lock();
+            let projects = || map.values().filter(|i| i.origin == Origin::Project);
+            for index in projects() {
+                orm.validated.extend(index.functions.values().flat_map(|f| f.validates.iter().cloned()));
+                for (&function, names) in &index.eager_loads {
+                    orm.eager.insert((index.file, function), names.clone());
+                }
+                for (&offset, class) in &index.classes {
+                    if !class.lazy_relationships.is_empty() {
+                        lazy_classes.push((index.file, offset));
+                    }
+                }
+            }
+            if lazy_classes.is_empty() {
+                return orm;
+            }
+            // Mapped subclasses inherit the relationships of their (project) bases.
+            for index in projects() {
+                for &offset in index.classes.keys() {
+                    let (mut queue, mut seen) = (vec![(index.file, offset)], FxHashSet::default());
+                    while let Some(key) = queue.pop() {
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                        let Some(class) = map.get(&key.0).and_then(|i| i.classes.get(&key.1)) else { continue };
+                        for name in &class.lazy_relationships {
+                            orm.lazy.insert(((index.file, offset), name.clone()));
+                            orm.lazy_names.insert(name.clone());
+                        }
+                        queue.extend(class.bases.iter().copied());
+                    }
+                }
+            }
+        }
+        // A lazy load runs `Session.execute` (`LazyLoader._emit_lazyload`).
+        let environment = db.program().resolver_environment(db);
+        let session = ModuleName::new("sqlalchemy.orm.session")
+            .and_then(|module| resolve_module_confident(db, environment, &module))
+            .and_then(|module| module.file(db));
+        if let Some(file) = session {
+            let index = self.get(db, file);
+            orm.load = index
+                .functions
+                .iter()
+                .find(|(_, f)| f.qualname == "sqlalchemy.orm.session.Session.execute")
+                .map(|(&offset, _)| (file, offset));
+        }
+        orm
+    }
+
     /// What can run implicitly, from the indexed files: see [`Implicit`].
     fn implicit(&self) -> Implicit {
         let map = self.0.lock();
@@ -366,6 +421,7 @@ fn referenced(facts: &[FileFacts]) -> (FxHashSet<File>, FxHashSet<Key>) {
     for f in facts {
         classes.extend(f.calls.iter().filter_map(|c| c.attribute.as_ref().map(|(key, _)| *key)));
         classes.extend(f.calls.iter().filter_map(|c| c.constructs));
+        classes.extend(f.calls.iter().filter_map(|c| c.sets.as_ref().map(|(key, _)| *key)));
         files.extend(classes.iter().map(|key| key.0));
         files.extend(f.calls.iter().flat_map(|c| c.targets.iter().map(|(key, _)| key.0)));
         files.extend(f.decorators.iter().flat_map(|(_, d)| d.iter().map(|key| key.0)));
@@ -419,6 +475,7 @@ fn run(
 ) -> Vec<FileFacts> {
     let implicit = (!all_implicit).then(|| indexes.implicit());
     let state = indexes.app_state();
+    let orm = indexes.orm(db);
     let shared = Mutex::new(db.clone());
     units
         .par_iter()
@@ -426,7 +483,7 @@ fn run(
             || shared.lock().clone(),
             |db, (file, wanted)| {
                 let index = indexes.get(db, *file);
-                extract_file(db, &index, wanted.as_ref(), implicit.as_ref(), &state)
+                extract_file(db, &index, wanted.as_ref(), implicit.as_ref(), &state, &orm)
             },
         )
         .collect()
@@ -482,6 +539,7 @@ impl<'a> Merger<'a> {
             is_generator: entry.is_generator,
             is_validator: entry.is_validator,
             is_serializer: entry.is_serializer,
+            validates: entry.validates.clone(),
             params: entry.params.clone(),
             parent: None,
             class: None,
@@ -538,7 +596,8 @@ impl<'a> Merger<'a> {
             if let Some(accessor) = raw.accessor {
                 targets.retain(|t| self.facts.function(*t).property == Some(accessor));
             }
-            if raw.implicit && targets.is_empty() && raw.attribute.is_none() {
+            let sets = raw.sets.and_then(|(k, names)| Some((self.class_id(k)?, names)));
+            if raw.implicit && targets.is_empty() && raw.attribute.is_none() && sets.is_none() {
                 continue;
             }
             let param = raw.param.and_then(|(owner, name)| Some((self.fn_id((file, owner))?, name)));
@@ -562,6 +621,7 @@ impl<'a> Merger<'a> {
                 constructs,
                 attribute,
                 returned_by,
+                sets,
             });
         }
         for (dispatcher, implementation) in file_facts.dispatches {

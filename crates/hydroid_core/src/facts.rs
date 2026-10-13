@@ -66,6 +66,9 @@ pub struct Function {
     /// A pydantic serialization hook (`@computed_field`, `@field_serializer`,
     /// `@model_serializer`): dumping its model runs it.
     pub is_serializer: bool,
+    /// A SQLAlchemy attribute validator (`@validates("email")`): setting one of these attributes
+    /// on an instance of its class (in the constructor, or `obj.email = ...`) runs it.
+    pub validates: Vec<String>,
     pub params: Vec<String>,
     /// Lexically enclosing function (closures read its parameters).
     pub parent: Option<FnId>,
@@ -132,6 +135,10 @@ pub struct Call {
     /// The callee is the value returned by calling these functions (`get_loader()()`,
     /// `nap = make_sleeper(); nap()`), see [`Facts::returns`].
     pub returned_by: Vec<FnId>,
+    /// Attributes this call sets on an instance of the class: the keyword arguments of a
+    /// construction, or the target of `obj.name = value`. Their ORM validators run (see
+    /// [`Function::validates`]).
+    pub sets: Option<(ClassId, Vec<String>)>,
     /// Why nothing was resolved (only set when `targets` is empty and `param` is `None`).
     pub unresolved: Option<String>,
 }

@@ -18,7 +18,8 @@ use ty_python_semantic::{
 
 use crate::db::HydroidDb;
 use crate::index::{
-    FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, is_class_object, state_owner, yield_values, yields,
+    FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, instance_class, is_class_object, state_owner,
+    yield_values, yields,
 };
 
 pub struct RawCall {
@@ -41,6 +42,8 @@ pub struct RawCall {
     /// See [`hydroid_core::facts::Call::attribute`].
     pub attribute: Option<(Key, String)>,
     pub returned_by: Vec<Key>,
+    /// See [`hydroid_core::facts::Call::sets`].
+    pub sets: Option<(Key, Vec<String>)>,
 }
 
 /// What code can run implicitly, from the definitions indexed so far.
@@ -62,6 +65,21 @@ pub struct AppState {
     pub stored: FxHashMap<(StateOwner, String), Option<Key>>,
     /// The class of `request.app`: the one `Starlette` subclass the project defines, if any.
     pub app: Option<Key>,
+}
+
+/// What the project's SQLAlchemy models run implicitly on attribute access.
+#[derive(Default)]
+pub struct Orm {
+    /// Attributes some `@validates` validator names.
+    pub validated: FxHashSet<String>,
+    /// `(mapped class, name)`: relationships loaded lazily on first read, inherited ones included.
+    pub lazy: FxHashSet<(Key, String)>,
+    pub lazy_names: FxHashSet<String>,
+    /// Relationships each function names in eager loader options (see
+    /// [`crate::index::FileIndex::eager_loads`]).
+    pub eager: FxHashMap<Key, Vec<String>>,
+    /// `Session.execute`, which a lazy load runs.
+    pub load: Option<Key>,
 }
 
 pub struct RawStore {
@@ -122,6 +140,7 @@ pub fn extract_file(
     wanted: Option<&FxHashSet<u32>>,
     implicit: Option<&Implicit>,
     state: &AppState,
+    orm: &Orm,
 ) -> FileFacts {
     let program_file = ty_python_semantic::Db::program_file(db, index.file);
     let model = SemanticModel::new(db, program_file);
@@ -129,6 +148,8 @@ pub fn extract_file(
     let mut extractor = Extractor {
         db,
         state,
+        orm,
+        lazy_reads: Vec::new(),
         model: &model,
         index,
         wanted,
@@ -150,6 +171,7 @@ pub fn extract_file(
         },
     };
     extractor.visit_body(&parsed.syntax().body);
+    extractor.drop_eager_reads();
     extractor.out
 }
 
@@ -182,6 +204,9 @@ const VALIDATES: &[&str] =
 struct Extractor<'a, 'db> {
     db: &'a HydroidDb,
     state: &'a AppState,
+    orm: &'a Orm,
+    /// Lazy relationship reads recorded: `(function, location, relationship)`.
+    lazy_reads: Vec<(u32, Location, String)>,
     model: &'a SemanticModel<'db>,
     index: &'a FileIndex,
     wanted: Option<&'a FxHashSet<u32>>,
@@ -572,6 +597,7 @@ impl<'db> Extractor<'_, 'db> {
             implicit: false,
             attribute: None,
             returned_by: Vec::new(),
+            sets: None,
         });
     }
 
@@ -855,6 +881,7 @@ impl<'db> Extractor<'_, 'db> {
                 implicit: true,
                 attribute: Some((class, dunder.to_string())),
                 returned_by: Vec::new(),
+                sets: None,
             });
         }
     }
@@ -1006,6 +1033,7 @@ impl<'db> Extractor<'_, 'db> {
             implicit: true,
             attribute,
             returned_by: Vec::new(),
+            sets: None,
         });
     }
 
@@ -1065,6 +1093,17 @@ impl<'db> Extractor<'_, 'db> {
             if resolution.targets.is_empty() && param.is_none() { self.returned_by(&call.func) } else { Vec::new() };
         let unresolved =
             (resolution.targets.is_empty() && param.is_none()).then_some(resolution.reason);
+        // The declarative constructor sets each keyword argument on the new instance.
+        let sets = resolution.constructs.and_then(|class| {
+            let names: Vec<String> = call
+                .arguments
+                .keywords
+                .iter()
+                .filter_map(|k| k.arg.as_ref().map(|a| a.to_string()))
+                .filter(|n| self.orm.validated.contains(n))
+                .collect();
+            (!names.is_empty()).then_some((class, names))
+        });
         self.out.calls.push(RawCall {
             caller: self.current,
             location,
@@ -1080,6 +1119,7 @@ impl<'db> Extractor<'_, 'db> {
             implicit: false,
             attribute,
             returned_by,
+            sets,
         });
     }
 
@@ -1171,6 +1211,205 @@ impl<'db> Extractor<'_, 'db> {
         }
     }
 
+    /// Implicit SQLAlchemy work on an attribute of a mapped instance: `obj.email = ...` runs the
+    /// `@validates("email")` validators, reading a lazily loaded relationship (`author.books`)
+    /// queries through the session.
+    fn orm_attribute(&mut self, attr: &ast::ExprAttribute) {
+        let name = attr.attr.as_str();
+        let validated = attr.ctx == ExprContext::Store && self.orm.validated.contains(name);
+        let lazy = attr.ctx == ExprContext::Load && self.orm.lazy_names.contains(name) && self.orm.load.is_some();
+        if !validated && !lazy {
+            return;
+        }
+        let Some(class) = self.mapped_instance_class(&attr.value) else { return };
+        let (targets, sets) = if validated {
+            (Vec::new(), Some((class, vec![name.to_string()])))
+        } else {
+            if !self.orm.lazy.contains(&(class, name.to_string())) || !self.may_be_persistent(&attr.value) {
+                return;
+            }
+            let load = self.orm.load.expect("checked above");
+            self.lazy_reads.push((self.current, self.index.location(attr.start()), name.to_string()));
+            (vec![(load, true)], None)
+        };
+        self.out.calls.push(RawCall {
+            caller: self.current,
+            location: self.index.location(attr.start()),
+            text: self.text(attr.range()),
+            targets,
+            virtual_dispatch: false,
+            param: None,
+            awaited: false,
+            iterates: false,
+            constructs: None,
+            unresolved: None,
+            accessor: None,
+            implicit: true,
+            attribute: None,
+            returned_by: Vec::new(),
+            sets,
+        });
+    }
+
+    /// The class of a (possibly mapped) instance: its type (`T | None`, `T & ~AlwaysFalsy`
+    /// narrowed), else, for a variable ty cannot type (`run_in_threadpool(db.get, Author, id)`
+    /// leaves the type variable unsolved), the one mapped class passed to the call it was
+    /// assigned from (`Session.get` and friends return an instance of the entity they are given).
+    fn mapped_instance_class(&self, receiver: &Expr) -> Option<Key> {
+        if let Some(class) = self.receiver_class(receiver).or_else(|| instance_class(self.model, receiver)) {
+            return Some(class);
+        }
+        let db = self.model.db();
+        match receiver.inferred_type(self.model)? {
+            Type::Intersection(intersection) => {
+                let mut positive = intersection.iter_positive(db).filter(|t| matches!(t, Type::NominalInstance(_)));
+                return positive.next().and_then(|ty| self.class_key(&ty));
+            }
+            Type::NominalInstance(_) | Type::ClassLiteral(_) | Type::ModuleLiteral(_) | Type::FunctionLiteral(_) => {
+                return None;
+            }
+            _ => {}
+        }
+        let Expr::Name(name) = receiver else { return None };
+        let mut found = None;
+        for definition in definitions_for_name(self.model, &name.id, receiver.into(), ImportAliasResolution::ResolveAliases) {
+            let ResolvedDefinition::Definition(def) = definition else { return None };
+            let DefinitionKind::Assignment(assignment) = def.kind(db) else { return None };
+            if def.file(db) != self.index.file || assignment.unpack().is_some() {
+                return None;
+            }
+            let module = parsed_module(db, def.python_file(db)).load(db);
+            let mut value = assignment.value(&module);
+            if let Expr::Await(await_expr) = value {
+                value = &await_expr.value;
+            }
+            let Expr::Call(call) = value else { return None };
+            let mut mapped = call.arguments.args.iter().filter_map(|argument| {
+                let ty = argument.inferred_type(self.model).filter(is_class_object)?;
+                self.class_key(&ty).filter(|class| self.orm.lazy.iter().any(|(c, _)| c == class))
+            });
+            let class = mapped.next()?;
+            if mapped.next().is_some() || found.is_some_and(|c| c != class) {
+                return None;
+            }
+            found = Some(class);
+        }
+        found
+    }
+
+    /// Whether a mapped instance may be attached to a sync session. Not when the variable holding
+    /// it is assigned a new instance (transient objects load nothing), nor when it was obtained by
+    /// awaiting something in a function using the async ORM: an `AsyncSession` lazy load raises
+    /// `MissingGreenlet` instead of blocking. Awaiting an offload API with a sync callable
+    /// (`await run_in_threadpool(db.get, Author, id)`) does return an instance of a sync session.
+    fn may_be_persistent(&self, receiver: &Expr) -> bool {
+        if self.uses_async_orm() {
+            return false;
+        }
+        self.may_be_persistent_value(receiver, 0)
+    }
+
+    fn may_be_persistent_value(&self, value: &Expr, depth: u8) -> bool {
+        if depth > 3 {
+            return true;
+        }
+        match value {
+            Expr::Await(await_expr) => {
+                matches!(&*await_expr.value, Expr::Call(call) if self.offloads(call))
+            }
+            Expr::Call(call) if call.func.inferred_type(self.model).is_some_and(|t| is_class_object(&t)) => false,
+            Expr::Name(name) => {
+                let db = self.model.db();
+                let definitions =
+                    definitions_for_name(self.model, &name.id, value.into(), ImportAliasResolution::ResolveAliases);
+                for definition in definitions {
+                    let ResolvedDefinition::Definition(def) = definition else { continue };
+                    if def.file(db) != self.index.file {
+                        continue;
+                    }
+                    let module = parsed_module(db, def.python_file(db)).load(db);
+                    let assigned = match def.kind(db) {
+                        DefinitionKind::Assignment(a) => Some(a.value(&module)),
+                        DefinitionKind::AnnotatedAssignment(a) => a.value(&module),
+                        DefinitionKind::For(f) => Some(f.iterable(&module)),
+                        DefinitionKind::Comprehension(c) => Some(c.iterable(&module)),
+                        _ => None,
+                    };
+                    let Some(assigned) = assigned else { continue };
+                    if !self.may_be_persistent_value(assigned, depth + 1) {
+                        return false;
+                    }
+                }
+                true
+            }
+            // `(await session.scalars(...)).first()`, `for x in await f()`: anything awaited on
+            // the way, unless it offloads.
+            _ => awaited_calls(value).iter().all(|call| self.offloads(call)),
+        }
+    }
+
+    /// `run_in_threadpool(db.get, ...)`, `asyncio.to_thread(f)`: a call handed a sync callable.
+    fn offloads(&self, call: &ast::ExprCall) -> bool {
+        call.arguments.args.iter().any(|a| matches!(self.value_of(a), Some(RawValue::Function(_))))
+    }
+
+    /// Whether the current function (or one enclosing it) mentions the async ORM:
+    /// `session: AsyncSession`, `async_sessionmaker`.
+    fn uses_async_orm(&self) -> bool {
+        let db = self.model.db();
+        let parsed = parsed_module(db, self.model.python_file()).load(db);
+        let mut scope = Some(self.current);
+        while let Some(key) = scope {
+            if key != MODULE_KEY
+                && let Some(def) = find_function(parsed.syntax(), key)
+            {
+                let text = self.index.text(def.range());
+                if text.contains("AsyncSession") || text.contains("async_sessionmaker") {
+                    return true;
+                }
+            }
+            scope = self.index.functions.get(&key).and_then(|f| f.parent);
+        }
+        false
+    }
+
+    /// Drops the lazy relationship reads whose relationship the function (or one it calls or
+    /// passes on, or the module) loads eagerly: `db.get(Author, id, options=[selectinload(Author.books)])`.
+    fn drop_eager_reads(&mut self) {
+        let Some(load) = self.orm.load else { return };
+        let file = self.index.file;
+        let mut dropped: Vec<(u32, Location)> = Vec::new();
+        for (function, location, name) in std::mem::take(&mut self.lazy_reads) {
+            let mut sources: Vec<Key> = vec![(file, MODULE_KEY)];
+            let mut scope = Some(function);
+            while let Some(key) = scope {
+                sources.push((file, key));
+                scope = self.index.functions.get(&key).and_then(|f| f.parent);
+            }
+            sources.extend(
+                self.out.calls.iter().filter(|c| c.caller == function).flat_map(|c| c.targets.iter().map(|(k, _)| *k)),
+            );
+            sources.extend(self.out.flows.iter().filter(|f| f.caller == function).filter_map(|f| match f.value {
+                RawValue::Function(key) => Some(key),
+                _ => None,
+            }));
+            let eager = sources
+                .iter()
+                .filter_map(|k| self.orm.eager.get(k))
+                .flatten()
+                .any(|n| n == &name || n == "*");
+            if eager {
+                dropped.push((function, location));
+            }
+        }
+        self.out.calls.retain(|c| {
+            !(c.targets.len() == 1
+                && c.targets[0].0 == load
+                && c.implicit
+                && dropped.iter().any(|(f, l)| *f == c.caller && *l == c.location))
+        });
+    }
+
     fn in_scope(&mut self, key: u32, f: impl FnOnce(&mut Self)) {
         let previous = std::mem::replace(&mut self.current, key);
         f(self);
@@ -1244,6 +1483,11 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
     }
 
     fn visit_expr(&mut self, expr: &'ast Expr) {
+        if let Expr::Attribute(attr) = expr
+            && self.recording()
+        {
+            self.orm_attribute(attr);
+        }
         match expr {
             Expr::Await(await_expr) => {
                 if let Expr::Call(call) = &*await_expr.value {
@@ -1355,6 +1599,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                         implicit: true,
                         attribute: None,
                         returned_by: Vec::new(),
+                        sets: None,
                     });
                 }
                 walk_expr(self, expr);
@@ -1362,6 +1607,28 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
             _ => walk_expr(self, expr),
         }
     }
+}
+
+/// The calls awaited in an expression (`await session.get(...)`), outside nested scopes.
+fn awaited_calls(expr: &Expr) -> Vec<&ast::ExprCall> {
+    struct Finder<'a>(Vec<&'a ast::ExprCall>);
+    impl<'a> SourceOrderVisitor<'a> for Finder<'a> {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            match expr {
+                Expr::Lambda(_) => {}
+                Expr::Await(await_expr) => {
+                    if let Expr::Call(call) = &*await_expr.value {
+                        self.0.push(call);
+                    }
+                    walk_expr(self, expr);
+                }
+                _ => walk_expr(self, expr),
+            }
+        }
+    }
+    let mut finder = Finder(Vec::new());
+    finder.visit_expr(expr);
+    finder.0
 }
 
 /// The call expression spanning exactly `range` in a module.

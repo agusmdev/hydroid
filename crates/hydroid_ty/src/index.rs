@@ -30,6 +30,8 @@ pub struct FnEntry {
     pub is_generator: bool,
     pub is_validator: bool,
     pub is_serializer: bool,
+    /// See [`hydroid_core::facts::Function::validates`] (project files only).
+    pub validates: Vec<String>,
     pub params: Vec<String>,
     /// How many of `params` can be passed positionally.
     pub positional: usize,
@@ -46,6 +48,9 @@ pub struct ClassEntry {
     pub methods: Vec<(String, u32)>,
     /// Classes named in the annotations of class-level fields (project classes only).
     pub fields: Vec<Key>,
+    /// SQLAlchemy relationships loaded lazily on first access (`relationship(...)` with the
+    /// default `lazy="select"`), project classes only.
+    pub lazy_relationships: Vec<String>,
 }
 
 /// Whose `state` an attribute is stored on: the application's (`app.state.x`), or the one
@@ -77,6 +82,10 @@ pub struct FileIndex {
     pub class_attributes: Vec<String>,
     /// Objects stored on application or connection state (project files only).
     pub state_stores: Vec<StateStore>,
+    /// Relationship names each function names in an eager loader option
+    /// (`selectinload(Author.books)`, `joinedload("books")`; `*` for wildcards), project files
+    /// only: what it loads is not loaded lazily later.
+    pub eager_loads: FxHashMap<u32, Vec<String>>,
     display_path: String,
     lines: LineIndex,
     source: ruff_db::source::SourceText,
@@ -109,6 +118,7 @@ impl FileIndex {
             suppressed,
             class_attributes: Vec::new(),
             state_stores: Vec::new(),
+            eager_loads: FxHashMap::default(),
             display_path,
             lines,
             source,
@@ -122,6 +132,7 @@ impl FileIndex {
             is_generator: false,
             is_validator: false,
             is_serializer: false,
+            validates: Vec::new(),
             params: Vec::new(),
             positional: 0,
             parent: None,
@@ -242,6 +253,60 @@ impl Builder<'_, '_> {
                 let name = key.value.to_str().to_string();
                 self.index.state_stores.push(StateStore { owner: StateOwner::Connection, name, class });
             }
+        }
+    }
+
+    /// `name = relationship(...)` (or `name: Mapped[...] = relationship(...)`) in the body of a
+    /// project class, loaded lazily: see [`ClassEntry::lazy_relationships`].
+    fn relationship(&mut self, name: &ast::ExprName, value: &Expr) {
+        let Some(class) = self.direct_class() else { return };
+        let Expr::Call(call) = value else { return };
+        if self.index.origin != Origin::Project
+            || !matches!(callee_name(&call.func), Some("relationship"))
+            || !defined_in_sqlalchemy(self.model, &call.func)
+        {
+            return;
+        }
+        // `lazy="selectin"`, `"joined"`, `"raise"`, `"noload"`, `"dynamic"`, `"write_only"`, ...:
+        // reading the attribute emits no query (or not by itself).
+        let lazy = match call.arguments.find_keyword("lazy").map(|k| &k.value) {
+            None => true,
+            Some(Expr::StringLiteral(s)) => s.value.to_str() == "select",
+            Some(Expr::BooleanLiteral(b)) => b.value,
+            Some(_) => false,
+        };
+        if lazy && let Some(entry) = self.index.classes.get_mut(&class) {
+            entry.lazy_relationships.push(name.id.to_string());
+        }
+    }
+
+    /// `selectinload(Author.books)`, `joinedload("books")`, `Load(Author).selectinload(...)`:
+    /// see [`FileIndex::eager_loads`].
+    fn eager_load(&mut self, call: &ast::ExprCall) {
+        if !callee_name(&call.func).is_some_and(|n| EAGER_LOADERS.contains(&n)) {
+            return;
+        }
+        // Module-level options (`AUTHOR_OPTIONS = [selectinload(...)]`) may be used anywhere in
+        // the file.
+        let function = self.enclosing_function().unwrap_or(MODULE_KEY);
+        let mut names = Vec::new();
+        for argument in &call.arguments.args {
+            match argument {
+                Expr::Attribute(attr) => names.push(attr.attr.to_string()),
+                // `Author.books.of_type(Novel)`, `Author.books.and_(...)`.
+                Expr::Call(inner) => {
+                    if let Expr::Attribute(method) = &*inner.func
+                        && let Expr::Attribute(attr) = &*method.value
+                    {
+                        names.push(attr.attr.to_string());
+                    }
+                }
+                Expr::StringLiteral(s) => names.extend(s.value.to_str().split('.').map(str::to_string)),
+                _ => {}
+            }
+        }
+        if !names.is_empty() {
+            self.index.eager_loads.entry(function).or_default().extend(names);
         }
     }
 
@@ -389,6 +454,45 @@ fn decorator_name(decorator: &ast::Decorator) -> Option<&str> {
         Expr::Attribute(attr) => Some(attr.attr.as_str()),
         _ => None,
     }
+}
+
+/// SQLAlchemy loader options that load a relationship up front (or keep it from loading).
+const EAGER_LOADERS: &[&str] =
+    &["selectinload", "joinedload", "subqueryload", "immediateload", "contains_eager", "raiseload", "noload"];
+
+/// `relationship` in `relationship(...)` and `orm.relationship(...)`.
+fn callee_name(func: &Expr) -> Option<&str> {
+    match func {
+        Expr::Name(name) => Some(name.id.as_str()),
+        Expr::Attribute(attr) => Some(attr.attr.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether a callee is a function defined in the `sqlalchemy` package.
+fn defined_in_sqlalchemy(model: &SemanticModel<'_>, func: &Expr) -> bool {
+    let db = model.db();
+    let Some(ty @ Type::FunctionLiteral(_)) = func.inferred_type(model) else { return false };
+    let Some(TypeDefinition::Function(def)) = ty.definition(db, &model.program_environment()) else { return false };
+    let path = def.file(db).path(db).as_str().replace('\\', "/");
+    path.contains("/sqlalchemy/")
+}
+
+/// The attributes a SQLAlchemy `@validates("a", "b")` decorator names.
+fn orm_validates(model: &SemanticModel<'_>, def: &ast::StmtFunctionDef) -> Vec<String> {
+    let mut names = Vec::new();
+    for decorator in &def.decorator_list {
+        let Expr::Call(call) = &decorator.expression else { continue };
+        if callee_name(&call.func) != Some("validates") || !defined_in_sqlalchemy(model, &call.func) {
+            continue;
+        }
+        for argument in &call.arguments.args {
+            if let Expr::StringLiteral(s) = argument {
+                names.push(s.value.to_str().to_string());
+            }
+        }
+    }
+    names
 }
 
 fn accessor(def: &ast::StmtFunctionDef) -> Option<Accessor> {
@@ -561,6 +665,11 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                         is_generator: !def.is_async && def.decorator_list.is_empty() && yields(&def.body),
                         is_validator: is_validator(def),
                         is_serializer: is_serializer(def),
+                        validates: if self.index.origin == Origin::Project && class.is_some() {
+                            orm_validates(self.model, def)
+                        } else {
+                            Vec::new()
+                        },
                         params,
                         positional,
                         parent: self.enclosing_function(),
@@ -590,13 +699,23 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                 let is_protocol = def.bases().iter().any(is_protocol_base);
                 self.index.classes.insert(
                     key,
-                    ClassEntry { qualname: qualname.clone(), bases, is_protocol, methods: Vec::new(), fields: Vec::new() },
+                    ClassEntry {
+                        qualname: qualname.clone(),
+                        bases,
+                        is_protocol,
+                        methods: Vec::new(),
+                        fields: Vec::new(),
+                        lazy_relationships: Vec::new(),
+                    },
                 );
                 self.scopes.push((Scope::Class(key), qualname));
                 walk_stmt(self, stmt);
                 self.scopes.pop();
             }
             Stmt::Assign(ast::StmtAssign { targets, value, .. }) if self.direct_class().is_some() => {
+                if let [Expr::Name(name)] = &targets[..] {
+                    self.relationship(name, value);
+                }
                 if value.is_call_expr() {
                     let names = targets.iter().filter_map(|t| t.as_name_expr()).map(|n| n.id.to_string());
                     self.index.class_attributes.extend(names);
@@ -609,6 +728,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     && let Some(name) = target.as_name_expr()
                 {
                     self.index.class_attributes.push(name.id.to_string());
+                    self.relationship(name, value.as_deref().expect("a call value"));
                 }
                 // Pydantic neither validates nor dumps class variables and private attributes.
                 let is_class_var = matches!(&**annotation, Expr::Subscript(s) if matches!(&*s.value,
@@ -628,6 +748,11 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
     }
 
     fn visit_expr(&mut self, expr: &'ast Expr) {
+        if let Expr::Call(call) = expr
+            && self.index.origin == Origin::Project
+        {
+            self.eager_load(call);
+        }
         if let Expr::Lambda(lambda) = expr {
             let key = lambda.start().to_u32();
             let location = self.index.location(lambda.start());
@@ -644,6 +769,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     is_generator: false,
                     is_validator: false,
                     is_serializer: false,
+                    validates: Vec::new(),
                     params,
                     positional,
                     parent: self.enclosing_function(),
