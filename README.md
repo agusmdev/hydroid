@@ -119,7 +119,8 @@ drop it and the upload step to fail the build instead.
    `sorted(xs, key=f)` or `stack.enter_context(cm)`, `singledispatch` implementations). Callables passed as arguments are recorded as flows
    (`to_thread(f)`, `Depends(dep)`, `on_startup=[f]`, decorators), and so are callables stored
    on `self` and returned by functions. When ty does not know a value's type because it comes
-   from an unannotated function, the class that function returns is used. Signatures record
+   from an unannotated function, the class that function returns is used; an unannotated
+   `client=Depends(provider)` parameter holds what the provider returns (or yields). Signatures record
    what FastAPI validates and serializes: the models (and `AfterValidator`-style callables) in
    parameter annotations, the return annotation, the classes returned. The facts of an unchanged project are reused from `.hydroid_cache/` (keyed by the
    binary, the options, the installed packages and every source file's contents).

@@ -173,8 +173,8 @@ struct Extractor<'a, 'db> {
     awaited: FxHashSet<u32>,
     /// Calls whose result is iterated right away (see [`Extractor::iterate`]).
     iterated: FxHashSet<u32>,
-    /// See [`Extractor::returned_classes`].
-    returned_classes: RefCell<FxHashMap<Key, Vec<Key>>>,
+    /// See [`Extractor::value_classes`].
+    returned_classes: RefCell<FxHashMap<(Key, bool), Vec<Key>>>,
     /// Ranges of callee expressions (attribute reads there are calls, not property reads).
     callees: FxHashSet<(u32, u32)>,
     out: FileFacts,
@@ -494,7 +494,8 @@ impl<'db> Extractor<'_, 'db> {
     }
 
     /// The class of an instance: its type, or, when ty does not know it (unannotated returns are
-    /// unknown to ty), the class the function it was returned from constructs.
+    /// unknown to ty), the class the function it was returned from (or the dependency it was
+    /// injected by) constructs.
     fn receiver_class(&self, receiver: &Expr) -> Option<Key> {
         if let Some(class) = self.self_class(receiver) {
             return Some(class);
@@ -502,7 +503,15 @@ impl<'db> Extractor<'_, 'db> {
         match receiver.inferred_type(self.model)? {
             ty @ Type::NominalInstance(_) => self.class_key(&ty),
             Type::Dynamic(_) => {
+                if let Some(class) = self.dependency_classes(receiver).first() {
+                    return Some(*class);
+                }
                 self.returned_by(receiver).into_iter().find_map(|f| self.returned_classes(f).first().copied())
+            }
+            Type::Union(union)
+                if union.elements(self.model.db()).iter().all(|t| matches!(t, Type::Dynamic(_))) =>
+            {
+                self.dependency_classes(receiver).first().copied()
             }
             _ => None,
         }
@@ -510,7 +519,13 @@ impl<'db> Extractor<'_, 'db> {
 
     /// Classes of the instances a function returns, from the types of its `return` values.
     fn returned_classes(&self, function: Key) -> Vec<Key> {
-        if let Some(classes) = self.returned_classes.borrow().get(&function) {
+        self.value_classes(function, false)
+    }
+
+    /// Classes of the instances a function returns (`yielded`: yields), from the types of its
+    /// `return` (`yield`) values.
+    fn value_classes(&self, function: Key, yielded: bool) -> Vec<Key> {
+        if let Some(classes) = self.returned_classes.borrow().get(&(function, yielded)) {
             return classes.clone();
         }
         let db = self.model.db();
@@ -519,7 +534,8 @@ impl<'db> Extractor<'_, 'db> {
         let parsed = parsed_module(db, model.python_file()).load(db);
         let mut classes = Vec::new();
         if let Some(def) = find_function(parsed.syntax(), offset) {
-            for value in return_values(&def.body) {
+            let values = if yielded { yield_values(&def.body) } else { return_values(&def.body) };
+            for value in values {
                 let types = match value.inferred_type(&model) {
                     Some(Type::Union(union)) => union.elements(db).to_vec(),
                     Some(ty) => vec![ty],
@@ -534,7 +550,68 @@ impl<'db> Extractor<'_, 'db> {
                 }
             }
         }
-        self.returned_classes.borrow_mut().insert(function, classes.clone());
+        self.returned_classes.borrow_mut().insert((function, yielded), classes.clone());
+        classes
+    }
+
+    /// The classes of an unannotated parameter's value when its default is `Depends(provider)`
+    /// (or `Security(provider)`): FastAPI passes what the provider returns (yields, for generator
+    /// dependencies), or an instance of a class used as a dependency.
+    fn dependency_classes(&self, receiver: &Expr) -> Vec<Key> {
+        let Some((owner, name)) = self.param_of(receiver) else { return Vec::new() };
+        let db = self.model.db();
+        let parsed = parsed_module(db, self.model.python_file()).load(db);
+        let Some(def) = find_function(parsed.syntax(), owner) else { return Vec::new() };
+        let parameters = &def.parameters;
+        let Some(parameter) = parameters
+            .posonlyargs
+            .iter()
+            .chain(&parameters.args)
+            .chain(&parameters.kwonlyargs)
+            .find(|p| p.parameter.name.as_str() == name)
+        else {
+            return Vec::new();
+        };
+        let Some(Expr::Call(call)) = parameter.default.as_deref() else { return Vec::new() };
+        if parameter.parameter.annotation.is_some() || !called_name(call).is_some_and(|n| DEPENDENCY_MARKERS.contains(&n))
+        {
+            return Vec::new();
+        }
+        let provider = call.arguments.args.first().or_else(|| call.arguments.find_keyword("dependency").map(|k| &k.value));
+        match provider.and_then(|p| self.value_of(p)) {
+            Some(RawValue::Function(function)) => self.provided_classes(function),
+            Some(RawValue::Class(class)) => vec![class],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Classes of what a dependency provider gives FastAPI: its declared return type (the yield
+    /// type of a generator), else the classes of its `return` (`yield`) values.
+    fn provided_classes(&self, function: Key) -> Vec<Key> {
+        let db = self.model.db();
+        let (file, offset) = function;
+        let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, file));
+        let parsed = parsed_module(db, model.python_file()).load(db);
+        let Some(def) = find_function(parsed.syntax(), offset) else { return Vec::new() };
+        let generator = yields(&def.body);
+        let mut classes = Vec::new();
+        if let Some(returns) = def.returns.as_deref() {
+            // `Iterator[Client]`, `Generator[Client, None, None]`: the first type argument.
+            let returns = match returns {
+                Expr::Subscript(subscript) if generator => match &*subscript.slice {
+                    Expr::Tuple(tuple) => tuple.elts.first(),
+                    slice => Some(slice),
+                },
+                Expr::Subscript(_) => None,
+                returns => Some(returns),
+            };
+            if let Some(returns) = returns.filter(|r| matches!(r, Expr::Name(_) | Expr::Attribute(_) | Expr::BinOp(_))) {
+                annotation_classes(&model, returns, &mut classes, &mut |_| {});
+            }
+        }
+        if classes.is_empty() {
+            classes = self.value_classes(function, generator);
+        }
         classes
     }
 
@@ -1151,6 +1228,31 @@ fn find_function(module: &ast::ModModule, offset: u32) -> Option<&ast::StmtFunct
     let mut finder = Finder { offset, found: None };
     finder.visit_body(&module.body);
     finder.found
+}
+
+/// The values a generator body yields (in its own scope; not `yield from`).
+fn yield_values(body: &[Stmt]) -> Vec<&Expr> {
+    struct Yields<'a>(Vec<&'a Expr>);
+    impl<'a> SourceOrderVisitor<'a> for Yields<'a> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if !matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                walk_stmt(self, stmt);
+            }
+        }
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            match expr {
+                Expr::Yield(ast::ExprYield { value: Some(value), .. }) => {
+                    self.0.push(value);
+                    walk_expr(self, value);
+                }
+                Expr::Lambda(_) => {}
+                _ => walk_expr(self, expr),
+            }
+        }
+    }
+    let mut yields = Yields(Vec::new());
+    yields.visit_body(body);
+    yields.0
 }
 
 /// The values a function body returns (in its own scope).
