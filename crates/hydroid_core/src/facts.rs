@@ -78,6 +78,9 @@ pub struct Function {
     pub class: Option<ClassId>,
     /// Resolved decorator callables, outermost first.
     pub decorators: Vec<FnId>,
+    /// The methods a library method calls on its own instance (`self.name(...)`): a project
+    /// subclass overriding one of them runs its override there (template methods).
+    pub self_calls: Vec<String>,
     /// Whether the body was analyzed. Unanalyzed functions (stdlib stubs, libraries without
     /// `--follow-libs`) are leaves: only the catalog knows whether they block.
     pub analyzed: bool,
@@ -249,6 +252,9 @@ pub struct Flow {
     pub into: FnId,
     pub slot: Slot,
     pub value: Value,
+    /// The class of the instance a bound method value belongs to (`Depends(scheme)`: the class
+    /// of `scheme`, whose `__call__` is the value).
+    pub receiver: Option<ClassId>,
     /// First string-literal argument of the receiving call (route paths, event names).
     pub literal: Option<String>,
 }

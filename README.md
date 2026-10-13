@@ -161,7 +161,10 @@ drop it and the upload step to fail the build instead.
    of an f-string, and `logging.info(...)` logs on the root logger. Records of a logger whose
    name is not known may reach any hook. Offload APIs cut the graph; callbacks are attributed to the call site passing
    them; overrides are found by class-hierarchy analysis (test doubles only stand in for real
-   classes in test code); calling a generator function runs nothing until the generator is
+   classes in test code); a library `async def` method running on an instance of a project
+   subclass (`Security(scheme)`, `await scheme(request)`) runs the project's overrides of the
+   library methods it calls on `self` (`APIKeyHeader.__call__` calling `self.check_api_key(...)`),
+   without `--follow-libs`; calling a generator function runs nothing until the generator is
    iterated; a decorated function is reached through its decorator's wrappers only when they call
    it (not when they only hand it to an offload API, or to `functools.wraps`). Starting an event
    loop (`asyncio.run`) is only reported when loop code does it directly: sync bridges reaching

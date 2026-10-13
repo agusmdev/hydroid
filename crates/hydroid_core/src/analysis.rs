@@ -121,9 +121,14 @@ struct Graph<'a> {
     log_stops: Vec<String>,
     /// Memoized [`Graph::validation_hooks`].
     validated: RefCell<HashMap<ClassId, Rc<[FnId]>>>,
+    /// Memoized [`Graph::template_hooks`].
+    templates: RefCell<HashMap<TemplateKey, Rc<[FnId]>>>,
 }
 
 type ParamKey = (FnId, String);
+
+/// A library method and the class of the instance it runs on.
+type TemplateKey = (FnId, ClassId);
 
 /// What [`Graph::effective_targets`] reads besides the call.
 #[derive(Clone, Copy)]
@@ -173,6 +178,7 @@ impl<'a> Graph<'a> {
             log_threshold: 0,
             log_stops: Vec::new(),
             validated: RefCell::default(),
+            templates: RefCell::default(),
         };
         let used_from_calls = facts.calls.iter().filter_map(|c| c.param.clone());
         let used_from_flows: Vec<ParamKey> = facts
@@ -379,6 +385,13 @@ impl<'a> Graph<'a> {
             });
             out.extend(body.iter().copied());
             out.extend(dispatches.get(&t).into_iter().flatten());
+            // Awaiting a library coroutine method runs, on the loop, the project overrides of
+            // the hooks it calls on the instance.
+            if let Some(receiver) = call.receiver
+                && self.facts.function(call.caller).is_async
+            {
+                out.extend(self.template_hooks(t, receiver).iter().copied());
+            }
             if call.virtual_dispatch {
                 // An instance of a known class runs only the overrides of its subclasses.
                 let receiver = call.receiver.filter(|r| !self.facts.class(*r).is_protocol);
@@ -1084,7 +1097,72 @@ impl<'a> Graph<'a> {
                 }
             }
         }
+        // A callable instance of a project subclass handed to FastAPI (`Security(scheme)`) whose
+        // `__call__` is a library `async def`: the project overrides of the hooks it calls.
+        for flow in &self.facts.flows {
+            let (Value::Function(method), Some(receiver)) = (flow.value.clone(), flow.receiver) else { continue };
+            let into = &self.facts.function(flow.into).qualname;
+            let Some(kind) = self.catalog.entry_kind(into) else { continue };
+            let slot = |name: &str| matches!(&flow.slot, Slot::Param(p) if p == name);
+            let applies = match kind {
+                "dependency" => slot("dependency"),
+                "route" | "websocket" => flow.slot == Slot::Decorated || slot("endpoint"),
+                _ => true,
+            };
+            if !applies {
+                continue;
+            }
+            let found = self.template_hooks(method, receiver);
+            if found.is_empty() {
+                continue;
+            }
+            let name = self.facts.function(method).qualname.rsplit('.').next().unwrap_or_default().to_string();
+            let label = format!("{} ({name})", entry_label(kind, into, flow));
+            hooks.extend(found.iter().map(|&h| (h, label.clone())));
+        }
         hooks.retain(|(h, _)| self.facts.function(*h).analyzed);
+        hooks
+    }
+
+    /// What a library `async def` method runs of the project when it runs on an instance of
+    /// `receiver` (template methods: `APIKeyHeader.__call__` calls `self.check_api_key(...)`):
+    /// the project overrides, in `receiver`'s MRO, of the library methods it calls on `self`,
+    /// directly or through other library methods it calls on `self`.
+    fn template_hooks(&self, method: FnId, receiver: ClassId) -> Rc<[FnId]> {
+        let f = self.facts.function(method);
+        let Some(owner) = f.class.filter(|_| f.is_async && !f.analyzed && f.origin != Origin::Project) else {
+            return Rc::from([]);
+        };
+        if let Some(found) = self.templates.borrow().get(&(method, receiver)) {
+            return found.clone();
+        }
+        let mut hooks = Vec::new();
+        if receiver != owner && self.inherits(receiver, owner) {
+            let mut seen = HashSet::from_iter([method]);
+            let mut queue = VecDeque::from([method]);
+            while let Some(m) = queue.pop_front() {
+                let caller = self.facts.function(m);
+                for name in &caller.self_calls {
+                    let Some(found) = Hierarchy::lookup(self.facts, receiver, name) else { continue };
+                    if !seen.insert(found) {
+                        continue;
+                    }
+                    let target = self.facts.function(found);
+                    if target.origin != Origin::Project {
+                        if !target.analyzed {
+                            queue.push_back(found);
+                        }
+                    } else if target.analyzed
+                        && caller.class.is_some_and(|c| Hierarchy::lookup(self.facts, c, name).is_some())
+                    {
+                        // An override of a method the library defines.
+                        hooks.push(found);
+                    }
+                }
+            }
+        }
+        let hooks: Rc<[FnId]> = Rc::from(hooks);
+        self.templates.borrow_mut().insert((method, receiver), hooks.clone());
         hooks
     }
 

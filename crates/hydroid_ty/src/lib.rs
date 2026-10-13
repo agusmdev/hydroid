@@ -545,6 +545,7 @@ impl<'a> Merger<'a> {
             serializes: entry.serializes.clone(),
             validates: entry.validates.clone(),
             params: entry.params.clone(),
+            self_calls: entry.self_calls.clone(),
             parent: None,
             class: None,
             decorators: Vec::new(),
@@ -709,7 +710,8 @@ impl<'a> Merger<'a> {
                     if i < entry.positional { Slot::Param(entry.params[i].clone()) } else { Slot::Unknown }
                 }
             };
-            self.facts.flows.push(Flow { location: raw.location, caller, into, slot, value, literal: raw.literal });
+            let receiver = raw.receiver.and_then(|k| self.class_id(k));
+            self.facts.flows.push(Flow { location: raw.location, caller, into, slot, value, receiver, literal: raw.literal });
         }
     }
 

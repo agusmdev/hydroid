@@ -39,6 +39,8 @@ pub struct FnEntry {
     pub positional: usize,
     pub parent: Option<u32>,
     pub class: Option<u32>,
+    /// See [`hydroid_core::facts::Function::self_calls`] (library methods only).
+    pub self_calls: Vec<String>,
 }
 
 pub struct ClassEntry {
@@ -140,6 +142,7 @@ impl FileIndex {
             positional: 0,
             parent: None,
             class: None,
+            self_calls: Vec::new(),
         };
         index.functions.insert(MODULE_KEY, module_entry);
         let mut builder = Builder { db, index: &mut index, model: &model, scopes: Vec::new(), module };
@@ -630,6 +633,42 @@ pub fn yield_values(body: &[Stmt]) -> Vec<&Expr> {
     yields.0
 }
 
+/// The methods an instance method calls on its own instance (`self.name(...)`), in its own
+/// scope: not in nested functions, lambdas or classes, which may run elsewhere.
+fn self_calls(def: &ast::StmtFunctionDef) -> Vec<String> {
+    struct Finder<'a> {
+        receiver: &'a str,
+        names: Vec<String>,
+    }
+    impl<'ast> SourceOrderVisitor<'ast> for Finder<'_> {
+        fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+            if !matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                walk_stmt(self, stmt);
+            }
+        }
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            if let Expr::Call(call) = expr
+                && let Expr::Attribute(attr) = &*call.func
+                && matches!(&*attr.value, Expr::Name(n) if n.id.as_str() == self.receiver)
+                && !self.names.iter().any(|n| n == attr.attr.as_str())
+            {
+                self.names.push(attr.attr.to_string());
+            }
+            if !matches!(expr, Expr::Lambda(_)) {
+                walk_expr(self, expr);
+            }
+        }
+    }
+    if def.decorator_list.iter().any(|d| matches!(decorator_name(d), Some("staticmethod" | "classmethod"))) {
+        return Vec::new();
+    }
+    let parameters = &def.parameters;
+    let Some(receiver) = parameters.posonlyargs.iter().chain(&parameters.args).next() else { return Vec::new() };
+    let mut finder = Finder { receiver: receiver.parameter.name.as_str(), names: Vec::new() };
+    finder.visit_body(&def.body);
+    finder.names
+}
+
 /// Whether a body yields (in its own scope: not in nested functions or classes).
 pub fn yields(body: &[Stmt]) -> bool {
     struct Finder(bool);
@@ -715,6 +754,11 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                         positional,
                         parent: self.enclosing_function(),
                         class,
+                        self_calls: if self.index.origin != Origin::Project && class.is_some() {
+                            self_calls(def)
+                        } else {
+                            Vec::new()
+                        },
                     },
                 );
                 // Decorators, defaults and annotations are evaluated in the enclosing scope.
@@ -816,6 +860,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     positional,
                     parent: self.enclosing_function(),
                     class: None,
+                    self_calls: Vec::new(),
                 },
             );
             self.scopes.push((Scope::Function(key), qualname));

@@ -123,6 +123,8 @@ pub struct RawFlow {
     pub bound: bool,
     pub slot: RawSlot,
     pub value: RawValue,
+    /// See [`hydroid_core::facts::Flow::receiver`].
+    pub receiver: Option<Key>,
     pub literal: Option<String>,
 }
 
@@ -408,6 +410,11 @@ impl<'db> Extractor<'_, 'db> {
     /// [`hydroid_core::facts::Call::receiver`]): `obj`'s class, or for `super().name(...)` the
     /// class of the calling method (with the name).
     fn mro_receiver(&self, callee: &Expr, resolution: &Resolution) -> (Option<Key>, Option<String>) {
+        // Calling an instance (`scheme(request)`, `self.scheme(request)`) looks `__call__` up
+        // in its class.
+        if !resolution.targets.is_empty() && matches!(callee.inferred_type(self.model), Some(Type::NominalInstance(_))) {
+            return (instance_class(self.model, callee), None);
+        }
         let Expr::Attribute(attr) = callee else { return (None, None) };
         if Self::is_super_call(&attr.value) {
             let class = self.index.functions.get(&self.current).and_then(|f| f.class);
@@ -1088,6 +1095,15 @@ impl<'db> Extractor<'_, 'db> {
         }
     }
 
+    /// The class of a callable instance (whose value is its `__call__`), when its class is a
+    /// project class: see [`hydroid_core::facts::Flow::receiver`].
+    fn called_instance(&self, expr: &Expr) -> Option<Key> {
+        if !matches!(expr.inferred_type(self.model), Some(Type::NominalInstance(_))) {
+            return None;
+        }
+        instance_class(self.model, expr).filter(|(file, _)| describe(self.db, *file).1 == Origin::Project)
+    }
+
     /// `<receiver>.<name>` for looking up implicit dunder calls through ty's IDE queries.
     fn synthesized_member(&self, receiver: &Expr, name: &str) -> ast::ExprAttribute {
         ast::ExprAttribute {
@@ -1158,21 +1174,21 @@ impl<'db> Extractor<'_, 'db> {
             );
         for (slot, argument) in arguments {
             // Callables in a literal list flow too (`FastAPI(on_startup=[init])`).
-            let values: Vec<RawValue> = match argument {
+            let values: Vec<(RawValue, Option<Key>)> = match argument {
                 Expr::List(ast::ExprList { elts, .. }) | Expr::Tuple(ast::ExprTuple { elts, .. }) => {
-                    elts.iter().filter_map(|e| self.value_of(e)).collect()
+                    elts.iter().filter_map(|e| Some((self.value_of(e)?, self.called_instance(e)))).collect()
                 }
-                _ => self.value_of(argument).into_iter().collect(),
+                _ => self.value_of(argument).map(|v| (v, self.called_instance(argument))).into_iter().collect(),
             };
             // `response_model=list[Item]`: the classes it names.
             let values = if values.is_empty() && matches!(&slot, RawSlot::Keyword(k) if k == "response_model") {
                 let mut classes = Vec::new();
                 annotation_classes(self.model, argument, &mut classes, &mut |_| {});
-                classes.into_iter().map(RawValue::Class).collect()
+                classes.into_iter().map(|c| (RawValue::Class(c), None)).collect()
             } else {
                 values
             };
-            for value in values {
+            for (value, receiver) in values {
                 for &(into, bound) in &resolution.targets {
                     self.out.flows.push(RawFlow {
                         caller: self.current,
@@ -1181,6 +1197,7 @@ impl<'db> Extractor<'_, 'db> {
                         bound,
                         slot: slot.clone(),
                         value: value.clone(),
+                        receiver,
                         literal: literal.clone(),
                     });
                 }
@@ -1495,6 +1512,7 @@ impl<'db> Extractor<'_, 'db> {
                     bound,
                     slot: RawSlot::Decorated,
                     value: RawValue::Function((self.index.file, key)),
+                    receiver: None,
                     literal: literal.clone(),
                 });
             }
