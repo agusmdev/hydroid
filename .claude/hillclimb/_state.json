@@ -239,6 +239,13 @@
         "orm_validates_on_construct",
         "py_copy_context_run"
       ]
+    },
+    {
+      "round": 9,
+      "lever": "protocol",
+      "protocol": "holdout baseline after promoting this round's cases, scored before any fix (same protocol as round 6): new holdout cases change the set the ratchet compares against.",
+      "holdout_recall": "0/5",
+      "holdout_fp": 0
     }
   ],
   "ground_truth": "scripts/hillclimb/oracle_runtime.py via check.py: a case is promoted only when the runtime proves every line where hydroid disagrees (verdict BREAKS), or with a reviewer's note"
