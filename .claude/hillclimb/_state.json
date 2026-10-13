@@ -264,6 +264,13 @@
         "py_mixin_super_chain",
         "std_email_make_msgid_fqdn"
       ]
+    },
+    {
+      "round": 11,
+      "lever": "protocol",
+      "protocol": "holdout baseline after promoting this round's cases, before any fix (same protocol as round 6). Note: candidate cache_configparser_read (would-be holdout, never shown to a fixer) started passing after round 10's stdlib catalog work and was dropped.",
+      "holdout_recall": "3/7",
+      "holdout_fp": 0
     }
   ],
   "ground_truth": "scripts/hillclimb/oracle_runtime.py via check.py: a case is promoted only when the runtime proves every line where hydroid disagrees (verdict BREAKS), or with a reviewer's note"
