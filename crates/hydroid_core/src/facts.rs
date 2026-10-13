@@ -225,6 +225,11 @@ pub struct Call {
     /// See [`Instance`]: set on `obj.name(...)` calls whose dispatch depends on more than the
     /// declared class of `obj`.
     pub instance: Option<Box<Instance>>,
+    /// The callees are decorated generator functions, and what the call returns is a context
+    /// manager or an iterator (`@contextmanager`): their bodies run when it is entered or
+    /// iterated (`iterates`), not now.
+    #[serde(default)]
+    pub deferred_body: bool,
     /// `(line, column)` of a call in the same caller this call is deferred to: it computes an
     /// element of a lazy iterable passed to that call (`to_thread(list, map(f, xs))`,
     /// `run_in_threadpool(sum, (f(x) for x in xs))`), so it runs wherever that call pulls the

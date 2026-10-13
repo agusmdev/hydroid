@@ -1330,9 +1330,11 @@ impl<'a> Graph<'a> {
     }
 
     /// Whether calling `target` at `call` runs its body now: calling a generator function only
-    /// creates the generator, unless the call site iterates it right away.
+    /// creates the generator (or the context manager its decorator wraps it in), unless the call
+    /// site iterates (enters) it right away.
     fn runs_body(&self, call: usize, target: FnId) -> bool {
-        !self.facts.function(target).is_generator || self.facts.calls[call].iterates
+        let call = &self.facts.calls[call];
+        !(self.facts.function(target).is_generator || call.deferred_body) || call.iterates
     }
 
     /// Loop code: every analyzed `async def`, plus sync callables scheduled on the loop and

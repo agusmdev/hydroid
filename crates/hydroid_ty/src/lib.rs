@@ -727,6 +727,7 @@ impl<'a> Merger<'a> {
                 logging: logging.map(Box::new),
                 instance: instance.map(Box::new),
                 lazy_in: raw.lazy_in,
+                deferred_body: raw.deferred_body,
             });
         }
         self.facts.stops_propagation.extend(file_facts.stops_propagation);

@@ -553,16 +553,6 @@ fn callee_name(func: &Expr) -> Option<&str> {
     }
 }
 
-/// Whether a decorator is `contextlib.contextmanager`.
-fn is_contextmanager(db: &HydroidDb, model: &SemanticModel<'_>, decorator: &ast::Decorator) -> bool {
-    if decorator_name(decorator) != Some("contextmanager") || decorator.expression.is_call_expr() {
-        return false;
-    }
-    let Some(ty @ Type::FunctionLiteral(_)) = decorator.expression.inferred_type(model) else { return false };
-    let Some(TypeDefinition::Function(def)) = ty.definition(db, &model.program_environment()) else { return false };
-    describe(db, def.file(db)).0 == "contextlib"
-}
-
 /// Whether a callee is a function defined in the `sqlalchemy` package.
 fn defined_in_sqlalchemy(model: &SemanticModel<'_>, func: &Expr) -> bool {
     let db = model.db();
@@ -909,15 +899,8 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                         is_async: def.is_async,
                         property: accessor(def),
                         // A decorated generator is called through its decorator, which decides
-                        // when the body runs. Calling a `@contextmanager` one only creates the
-                        // generator (in a `_GeneratorContextManager`): entering that runs it.
-                        is_generator: !def.is_async
-                            && match &def.decorator_list[..] {
-                                [] => true,
-                                [decorator] => is_contextmanager(self.db, self.model, decorator),
-                                _ => false,
-                            }
-                            && yields(&def.body),
+                        // when the body runs (see `Call::deferred_body`).
+                        is_generator: !def.is_async && def.decorator_list.is_empty() && yields(&def.body),
                         is_validator: is_validator(def),
                         is_serializer: is_serializer(def),
                         serializes: serialized_fields(def),

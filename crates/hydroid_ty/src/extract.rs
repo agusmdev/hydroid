@@ -68,6 +68,7 @@ pub struct RawCall {
     pub instance: Option<RawInstance>,
     /// See [`hydroid_core::facts::Call::lazy_in`].
     pub lazy_in: Option<(u32, u32)>,
+    pub deferred_body: bool,
 }
 
 /// See [`hydroid_core::facts::Instance`]: classes as keys.
@@ -966,6 +967,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
             logging: None,
             instance: None,
             lazy_in: None,
+            deferred_body: false,
         });
     }
 
@@ -1322,8 +1324,34 @@ impl<'a, 'db> Extractor<'a, 'db> {
                 logging: None,
                 instance: None,
                 lazy_in: None,
+                deferred_body: false,
             });
         }
+    }
+
+    /// Whether a call to decorated generator functions only creates what runs their bodies later:
+    /// ty types what it returns as a context manager or an iterator (`@contextmanager`), see
+    /// [`hydroid_core::facts::Call::deferred_body`]. Plain functions are typed as themselves:
+    /// only other callee types can be decorated.
+    fn defers_body(&self, call: &ast::ExprCall, resolution: &Resolution) -> bool {
+        if resolution.targets.is_empty()
+            || resolution.constructs.is_some()
+            || matches!(call.func.inferred_type(self.model), Some(Type::FunctionLiteral(_) | Type::BoundMethod(_)))
+        {
+            return false;
+        }
+        let db = self.model.db();
+        let decorated_generator = |&((file, offset), _): &(Key, bool)| {
+            let parsed = parsed_module(db, ty_python_semantic::Db::program_file(db, file).python_file(db)).load(db);
+            find_function(parsed.syntax(), offset)
+                .is_some_and(|def| !def.is_async && !def.decorator_list.is_empty() && yields(&def.body))
+        };
+        if !resolution.targets.iter().all(decorated_generator) {
+            return false;
+        }
+        let Some(ty @ Type::NominalInstance(_)) = call.inferred_type(self.model) else { return false };
+        self.class_key(&ty)
+            .is_some_and(|class| ["__enter__", "__next__"].iter().any(|m| class_method(self.db, class, m).is_some()))
     }
 
     /// What a library function does with its arguments during the call (catalog
@@ -1482,6 +1510,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
             logging: None,
             instance: None,
             lazy_in: None,
+            deferred_body: false,
         });
     }
 
@@ -1544,6 +1573,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
         let returned_by = if param.is_none() { self.returned_by(&call.func) } else { Vec::new() };
         let (receiver, super_name) = self.mro_receiver(&call.func, &resolution);
         let instance = self.instance(&call.func, &resolution);
+        let deferred_body = self.defers_body(call, &resolution);
         let unresolved =
             (resolution.targets.is_empty() && param.is_none()).then_some(resolution.reason);
         // The declarative constructor sets each keyword argument on the new instance.
@@ -1604,6 +1634,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
             logging,
             instance,
             lazy_in: None,
+            deferred_body,
         });
     }
 
@@ -2036,6 +2067,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
             logging: None,
             instance: None,
             lazy_in: None,
+            deferred_body: false,
         });
     }
 
@@ -2708,6 +2740,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                         logging: None,
                         instance: None,
                         lazy_in: None,
+                        deferred_body: false,
                     });
                 }
                 walk_expr(self, expr);
