@@ -246,6 +246,24 @@
       "protocol": "holdout baseline after promoting this round's cases, scored before any fix (same protocol as round 6): new holdout cases change the set the ratchet compares against.",
       "holdout_recall": "0/5",
       "holdout_fp": 0
+    },
+    {
+      "round": 10,
+      "lever": "recall+precision: decorators, logging, MRO, stdlib helpers, middleware",
+      "change": "round 10: offloading decorators (functools.wraps no longer counts as using the wrapped fn) and running-loop guards not loop code; logging calls run attached project Handler/Filter/Formatter hooks and blocking stdlib handlers, level-aware; cooperative super() chains along the receiver's MRO, overrides limited to the receiver's subclasses; stdlib helpers that block internally (catalog, unless_given/blocks_in); Starlette middleware constructed on the loop",
+      "train_recall": "145/145",
+      "train_fp": 0,
+      "holdout_recall": "3/5",
+      "holdout_fp": 0,
+      "results": ".claude/hillclimb/recall/v12",
+      "ratcheted_to_train": [
+        "fp2_asyncify_decorator",
+        "fp2_running_loop_branch",
+        "log_filter_hostname_lookup",
+        "mw_middleware_init_io",
+        "py_mixin_super_chain",
+        "std_email_make_msgid_fqdn"
+      ]
     }
   ],
   "ground_truth": "scripts/hillclimb/oracle_runtime.py via check.py: a case is promoted only when the runtime proves every line where hydroid disagrees (verdict BREAKS), or with a reviewer's note"
