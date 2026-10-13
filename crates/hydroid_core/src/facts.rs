@@ -90,6 +90,10 @@ pub struct Class {
     /// Classes named in the annotations of its class-level fields (nested models). Project
     /// classes only.
     pub fields: Vec<ClassId>,
+    /// Fields declared with `Field(default_factory=f)` (pydantic) or `field(default_factory=f)`
+    /// (dataclasses): constructing the class without giving the field calls the factory. Each is
+    /// `(the names the field can be given by, the factory)`.
+    pub default_factories: Vec<(Vec<String>, Value)>,
 }
 
 /// What FastAPI validates and serializes around a function when it is an endpoint or a
@@ -139,6 +143,9 @@ pub struct Call {
     /// construction, or the target of `obj.name = value`. Their ORM validators run (see
     /// [`Function::validates`]).
     pub sets: Option<(ClassId, Vec<String>)>,
+    /// The fields a construction gives explicitly (its keyword arguments): their default
+    /// factories do not run. `None` when that is not known (positional arguments).
+    pub given: Option<Vec<String>>,
     /// Why nothing was resolved (only set when `targets` is empty and `param` is `None`).
     pub unresolved: Option<String>,
 }

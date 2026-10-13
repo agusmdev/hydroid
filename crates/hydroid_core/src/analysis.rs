@@ -333,6 +333,9 @@ impl<'a> Graph<'a> {
         }
         if let Some(class) = call.constructs {
             out.extend(self.construction_hooks(class));
+            if let Some(given) = &call.given {
+                out.extend(self.default_factories(class, given));
+            }
         }
         if let Some((class, names)) = &call.sets {
             out.extend(self.attribute_hooks(*class, names));
@@ -432,6 +435,29 @@ impl<'a> Graph<'a> {
         hooks
     }
 
+    /// The default factories constructing `class` calls when it is given only the `given` fields
+    /// (of the class and its bases). A class as factory runs its `__init__`.
+    fn default_factories(&self, class: ClassId, given: &[String]) -> Vec<FnId> {
+        let mut factories = Vec::new();
+        let mut seen = HashSet::from_iter([class]);
+        let mut queue = VecDeque::from([class]);
+        while let Some(c) = queue.pop_front() {
+            let cls = self.facts.class(c);
+            for (names, factory) in &cls.default_factories {
+                if names.iter().any(|n| given.contains(n)) {
+                    continue;
+                }
+                match factory {
+                    Value::Function(f) => factories.push(*f),
+                    Value::Class(k) => factories.extend(Hierarchy::lookup(self.facts, *k, "__init__")),
+                    Value::Param(..) => {}
+                }
+            }
+            queue.extend(cls.bases.iter().filter(|b| seen.insert(**b)));
+        }
+        factories
+    }
+
     /// The SQLAlchemy validators setting `names` on an instance of `class` runs (of the class and
     /// its bases).
     fn attribute_hooks(&self, class: ClassId, names: &[String]) -> Vec<FnId> {
@@ -451,14 +477,16 @@ impl<'a> Graph<'a> {
         hooks
     }
 
-    /// What validating `class` from request data runs: its construction hooks, and those of the
-    /// models nested in its fields.
+    /// What validating `class` from request data runs: its construction hooks and default
+    /// factories (the request may leave those fields out), and those of the models nested in its
+    /// fields.
     fn validation_hooks(&self, class: ClassId) -> Vec<FnId> {
         let mut hooks = Vec::new();
         let mut seen = HashSet::from_iter([class]);
         let mut queue = VecDeque::from([class]);
         while let Some(c) = queue.pop_front() {
             hooks.extend(self.construction_hooks(c));
+            hooks.extend(self.default_factories(c, &[]));
             queue.extend(self.facts.class(c).fields.iter().filter(|f| seen.insert(**f)));
         }
         hooks

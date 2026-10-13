@@ -114,9 +114,10 @@ drop it and the upload step to fail the build instead.
    in parallel; each call is resolved to its definitions through ty (types, then
    go-to-definition), including implicit calls (`with`, `for` and comprehensions, properties
    and their setters, descriptors, operators like `x[k]` and `k in x` on user classes,
-   `__getattr__`, iterators' `__next__`, constructors with `__post_init__` and pydantic
-   validators, builtins and `contextlib` helpers that iterate, enter or call their arguments like
-   `sorted(xs, key=f)` or `stack.enter_context(cm)`, `singledispatch` implementations, SQLAlchemy
+   `__getattr__`, iterators' `__next__`, constructors with `__post_init__`, pydantic
+   validators and the `default_factory` of fields the call does not give, builtins and
+   `contextlib` helpers that iterate, enter or call their arguments like `sorted(xs, key=f)`,
+   `stack.enter_context(cm)` or `copy_context().run(f)`, `singledispatch` implementations, SQLAlchemy
    `@validates` validators run by `Model(field=...)` and `obj.field = ...`, and reads of lazily
    loaded `relationship()` attributes, which query through `Session.execute` unless the
    relationship is eager (`lazy="selectin"`, ...) or the function loads it with an eager option

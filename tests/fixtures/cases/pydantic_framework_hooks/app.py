@@ -1,12 +1,14 @@
+import asyncio
 import os
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated
 
 import requests
 from fastapi import Body, Depends, FastAPI
-from pydantic import AfterValidator, BaseModel, computed_field, field_serializer, field_validator
+from pydantic import AfterValidator, BaseModel, Field, computed_field, field_serializer, field_validator
 
 app = FastAPI()
 
@@ -170,3 +172,48 @@ def lookup(key):
 @app.get("/cached", response_model=Cached)
 async def cached():
     return lookup("k")
+
+
+# --- default factories: constructing without the field calls its factory -----------------------
+
+
+def load_token() -> str:
+    return Path("token.txt").read_text()
+
+
+def load_region() -> str:
+    return Path("region.txt").read_text()  # expect: pathlib.Path.read_text via route POST /deploy (request validation)
+
+
+class Credentials(BaseModel):
+    token: str = Field(default_factory=load_token, alias="apiToken")
+    scopes: list[str] = Field(default_factory=list)
+
+
+@dataclass
+class Job:
+    name: str
+    started: str = field(default_factory=load_token)
+
+
+@app.get("/credentials")
+async def credentials(data: str):
+    Credentials()  # expect: pathlib.Path.read_text
+    Credentials(apiToken="given")
+    # What the data gives is not known statically.
+    Credentials.model_validate_json(data)
+    Job(name="j")  # expect: pathlib.Path.read_text
+    Job(name="j", started="now")
+    Job("j")
+    await asyncio.to_thread(Credentials)
+    return {}
+
+
+# The request may leave the field out: validating the body calls the factory on the loop.
+class Deploy(BaseModel):
+    region: str = Field(default_factory=load_region)
+
+
+@app.post("/deploy")
+def deploy(spec: Deploy):
+    return {"region": spec.region}

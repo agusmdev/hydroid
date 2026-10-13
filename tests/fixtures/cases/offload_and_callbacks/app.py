@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import functools
 import threading
 import time
@@ -165,4 +166,20 @@ async def scheduled():
     loop.call_soon(functools.partial(with_arg, 1))
     task = asyncio.ensure_future(asyncio.sleep(1))
     task.add_done_callback(on_done)
+    return {}
+
+
+# --- `Context.run` calls its argument right away, on this thread -------------------------------
+
+
+def label(name: str) -> str:
+    return name.upper()
+
+
+@app.get("/in-context")
+async def in_context(name: str):
+    ctx = contextvars.copy_context()
+    ctx.run(blocking_helper, 1)  # expect: time.sleep
+    ctx.run(label, name)
+    await run_in_threadpool(ctx.run, blocking_helper, 1)
     return {}

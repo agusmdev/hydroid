@@ -568,6 +568,7 @@ impl<'a> Merger<'a> {
             is_protocol: entry.is_protocol,
             methods: Vec::new(),
             fields: Vec::new(),
+            default_factories: Vec::new(),
         });
         let bases = self.indexes.bases(key).into_iter().filter_map(|b| self.class_id(b)).collect();
         let methods = entry
@@ -622,6 +623,7 @@ impl<'a> Merger<'a> {
                 attribute,
                 returned_by,
                 sets,
+                given: raw.given,
             });
         }
         for (dispatcher, implementation) in file_facts.dispatches {
@@ -649,6 +651,10 @@ impl<'a> Merger<'a> {
             let Some(class) = self.class_id(raw.class) else { continue };
             let Some(value) = self.value(file, raw.value) else { continue };
             self.facts.stores.push(Store { class, name: raw.name, value });
+        }
+        for (class, names, value) in file_facts.default_factories {
+            let (Some(class), Some(value)) = (self.class_id((file, class)), self.value(file, value)) else { continue };
+            self.facts.classes[class.0 as usize].default_factories.push((names, value));
         }
         for raw in file_facts.flows {
             let (Some(caller), Some(into)) = (self.fn_id((file, raw.caller)), self.fn_id(raw.into)) else {

@@ -44,6 +44,8 @@ pub struct RawCall {
     pub returned_by: Vec<Key>,
     /// See [`hydroid_core::facts::Call::sets`].
     pub sets: Option<(Key, Vec<String>)>,
+    /// See [`hydroid_core::facts::Call::given`].
+    pub given: Option<Vec<String>>,
 }
 
 /// What code can run implicitly, from the definitions indexed so far.
@@ -131,6 +133,9 @@ pub struct FileFacts {
     /// `(dispatcher, implementation defined in this file)`.
     pub dispatches: Vec<(Key, u32)>,
     pub decorators: Vec<(u32, Vec<Key>)>,
+    /// `(class defined in this file, names the field can be given by, factory)`, see
+    /// [`hydroid_core::facts::Class::default_factories`].
+    pub default_factories: Vec<(u32, Vec<String>, RawValue)>,
 }
 
 /// Extracts the bodies of `wanted` functions (every function and the module body when `None`).
@@ -168,6 +173,7 @@ pub fn extract_file(
             returns: Vec::new(),
             dispatches: Vec::new(),
             decorators: Vec::new(),
+            default_factories: Vec::new(),
         },
     };
     extractor.visit_body(&parsed.syntax().body);
@@ -530,12 +536,16 @@ impl<'db> Extractor<'_, 'db> {
         }
     }
 
-    /// The name of a builtin (or `functools.reduce`) the resolved call targets.
+    /// The name of a builtin (or a `functools`, `contextlib` or `contextvars` function) the
+    /// resolved call targets.
     fn builtin_name<'e>(&self, func: &'e Expr, resolution: &Resolution) -> Option<&'e str> {
         let db = self.model.db();
         let is_builtin = |file: File| match file.path(db) {
             FilePath::Vendored(path) => {
-                matches!(path.as_str(), "stdlib/builtins.pyi" | "stdlib/functools.pyi" | "stdlib/contextlib.pyi")
+                matches!(
+                path.as_str(),
+                "stdlib/builtins.pyi" | "stdlib/functools.pyi" | "stdlib/contextlib.pyi" | "stdlib/_contextvars.pyi"
+            )
             }
             _ => false,
         };
@@ -598,6 +608,7 @@ impl<'db> Extractor<'_, 'db> {
             attribute: None,
             returned_by: Vec::new(),
             sets: None,
+            given: None,
         });
     }
 
@@ -882,6 +893,7 @@ impl<'db> Extractor<'_, 'db> {
                 attribute: Some((class, dunder.to_string())),
                 returned_by: Vec::new(),
                 sets: None,
+                given: None,
             });
         }
     }
@@ -917,7 +929,8 @@ impl<'db> Extractor<'_, 'db> {
                 }
                 return;
             }
-            "callback" => {
+            // `ExitStack.callback(f)`; `Context.run(f, *args)` calls `f` right away, in this thread.
+            "callback" | "run" => {
                 if let Some(f) = args.first() {
                     self.call_value(call, f);
                 }
@@ -1034,6 +1047,7 @@ impl<'db> Extractor<'_, 'db> {
             attribute,
             returned_by: Vec::new(),
             sets: None,
+            given: None,
         });
     }
 
@@ -1104,6 +1118,12 @@ impl<'db> Extractor<'_, 'db> {
                 .collect();
             (!names.is_empty()).then_some((class, names))
         });
+        // A class called with keyword arguments only gives those fields. Positional arguments
+        // (dataclasses) and `Model.model_validate(data)` may give any.
+        let validates = matches!(&*call.func, Expr::Attribute(a) if VALIDATES.contains(&a.attr.as_str()));
+        let given = (!validates && call.arguments.args.is_empty()).then(|| {
+            call.arguments.keywords.iter().filter_map(|k| k.arg.as_ref().map(|a| a.to_string())).collect()
+        });
         self.out.calls.push(RawCall {
             caller: self.current,
             location,
@@ -1120,6 +1140,7 @@ impl<'db> Extractor<'_, 'db> {
             attribute,
             returned_by,
             sets,
+            given,
         });
     }
 
@@ -1248,6 +1269,7 @@ impl<'db> Extractor<'_, 'db> {
             attribute: None,
             returned_by: Vec::new(),
             sets,
+            given: None,
         });
     }
 
@@ -1410,6 +1432,26 @@ impl<'db> Extractor<'_, 'db> {
         });
     }
 
+    /// `name: T = Field(default_factory=f)` (or `field(...)`) in the body of `class`. The field can
+    /// also be given by its alias.
+    fn default_factory(&mut self, class: u32, field: &Stmt) {
+        let (target, value) = match field {
+            Stmt::AnnAssign(ast::StmtAnnAssign { target, value: Some(value), .. }) => (&**target, &**value),
+            Stmt::Assign(ast::StmtAssign { targets, value, .. }) if targets.len() == 1 => (&targets[0], &**value),
+            _ => return,
+        };
+        let (Expr::Name(name), Expr::Call(call)) = (target, value) else { return };
+        let keyword = |arg: &str| call.arguments.find_keyword(arg).map(|k| &k.value);
+        let Some(factory) = keyword("default_factory").and_then(|f| self.value_of(f)) else { return };
+        let mut names = vec![name.id.to_string()];
+        for alias in ["alias", "validation_alias"].into_iter().filter_map(keyword) {
+            if let Expr::StringLiteral(alias) = alias {
+                names.push(alias.value.to_str().to_string());
+            }
+        }
+        self.out.default_factories.push((class, names, factory));
+    }
+
     fn in_scope(&mut self, key: u32, f: impl FnOnce(&mut Self)) {
         let previous = std::mem::replace(&mut self.current, key);
         f(self);
@@ -1449,6 +1491,12 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
             Stmt::AnnAssign(assign) if self.recording() => {
                 if let Some(value) = &assign.value {
                     self.store(&assign.target, value);
+                }
+                walk_stmt(self, stmt);
+            }
+            Stmt::ClassDef(def) if self.recording() => {
+                for field in &def.body {
+                    self.default_factory(def.name.start().to_u32(), field);
                 }
                 walk_stmt(self, stmt);
             }
@@ -1600,6 +1648,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                         attribute: None,
                         returned_by: Vec::new(),
                         sets: None,
+                        given: None,
                     });
                 }
                 walk_expr(self, expr);
