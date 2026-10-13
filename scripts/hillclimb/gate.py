@@ -3,13 +3,16 @@
 
 1. harness lock   the change does not touch the harness: the scorer, the oracle, the cases, the
                   split, the fixture environment, the Rust test that reads them, or the skill
-2. build          cargo build --release -p hydroid
-3. lint           cargo clippy (as CI runs it); skipped with --fast
-4. tests          cargo test --workspace (includes every `train` adversarial case)
-5. score          train + open: 0 false positives, no errors;
+2. literals       no string literal added to crates/**/*.rs (outside comments and test code)
+                  names library code (`logging.Handler`, `fastapi.`): library knowledge goes in
+                  catalog.toml as data. Other added literals are printed for review (literals.py)
+3. build          cargo build --release -p hydroid
+4. lint           cargo clippy (as CI runs it); skipped with --fast
+5. tests          cargo test --workspace (includes every `train` adversarial case)
+6. score          train + open: 0 false positives, no errors;
                   holdout (aggregate only): 0 false positives, recall not below the baseline
                   (with --require-holdout-gain: above it)
-6. polar          optional (--polar): Polar's wall time, against the goal in _state.json
+7. polar          optional (--polar): Polar's wall time, against the goal in _state.json
 
 The holdout baseline is keyed by the set of holdout case names (`holdout_set`, a hash of the sorted
 names; `holdout_sets` in _state.json lists them): the last recorded round with the same set, or,
@@ -40,6 +43,8 @@ SPLIT = ROOT / "tests/adversarial/split.json"
 CASES = ROOT / "tests/adversarial/cases"
 BASE_BUILDS = ROOT / "target/gate-base"
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import literals  # noqa: E402
 PROTECTED = (
     "scripts/hillclimb/",
     "tests/adversarial/",
@@ -152,6 +157,12 @@ def main() -> int:
     if touched:
         return fail("harness lock", "the fix changed harness files:\n  " + "\n  ".join(touched)
                     + "\nA fix changes hydroid (crates/, catalog), never the yardstick.")
+
+    print(f"$ literals.py {args.base}  (string literals added to crates/**/*.rs)")
+    no_library_names, text = literals.report(args.base)
+    print(text)
+    if not no_library_names:
+        return fail("literals", "the change adds Rust string literals naming library code (above)")
 
     # The holdout baseline needs the base ref's binary when the holdout set changed since the last
     # recorded round: built first, since it shares target/release/hydroid with the head build.
