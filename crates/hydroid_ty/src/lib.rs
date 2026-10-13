@@ -625,6 +625,9 @@ impl<'a> Merger<'a> {
             params: entry.params.clone(),
             self_calls: entry.self_calls.clone(),
             closure_self_calls: entry.closure_self_calls.clone(),
+            called_params: entry.called_params.clone(),
+            stored_params: entry.stored_params.clone(),
+            called_attributes: entry.called_attributes.clone(),
             parent: None,
             class: None,
             decorators: Vec::new(),
@@ -651,6 +654,8 @@ impl<'a> Merger<'a> {
             qualname: entry.qualname.clone(),
             bases: Vec::new(),
             is_protocol: entry.is_protocol,
+            // Set in `finish`, once every project module's names are known.
+            referenced: true,
             methods: Vec::new(),
             fields: Vec::new(),
             default_factories: Vec::new(),
@@ -855,7 +860,22 @@ impl<'a> Merger<'a> {
         wanted.into_iter().map(|(f, k)| (f, Some(k))).collect()
     }
 
-    fn finish(self) -> Facts {
+    fn finish(mut self) -> Facts {
+        // A project class is referenced when a project module uses its name (see
+        // `index::used_names`), or something may register it without naming it.
+        let indexes = self.indexes.0.lock();
+        let used: FxHashSet<&str> = indexes
+            .values()
+            .filter(|i| i.origin == Origin::Project)
+            .flat_map(|i| i.used_names.iter().map(String::as_str))
+            .collect();
+        for (key, &id) in &self.class_ids {
+            let Some(index) = indexes.get(&key.0).filter(|i| i.origin == Origin::Project) else { continue };
+            let Some(entry) = index.classes.get(&key.1) else { continue };
+            let name = entry.qualname.rsplit('.').next().unwrap_or_default();
+            self.facts.classes[id.0 as usize].referenced = entry.registered || used.contains(name);
+        }
+        drop(indexes);
         self.facts
     }
 }

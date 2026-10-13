@@ -138,6 +138,11 @@ struct Graph<'a> {
     constructed: RefCell<HashMap<ClassId, Rc<[FnId]>>>,
     /// What the catalog says about each function.
     roles: Vec<Roles>,
+    /// Classes that may have instances of their own, by class (see
+    /// [`crate::facts::Class::referenced`]).
+    instantiable: Vec<bool>,
+    /// Memoized [`Graph::instantiable_below`].
+    below: RefCell<HashMap<ClassId, Rc<[ClassId]>>>,
     /// Functions defined in test code (see [`is_test_path`]).
     in_tests: Vec<bool>,
     /// Memoized [`Graph::template_hooks`].
@@ -213,9 +218,22 @@ impl<'a> Graph<'a> {
             ancestry: RefCell::default(),
             constructed: RefCell::default(),
             roles,
+            instantiable: Vec::new(),
+            below: RefCell::default(),
             in_tests: facts.functions.iter().map(|f| is_test_path(&f.location.path)).collect(),
             templates: RefCell::default(),
         };
+        // A class with no instances of its own may still have them through a registry its
+        // ancestors keep (`__init_subclass__`).
+        graph.instantiable = (0..facts.classes.len() as u32)
+            .map(ClassId)
+            .map(|c| {
+                let class = facts.class(c);
+                class.referenced
+                    || class.is_protocol
+                    || graph.ancestors(c).iter().any(|&a| facts.class(a).methods.iter().any(|(n, _)| n == "__init_subclass__"))
+            })
+            .collect();
         let used_from_calls = facts.calls.iter().filter_map(|c| c.param.clone());
         let used_from_flows: Vec<ParamKey> = facts
             .flows
@@ -417,7 +435,12 @@ impl<'a> Graph<'a> {
     ) -> Vec<FnId> {
         let Context { nested, params, called, hierarchy, stored, returned, dispatches } = *cx;
         let mut out = Vec::new();
-        for &t in &call.targets {
+        let narrowed = if call.virtual_dispatch { self.narrowed_targets(call, hierarchy) } else { None };
+        let (targets, virtual_dispatch) = match &narrowed {
+            Some(narrowed) => (&narrowed[..], false),
+            None => (&call.targets[..], call.virtual_dispatch),
+        };
+        for &t in targets {
             // A copy for one kind of `self` (see `specialize`) has the original's overrides.
             let original = self.facts.function(t).specializes.unwrap_or(t);
             let (body, overrides) = runs.entry(t).or_insert_with(|| {
@@ -449,7 +472,7 @@ impl<'a> Graph<'a> {
             {
                 out.extend(self.template_hooks(original, receiver).iter().copied());
             }
-            if call.virtual_dispatch {
+            if virtual_dispatch {
                 // An instance of a known class runs only the overrides of its subclasses.
                 let receiver = call.receiver.filter(|r| !self.facts.class(*r).is_protocol);
                 let below = |o: FnId| {
@@ -1201,8 +1224,105 @@ impl<'a> Graph<'a> {
                 hooks.push((f, format!("`{}` replaced on an instance, called by {caller}", store.name)));
             }
         }
+        // Project classes library code instantiates (`APIRouter(route_class=AuditedRoute)` stores
+        // the class, `add_api_route` calls it): the library `async def` methods of those instances
+        // run on the loop, and with them the project overrides of what they call on `self`.
+        for (class, by) in self.library_constructed() {
+            let calls = loop_calls.entry(class).or_insert_with(|| self.loop_self_calls(class));
+            for (name, &caller) in calls.iter() {
+                let Some(method) = Hierarchy::lookup(self.facts, class, name) else { continue };
+                if self.facts.function(method).origin != Origin::Project {
+                    continue;
+                }
+                let (class, by, caller) = (&self.facts.class(class).qualname, &self.facts.function(by).qualname, &self.facts.function(caller).qualname);
+                hooks.push((method, format!("{class} instances {by} constructs: `{name}`, called by {caller}")));
+            }
+        }
         hooks.retain(|(h, _)| self.facts.function(*h).analyzed);
         hooks
+    }
+
+    /// The classes library code instantiates from a class passed to it, with the library function
+    /// it is passed to: one that calls the parameter, or stores it on its instance where a method
+    /// of its class calls the attribute (see [`crate::facts::Function::called_params`]).
+    fn library_constructed(&self) -> Vec<(ClassId, FnId)> {
+        let mut found = Vec::new();
+        for flow in &self.facts.flows {
+            let (Value::Class(class), Slot::Param(slot)) = (&flow.value, &flow.slot) else { continue };
+            let into = self.facts.function(flow.into);
+            if into.origin == Origin::Project {
+                continue;
+            }
+            let calls_attribute = |attribute: &String| {
+                into.class.is_some_and(|k| {
+                    self.ancestors(k).iter().any(|&a| {
+                        let methods = &self.facts.class(a).methods;
+                        methods.iter().any(|(_, m)| self.facts.function(*m).called_attributes.contains(attribute))
+                    })
+                })
+            };
+            if into.called_params.contains(slot)
+                || into.stored_params.iter().any(|(p, attribute)| p == slot && calls_attribute(attribute))
+            {
+                found.push((*class, flow.into));
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
+
+    /// What a virtual call runs when the class it dispatches on has no instances of its own (see
+    /// [`crate::facts::Class::referenced`]): the methods the MROs of its instantiable subclasses
+    /// find. `None` when the class may have instances, a target is a copy (see `specialize`), or
+    /// no instantiable subclass is known.
+    fn narrowed_targets(&self, call: &Call, hierarchy: &Hierarchy) -> Option<Vec<FnId>> {
+        let mut out = Vec::new();
+        for &t in &call.targets {
+            let f = self.facts.function(t);
+            if f.specializes.is_some() {
+                return None;
+            }
+            let owner = f.class?;
+            let class = call.receiver.filter(|r| !self.facts.class(*r).is_protocol).unwrap_or(owner);
+            if self.instantiable[class.0 as usize] {
+                return None;
+            }
+            let name = &self.facts.class(owner).methods.iter().find(|(_, m)| *m == t)?.0;
+            let below = self.instantiable_below(class, hierarchy);
+            if below.is_empty() {
+                return None;
+            }
+            for &c in below.iter() {
+                out.extend(Hierarchy::lookup(self.facts, c, name).filter(|&m| self.dispatches_into(call.caller, m)));
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// The subclasses of `class` (at any depth) that may have instances of their own.
+    fn instantiable_below(&self, class: ClassId, hierarchy: &Hierarchy) -> Rc<[ClassId]> {
+        if let Some(found) = self.below.borrow().get(&class) {
+            return found.clone();
+        }
+        let mut out = Vec::new();
+        let mut seen = HashSet::from_iter([class]);
+        let mut queue = VecDeque::from([class]);
+        while let Some(c) = queue.pop_front() {
+            for &sub in &hierarchy.subclasses[c.0 as usize] {
+                if seen.insert(sub) {
+                    if self.instantiable[sub.0 as usize] {
+                        out.push(sub);
+                    }
+                    queue.push_back(sub);
+                }
+            }
+        }
+        let out: Rc<[ClassId]> = out.into();
+        self.below.borrow_mut().insert(class, out.clone());
+        out
     }
 
     /// The methods library code calls on the loop on an instance of `class`, each with the

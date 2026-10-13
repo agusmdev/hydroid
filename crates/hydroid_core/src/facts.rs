@@ -89,6 +89,17 @@ pub struct Function {
     /// on the loop. A project callable assigned over one of them on an instance runs there.
     #[serde(default)]
     pub closure_self_calls: Vec<String>,
+    /// The parameters a library function calls, directly or through a local name: a class
+    /// passed there gets instantiated (`route_class(...)`).
+    #[serde(default)]
+    pub called_params: Vec<String>,
+    /// `(parameter, attribute)`: the parameters a library method stores on its instance
+    /// (`self.route_class = route_class`).
+    #[serde(default)]
+    pub stored_params: Vec<(String, String)>,
+    /// The attributes of its instance a library method calls (`self.route_class(...)`).
+    #[serde(default)]
+    pub called_attributes: Vec<String>,
     /// Whether the body was analyzed. Unanalyzed functions (stdlib stubs, libraries without
     /// `--follow-libs`) are leaves: only the catalog knows whether they block.
     pub analyzed: bool,
@@ -103,6 +114,11 @@ pub struct Class {
     pub qualname: String,
     pub bases: Vec<ClassId>,
     pub is_protocol: bool,
+    /// The project names the class (outside class bases), registers it (decorators, class
+    /// keywords), or it is a library class: it may have instances of its own. A project class
+    /// nothing names is only a base: its instances are instances of subclasses.
+    #[serde(default)]
+    pub referenced: bool,
     /// Methods defined directly in the class body.
     pub methods: Vec<(String, FnId)>,
     /// Classes named in the annotations of its class-level fields (nested models). Project

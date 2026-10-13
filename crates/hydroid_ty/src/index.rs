@@ -9,7 +9,7 @@ use ruff_python_ast::visitor::source_order::{SourceOrderVisitor, walk_expr, walk
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_source_file::LineIndex;
 use ruff_text_size::{Ranged, TextSize};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use ty_python_semantic::types::{Type, TypeDefinition};
 use ty_python_semantic::{HasType, SemanticModel, TypeQualifiers};
 
@@ -39,6 +39,12 @@ pub struct FnEntry {
     pub self_calls: Vec<String>,
     /// See [`hydroid_core::facts::Function::closure_self_calls`] (library methods only).
     pub closure_self_calls: Vec<String>,
+    /// See [`hydroid_core::facts::Function::called_params`] (library functions only).
+    pub called_params: Vec<String>,
+    /// See [`hydroid_core::facts::Function::stored_params`] (library methods only).
+    pub stored_params: Vec<(String, String)>,
+    /// See [`hydroid_core::facts::Function::called_attributes`] (library methods only).
+    pub called_attributes: Vec<String>,
 }
 
 pub struct ClassEntry {
@@ -53,6 +59,9 @@ pub struct ClassEntry {
     /// SQLAlchemy relationships loaded lazily on first access (`relationship(...)` with the
     /// default `lazy="select"`), project classes only.
     pub lazy_relationships: Vec<String>,
+    /// Decorated, or given keywords (`metaclass=...`): something may register (and instantiate)
+    /// it without naming it.
+    pub registered: bool,
 }
 
 /// Whose `state` an attribute is stored on: the application's (`app.state.x`), or the one
@@ -96,6 +105,8 @@ pub struct FileIndex {
     /// declared `global` or `nonlocal`, or assigned as an attribute of something other than
     /// `self` (`module.client = ...`).
     pub rebound: Vec<String>,
+    /// The names the module uses (project files only), see [`used_names`].
+    pub used_names: FxHashSet<String>,
     display_path: String,
     lines: LineIndex,
     source: ruff_db::source::SourceText,
@@ -131,6 +142,7 @@ impl FileIndex {
             eager_loads: FxHashMap::default(),
             generic_attributes: Vec::new(),
             rebound: Vec::new(),
+            used_names: if origin == Origin::Project { used_names(&parsed.syntax().body) } else { FxHashSet::default() },
             display_path,
             lines,
             source,
@@ -149,6 +161,9 @@ impl FileIndex {
             class: None,
             self_calls: Vec::new(),
             closure_self_calls: Vec::new(),
+            called_params: Vec::new(),
+            stored_params: Vec::new(),
+            called_attributes: Vec::new(),
         };
         index.functions.insert(MODULE_KEY, module_entry);
         let mut builder = Builder { db, index: &mut index, model: &model, scopes: Vec::new(), module };
@@ -684,6 +699,145 @@ fn attribute_calls(class: &ast::StmtClassDef) -> Vec<String> {
     finder.names
 }
 
+/// What a library function calls of what it is given, to construct it (`route_class(...)`): the
+/// parameters it calls, the parameters a method stores on its instance (`self.route_class =
+/// route_class`), and the attributes of its instance it calls (`self.route_class(...)`), directly
+/// or through a local name assigned from them (`cls = override or self.route_class; cls(...)`).
+/// Only in its own scope, not in nested functions or classes.
+fn constructions(def: &ast::StmtFunctionDef, is_method: bool) -> (Vec<String>, Vec<(String, String)>, Vec<String>) {
+    struct Finder<'a> {
+        receiver: Option<&'a str>,
+        params: Vec<&'a str>,
+        /// What each local name was assigned from: `(parameters, attributes)`.
+        locals: Vec<(&'a str, Vec<String>, Vec<String>)>,
+        called_params: Vec<String>,
+        stored: Vec<(String, String)>,
+        called_attributes: Vec<String>,
+    }
+    impl<'a> Finder<'a> {
+        /// The parameters and instance attributes an expression reads.
+        fn sources(&self, expr: &'a Expr) -> (Vec<String>, Vec<String>) {
+            struct Reads<'f, 'a>(&'f Finder<'a>, Vec<String>, Vec<String>);
+            impl<'b> SourceOrderVisitor<'b> for Reads<'_, '_> {
+                fn visit_expr(&mut self, expr: &'b Expr) {
+                    match expr {
+                        Expr::Name(n) if self.0.params.contains(&n.id.as_str()) => self.1.push(n.id.to_string()),
+                        Expr::Attribute(a) if self.0.is_receiver(&a.value) => self.2.push(a.attr.to_string()),
+                        Expr::Lambda(_) => return,
+                        _ => {}
+                    }
+                    walk_expr(self, expr);
+                }
+            }
+            let mut reads = Reads(self, Vec::new(), Vec::new());
+            reads.visit_expr(expr);
+            (reads.1, reads.2)
+        }
+
+        fn is_receiver(&self, expr: &Expr) -> bool {
+            matches!(expr, Expr::Name(n) if Some(n.id.as_str()) == self.receiver)
+        }
+    }
+    impl<'a> SourceOrderVisitor<'a> for Finder<'a> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            match stmt {
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => return,
+                Stmt::Assign(ast::StmtAssign { targets, value, .. }) => match &targets[..] {
+                    [Expr::Name(name)] => {
+                        let (params, attributes) = self.sources(value);
+                        self.locals.push((name.id.as_str(), params, attributes));
+                    }
+                    [Expr::Attribute(attr)] if self.is_receiver(&attr.value) => {
+                        if let Expr::Name(value) = &**value
+                            && self.params.contains(&value.id.as_str())
+                        {
+                            self.stored.push((value.id.to_string(), attr.attr.to_string()));
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+            walk_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if let Expr::Call(call) = expr {
+                match &*call.func {
+                    Expr::Name(n) if self.params.contains(&n.id.as_str()) => self.called_params.push(n.id.to_string()),
+                    Expr::Name(n) => {
+                        if let Some((_, params, attributes)) = self.locals.iter().rev().find(|(l, _, _)| *l == n.id.as_str()) {
+                            let (params, attributes) = (params.clone(), attributes.clone());
+                            self.called_params.extend(params);
+                            self.called_attributes.extend(attributes);
+                        }
+                    }
+                    Expr::Attribute(a) if self.is_receiver(&a.value) => self.called_attributes.push(a.attr.to_string()),
+                    _ => {}
+                }
+            }
+            if !matches!(expr, Expr::Lambda(_)) {
+                walk_expr(self, expr);
+            }
+        }
+    }
+    let receiver = if is_method { receiver_name(def) } else { None };
+    let params = def.parameters.iter_non_variadic_params().map(|p| p.parameter.name.as_str()).filter(|p| Some(*p) != receiver).collect();
+    let mut finder = Finder {
+        receiver,
+        params,
+        locals: Vec::new(),
+        called_params: Vec::new(),
+        stored: Vec::new(),
+        called_attributes: Vec::new(),
+    };
+    finder.visit_body(&def.body);
+    let dedup = |mut v: Vec<String>| {
+        v.sort();
+        v.dedup();
+        v
+    };
+    (dedup(finder.called_params), finder.stored, dedup(finder.called_attributes))
+}
+
+/// The names a project module uses, outside the bases of its class definitions: names and
+/// attributes read, and the dotted segments of its string literals (forward references, names
+/// given to registries). A class whose name no module uses is never instantiated as itself.
+fn used_names(body: &[Stmt]) -> FxHashSet<String> {
+    struct Names(FxHashSet<String>);
+    impl<'a> SourceOrderVisitor<'a> for Names {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if let Stmt::ClassDef(def) = stmt {
+                for decorator in &def.decorator_list {
+                    self.visit_decorator(decorator);
+                }
+                for keyword in def.arguments.iter().flat_map(|a| a.keywords.iter()) {
+                    self.visit_expr(&keyword.value);
+                }
+                self.visit_body(&def.body);
+                return;
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            match expr {
+                Expr::Name(name) if name.ctx == ast::ExprContext::Load => {
+                    self.0.insert(name.id.to_string());
+                }
+                Expr::Attribute(attr) if attr.ctx == ast::ExprContext::Load => {
+                    self.0.insert(attr.attr.to_string());
+                }
+                Expr::StringLiteral(s) => self.0.extend(s.value.to_str().split('.').map(str::to_string)),
+                _ => {}
+            }
+            walk_expr(self, expr);
+        }
+    }
+    let mut names = Names(FxHashSet::default());
+    names.visit_body(body);
+    names.0
+}
+
 fn self_calls(def: &ast::StmtFunctionDef) -> Vec<String> {
     match receiver_name(def) {
         Some(receiver) => calls_on(receiver, &def.body),
@@ -846,6 +1000,11 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     entry.methods.push((def.name.to_string(), key));
                 }
                 let library_method = self.index.origin != Origin::Project && class.is_some();
+                let (called_params, stored_params, called_attributes) = if self.index.origin != Origin::Project {
+                    constructions(def, class.is_some())
+                } else {
+                    Default::default()
+                };
                 self.index.functions.insert(
                     key,
                     FnEntry {
@@ -868,6 +1027,9 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                         class,
                         self_calls: if library_method { self_calls(def) } else { Vec::new() },
                         closure_self_calls: if library_method { closure_self_calls(def) } else { Vec::new() },
+                        called_params,
+                        stored_params,
+                        called_attributes,
                     },
                 );
                 // Decorators, defaults and annotations are evaluated in the enclosing scope.
@@ -908,6 +1070,8 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                         methods: Vec::new(),
                         fields: Vec::new(),
                         lazy_relationships: Vec::new(),
+                        registered: !def.decorator_list.is_empty()
+                            || def.arguments.as_ref().is_some_and(|a| !a.keywords.is_empty()),
                     },
                 );
                 self.scopes.push((Scope::Class(key), qualname));
@@ -975,6 +1139,9 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     class: None,
                     self_calls: Vec::new(),
                     closure_self_calls: Vec::new(),
+                    called_params: Vec::new(),
+                    stored_params: Vec::new(),
+                    called_attributes: Vec::new(),
                 },
             );
             self.scopes.push((Scope::Function(key), qualname));
