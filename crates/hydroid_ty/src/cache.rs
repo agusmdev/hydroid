@@ -39,6 +39,7 @@ struct Head {
     dispatches: Vec<(FnId, FnId)>,
     signatures: Vec<Signature>,
     suppressed: Vec<(String, u32)>,
+    stops_propagation: Vec<(String, bool)>,
 }
 
 /// Hash of everything an extraction depends on.
@@ -152,6 +153,7 @@ pub fn load(root: &Path) -> Option<(u64, Entry)> {
         dispatches: head.dispatches,
         signatures: head.signatures,
         suppressed: head.suppressed,
+        stops_propagation: head.stops_propagation,
     };
     Some((
         u64::from_le_bytes(*stored),
@@ -226,6 +228,7 @@ pub fn store(root: &Path, fingerprint: u64, entry: &Entry) {
             dispatches: facts.dispatches.clone(),
             signatures: facts.signatures.clone(),
             suppressed: facts.suppressed.clone(),
+            stops_propagation: facts.stops_propagation.clone(),
         };
         let mut sections = vec![bincode::serialize(&head)?];
         sections.extend(chunks(&facts.calls)?);

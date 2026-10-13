@@ -43,10 +43,13 @@ def record_failure(reason: str) -> None:
 
 @app.post("/fail")
 async def fail():
-    # Every attached hook runs; the report names the shortest chain.
-    log.warning("failing")  # expect: time.sleep
+    # The hooks of the `errors` logger run (the `audit` filter does not); the report names the
+    # shortest chain.
+    log.warning("failing")  # expect: _socket.gethostbyname
     record_failure("boom")  # expect: requests.api.post
-    logging.exception("module level")  # expect: time.sleep
+    # The root logger: no handler is attached to it or above it.
+    logging.exception("module level")
+    logging.getLogger("audit").warning("audited")  # expect: time.sleep
     return {}
 
 

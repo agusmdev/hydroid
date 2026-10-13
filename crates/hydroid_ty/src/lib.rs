@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use hydroid_core::catalog::qualname_matches;
 use hydroid_core::facts::{
-    Call, Class, ClassId, Facts, FnId, Flow, Function, Level, Origin, Signature, Slot, Store, Value,
+    Call, Class, ClassId, Facts, FnId, Flow, Function, Level, LogUse, Origin, Signature, Slot, Store, Value,
 };
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -609,6 +609,11 @@ impl<'a> Merger<'a> {
             let returned_by = raw.returned_by.into_iter().filter_map(|k| self.fn_id(k)).collect();
             let level = raw.level.map(|(value, receiver)| Level { value, receiver: receiver.and_then(|k| self.class_id(k)) });
             let receiver = raw.receiver.and_then(|k| self.class_id(k));
+            let logging = raw.logging.map(|(logger, attaches, attach_only)| LogUse {
+                logger,
+                attaches: attaches.and_then(|k| self.class_id(k)),
+                attach_only,
+            });
             self.facts.calls.push(Call {
                 caller,
                 location: raw.location,
@@ -631,8 +636,10 @@ impl<'a> Merger<'a> {
                 level,
                 receiver,
                 super_name: raw.super_name,
+                logging,
             });
         }
+        self.facts.stops_propagation.extend(file_facts.stops_propagation);
         for (dispatcher, implementation) in file_facts.dispatches {
             let (Some(dispatcher), Some(implementation)) = (self.fn_id(dispatcher), self.fn_id((file, implementation)))
             else {

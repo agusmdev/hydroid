@@ -1,6 +1,6 @@
 //! Walks function bodies and records calls (with their resolved callees) and callable flows.
 
-use hydroid_core::facts::{Accessor, Location, Origin};
+use hydroid_core::facts::{Accessor, Location, LoggerName, Origin};
 use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::visitor::source_order::{SourceOrderVisitor, walk_expr, walk_stmt};
@@ -52,6 +52,8 @@ pub struct RawCall {
     pub receiver: Option<Key>,
     /// See [`hydroid_core::facts::Call::super_name`].
     pub super_name: Option<String>,
+    /// See [`hydroid_core::facts::Call::logging`]: classes as keys.
+    pub logging: Option<(Option<LoggerName>, Option<Key>, bool)>,
 }
 
 /// What code can run implicitly, from the definitions indexed so far.
@@ -142,6 +144,8 @@ pub struct FileFacts {
     /// `(class defined in this file, names the field can be given by, factory)`, see
     /// [`hydroid_core::facts::Class::default_factories`].
     pub default_factories: Vec<(u32, Vec<String>, RawValue)>,
+    /// See [`hydroid_core::facts::Facts::stops_propagation`].
+    pub stops_propagation: Vec<(String, bool)>,
 }
 
 /// Extracts the bodies of `wanted` functions (every function and the module body when `None`).
@@ -170,6 +174,11 @@ pub fn extract_file(
         iterated: FxHashSet::default(),
         returned_classes: RefCell::default(),
         callees: FxHashSet::default(),
+        attach_only: if ATTACHES.iter().any(|m| index.text(parsed.syntax().range()).contains(m)) {
+            attach_only(&parsed.syntax().body)
+        } else {
+            FxHashSet::default()
+        },
         out: FileFacts {
             file: index.file,
             signatures: Vec::new(),
@@ -180,6 +189,7 @@ pub fn extract_file(
             dispatches: Vec::new(),
             decorators: Vec::new(),
             default_factories: Vec::new(),
+            stops_propagation: Vec::new(),
         },
     };
     extractor.visit_body(&parsed.syntax().body);
@@ -213,6 +223,12 @@ const DEPENDENCY_MARKERS: &[&str] = &["Depends", "Security"];
 const VALIDATES: &[&str] =
     &["model_validate", "model_validate_json", "model_validate_strings", "parse_obj", "parse_raw"];
 
+/// Logger methods logging a record.
+const LOGS: &[&str] = &["debug", "info", "warning", "warn", "error", "exception", "critical", "fatal", "log"];
+
+/// Methods attaching a handler, filter or formatter to a logger or handler.
+const ATTACHES: &[&str] = &["addHandler", "addFilter", "setFormatter"];
+
 struct Extractor<'a, 'db> {
     db: &'a HydroidDb,
     state: &'a AppState,
@@ -232,6 +248,8 @@ struct Extractor<'a, 'db> {
     returned_classes: RefCell<FxHashMap<(Key, bool), Vec<Key>>>,
     /// Ranges of callee expressions (attribute reads there are calls, not property reads).
     callees: FxHashSet<(u32, u32)>,
+    /// Constructions (by offset) whose instance is only attached, see [`attach_only`].
+    attach_only: FxHashSet<u32>,
     out: FileFacts,
 }
 
@@ -633,6 +651,7 @@ impl<'db> Extractor<'_, 'db> {
             level: None,
             receiver: None,
             super_name: None,
+            logging: None,
         });
     }
 
@@ -921,6 +940,7 @@ impl<'db> Extractor<'_, 'db> {
                 level: None,
                 receiver: None,
                 super_name: None,
+                logging: None,
             });
         }
     }
@@ -1078,6 +1098,7 @@ impl<'db> Extractor<'_, 'db> {
             level: None,
             receiver: None,
             super_name: None,
+            logging: None,
         });
     }
 
@@ -1156,6 +1177,7 @@ impl<'db> Extractor<'_, 'db> {
             call.arguments.keywords.iter().filter_map(|k| k.arg.as_ref().map(|a| a.to_string())).collect()
         });
         let level = self.level_argument(call);
+        let logging = self.log_use(call, resolution.constructs.is_some());
         self.out.calls.push(RawCall {
             caller: self.current,
             location,
@@ -1176,7 +1198,134 @@ impl<'db> Extractor<'_, 'db> {
             level,
             receiver,
             super_name,
+            logging,
         });
+    }
+
+    /// See [`hydroid_core::facts::Call::logging`].
+    fn log_use(&self, call: &ast::ExprCall, constructs: bool) -> Option<(Option<LoggerName>, Option<Key>, bool)> {
+        if constructs {
+            return self.attach_only.contains(&call.start().to_u32()).then_some((None, None, true));
+        }
+        let Expr::Attribute(attr) = &*call.func else { return None };
+        let attaching = ATTACHES.contains(&attr.attr.as_str());
+        if !attaching && !LOGS.contains(&attr.attr.as_str()) {
+            return None;
+        }
+        let logger = if matches!(attr.value.inferred_type(self.model), Some(Type::ModuleLiteral(_))) {
+            // `logging.info(...)` logs on the root logger.
+            Some(LoggerName { name: String::new(), exact: true })
+        } else {
+            self.logger_name(self.model, &attr.value, 0)
+        };
+        let attaches = if attaching {
+            let argument = call.arguments.args.first()?;
+            self.receiver_class(argument).or_else(|| instance_class(self.model, argument))
+        } else {
+            None
+        };
+        Some((logger, attaches, false))
+    }
+
+    /// The name of the logger an expression (in the file of `model`) evaluates to:
+    /// `logging.getLogger("audit")`, `getLogger(__name__)`, `getLogger(f"svc.{name}")` (only the
+    /// start known), `logging.root`, a variable assigned one, or the call of a function returning
+    /// one. `None` when not known.
+    fn logger_name(&self, model: &SemanticModel<'db>, expr: &Expr, depth: u8) -> Option<LoggerName> {
+        if depth > 4 {
+            return None;
+        }
+        let db = model.db();
+        let exact = |name: &str| {
+            // `getLogger("root")` is the root logger too.
+            let name = if name == "root" { "" } else { name };
+            Some(LoggerName { name: name.to_string(), exact: true })
+        };
+        match expr {
+            Expr::Call(call) if called_name(call) == Some("getLogger") => {
+                let argument = call.arguments.args.first().or(call.arguments.find_keyword("name").map(|k| &k.value));
+                match argument {
+                    None | Some(Expr::NoneLiteral(_)) => exact(""),
+                    Some(Expr::StringLiteral(s)) => exact(s.value.to_str()),
+                    Some(Expr::Name(n)) if n.id.as_str() == "__name__" => exact(&describe(self.db, model.file()).0),
+                    Some(Expr::FString(f)) => {
+                        let mut name = String::new();
+                        for part in f.value.iter() {
+                            match part {
+                                ast::FStringPartRef::Literal(literal) => name.push_str(&literal.value),
+                                ast::FStringPartRef::FString(f) => {
+                                    for element in &f.elements {
+                                        let ast::InterpolatedStringElement::Literal(literal) = element else {
+                                            return (!name.is_empty()).then_some(LoggerName { name, exact: false });
+                                        };
+                                        name.push_str(&literal.value);
+                                    }
+                                }
+                            }
+                        }
+                        exact(&name)
+                    }
+                    _ => None,
+                }
+            }
+            Expr::Attribute(attr) if attr.attr.as_str() == "root" => {
+                matches!(attr.value.inferred_type(model), Some(Type::ModuleLiteral(_))).then(|| exact(""))?
+            }
+            Expr::Name(name) => {
+                let mut found: Option<LoggerName> = None;
+                for definition in definitions_for_name(model, &name.id, expr.into(), ImportAliasResolution::ResolveAliases)
+                {
+                    let ResolvedDefinition::Definition(def) = definition else { return None };
+                    let module = parsed_module(db, def.python_file(db)).load(db);
+                    let value = match def.kind(db) {
+                        DefinitionKind::Assignment(a) if a.unpack().is_none() => a.value(&module),
+                        DefinitionKind::AnnotatedAssignment(a) => a.value(&module)?,
+                        _ => return None,
+                    };
+                    let other;
+                    let model = if def.file(db) == model.file() {
+                        model
+                    } else {
+                        other = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, def.file(db)));
+                        &other
+                    };
+                    let name = self.logger_name(model, value, depth + 1)?;
+                    if found.as_ref().is_some_and(|f| *f != name) {
+                        return None;
+                    }
+                    found = Some(name);
+                }
+                found
+            }
+            // `service_logger("payments")`: what the function returns.
+            Expr::Call(call) if model.file() == self.model.file() => {
+                let Some(RawValue::Function(key)) = self.value_of(&call.func) else { return None };
+                let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, key.0));
+                let module = parsed_module(db, model.python_file()).load(db);
+                let def = find_function(module.syntax(), key.1)?;
+                let mut found: Option<LoggerName> = None;
+                for value in return_values(&def.body) {
+                    let name = self.logger_name(&model, value, depth + 1)?;
+                    if found.as_ref().is_some_and(|f| *f != name) {
+                        return None;
+                    }
+                    found = Some(name);
+                }
+                found
+            }
+            _ => None,
+        }
+    }
+
+    /// `logger.propagate = value` (see [`hydroid_core::facts::Facts::stops_propagation`]).
+    fn propagation(&mut self, target: &Expr, value: &Expr) {
+        let Expr::Attribute(attr) = target else { return };
+        if attr.attr.as_str() != "propagate" {
+            return;
+        }
+        if let Some(LoggerName { name, exact: true }) = self.logger_name(self.model, &attr.value, 0) {
+            self.out.stops_propagation.push((name, matches!(value, Expr::BooleanLiteral(b) if !b.value)));
+        }
     }
 
     /// The logging level a call passes: its `level=` keyword, or the first argument of
@@ -1323,7 +1472,10 @@ impl<'db> Extractor<'_, 'db> {
         let (targets, sets) = if validated {
             (Vec::new(), Some((class, vec![name.to_string()])))
         } else {
-            if !self.orm.lazy.contains(&(class, name.to_string())) || !self.may_be_persistent(&attr.value) {
+            if !self.orm.lazy.contains(&(class, name.to_string()))
+                || !self.may_be_persistent(&attr.value)
+                || self.preloaded_off_loop(&attr.value, name, attr.start().to_u32())
+            {
                 return;
             }
             let load = self.orm.load.expect("checked above");
@@ -1350,6 +1502,7 @@ impl<'db> Extractor<'_, 'db> {
             level: None,
             receiver: None,
             super_name: None,
+            logging: None,
         });
     }
 
@@ -1475,6 +1628,85 @@ impl<'db> Extractor<'_, 'db> {
         false
     }
 
+    /// Whether relationship `name` of the instance a variable holds was already loaded before
+    /// this read (at offset `read`), off the loop: the variable holds what an awaited offload
+    /// returned (`project = await run_in_threadpool(load_project, db, id)`), or was passed to one
+    /// (`await to_thread(prepare, project)`), and the helper reads the relationship on that
+    /// value or refreshes it by name (`db.refresh(project, attribute_names=["members"])`). A
+    /// loaded collection sits in the instance `__dict__`, which attribute reads return without
+    /// loading. Not when anything that may expire it (`commit()`, `expire(...)`, ...) runs in
+    /// between, or the variable is assigned again.
+    fn preloaded_off_loop(&self, receiver: &Expr, name: &str, read: u32) -> bool {
+        let Expr::Name(var) = receiver else { return false };
+        let var = var.id.as_str();
+        let db = self.model.db();
+        let parsed = parsed_module(db, self.model.python_file()).load(db);
+        let Some(def) = find_function(parsed.syntax(), self.current) else { return false };
+        let body = scope_items(&def.body);
+        let stores: Vec<u32> = body.stores.iter().filter(|(n, _)| *n == var).map(|(_, at)| *at).collect();
+        for (call, assigned) in &body.awaited {
+            let (start, end) = (call.start().to_u32(), call.end().to_u32());
+            if end > read {
+                continue;
+            }
+            // The value from where it is set (or passed) until the read stays as it was.
+            let since = if *assigned == Some(var) { end } else { start };
+            if stores.iter().any(|&at| at > since && at < read)
+                || body.calls.iter().any(|c| c.start().to_u32() > end && c.start().to_u32() < read && expires(c, var))
+            {
+                continue;
+            }
+            let args = &call.arguments.args;
+            let Some(at) = args.iter().position(|a| matches!(self.value_of(a), Some(RawValue::Function(_)))) else {
+                continue;
+            };
+            let Some(RawValue::Function(helper)) = self.value_of(&args[at]) else { continue };
+            let helper_file = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, helper.0)).python_file();
+            let helper_module = parsed_module(db, helper_file).load(db);
+            let Some(helper_def) = find_function(helper_module.syntax(), helper.1) else { continue };
+            let mut params: Vec<&str> =
+                helper_def.parameters.iter_non_variadic_params().map(|p| p.parameter.name.as_str()).collect();
+            if matches!(&args[at], Expr::Attribute(_)) && matches!(params.first(), Some(&("self" | "cls"))) {
+                params.remove(0);
+            }
+            // The helper's names for the variable: the parameter it is passed as, and what it
+            // returns when the result is assigned to the variable.
+            let mut names: Vec<&str> = Vec::new();
+            let passed = |e: &Expr| matches!(e, Expr::Name(n) if n.id.as_str() == var);
+            for (i, a) in args.iter().enumerate().skip(at + 1) {
+                if a.is_starred_expr() {
+                    break;
+                }
+                if passed(a) {
+                    names.extend(params.get(i - at - 1));
+                }
+            }
+            for keyword in &call.arguments.keywords {
+                if let Some(arg) = &keyword.arg
+                    && passed(&keyword.value)
+                {
+                    names.extend(params.iter().find(|p| **p == arg.as_str()));
+                }
+            }
+            let helper_body = scope_items(&helper_def.body);
+            if names.iter().any(|p| helper_body.preloads(p, name)) {
+                return true;
+            }
+            if *assigned == Some(var) {
+                let returned: Vec<&Expr> =
+                    return_values(&helper_def.body).into_iter().filter(|v| !v.is_none_literal_expr()).collect();
+                if !returned.is_empty()
+                    && returned
+                        .iter()
+                        .all(|v| matches!(v, Expr::Name(n) if helper_body.preloads(n.id.as_str(), name)))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Drops the lazy relationship reads whose relationship the function (or one it calls or
     /// passes on, or the module) loads eagerly: `db.get(Author, id, options=[selectinload(Author.books)])`.
     fn drop_eager_reads(&mut self) {
@@ -1585,6 +1817,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
             Stmt::Assign(assign) if self.recording() => {
                 for target in &assign.targets {
                     self.store(target, &assign.value);
+                    self.propagation(target, &assign.value);
                 }
                 walk_stmt(self, stmt);
             }
@@ -1766,6 +1999,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                         level: None,
                         receiver: None,
                         super_name: None,
+                        logging: None,
                     });
                 }
                 walk_expr(self, expr);
@@ -1811,6 +2045,195 @@ fn body_calls(body: &[Stmt]) -> Vec<&ast::ExprCall> {
     let mut finder = Finder(Vec::new());
     finder.visit_body(body);
     finder.0
+}
+
+/// Constructions whose instance is only attached to a logger or handler (see
+/// [`hydroid_core::facts::LogUse::attach_only`]): the argument of `addHandler(...)`,
+/// `addFilter(...)` or `setFormatter(...)`, or assigned to a function's variable that is only
+/// passed to those or has methods called on it (`handler.setLevel(...)`).
+fn attach_only(body: &[Stmt]) -> FxHashSet<u32> {
+    #[derive(Default)]
+    struct Uses<'a> {
+        functions: Vec<&'a ast::StmtFunctionDef>,
+        assigned: Vec<(&'a str, u32)>,
+        stores: Vec<&'a str>,
+        /// Variable reads, and whether each is an attachment or a method call.
+        loads: Vec<(&'a str, bool)>,
+        direct: FxHashSet<u32>,
+        attached: FxHashSet<u32>,
+    }
+    impl<'a> SourceOrderVisitor<'a> for Uses<'a> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if let Stmt::FunctionDef(def) = stmt {
+                self.functions.push(def);
+            }
+            if let Stmt::Assign(assign) = stmt
+                && let ([Expr::Name(name)], Expr::Call(call)) = (&assign.targets[..], &*assign.value)
+            {
+                self.assigned.push((name.id.as_str(), call.start().to_u32()));
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            match expr {
+                Expr::Call(call) => {
+                    if let Expr::Attribute(attr) = &*call.func {
+                        if let Expr::Name(name) = &*attr.value {
+                            self.attached.insert(name.start().to_u32());
+                        }
+                        if ATTACHES.contains(&attr.attr.as_str()) {
+                            match call.arguments.args.first() {
+                                Some(Expr::Call(argument)) => {
+                                    self.direct.insert(argument.start().to_u32());
+                                }
+                                Some(Expr::Name(name)) => {
+                                    self.attached.insert(name.start().to_u32());
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Expr::Name(name) if name.ctx == ExprContext::Store => self.stores.push(name.id.as_str()),
+                Expr::Name(name) if name.ctx == ExprContext::Load => {
+                    self.loads.push((name.id.as_str(), self.attached.contains(&name.start().to_u32())));
+                }
+                _ => {}
+            }
+            walk_expr(self, expr);
+        }
+    }
+    let mut module = Uses::default();
+    module.visit_body(body);
+    let mut found = std::mem::take(&mut module.direct);
+    for def in module.functions {
+        let mut uses = Uses::default();
+        uses.visit_body(&def.body);
+        for (name, call) in &uses.assigned {
+            let assigned_once = uses.stores.iter().filter(|s| *s == name).count() == 1;
+            if assigned_once && uses.loads.iter().all(|(n, attached)| n != name || *attached) {
+                found.insert(*call);
+            }
+        }
+    }
+    found
+}
+
+/// What a function body (its own scope) does, for following an ORM instance through it.
+#[derive(Default)]
+struct ScopeItems<'a> {
+    /// Awaited calls, with the variable the result is assigned to (`x = await f(...)`).
+    awaited: Vec<(&'a ast::ExprCall, Option<&'a str>)>,
+    calls: Vec<&'a ast::ExprCall>,
+    /// Variables assigned, and where.
+    stores: Vec<(&'a str, u32)>,
+    /// `name.attribute` reads: `(name, attribute, offset)`.
+    reads: Vec<(&'a str, &'a str, u32)>,
+}
+
+impl<'a> SourceOrderVisitor<'a> for ScopeItems<'a> {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        match stmt {
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+            _ => {
+                let (targets, value): (&[Expr], _) = match stmt {
+                    Stmt::Assign(a) => (&a.targets, Some(&*a.value)),
+                    Stmt::AnnAssign(a) => (std::slice::from_ref(&*a.target), a.value.as_deref()),
+                    _ => (&[], None),
+                };
+                if let ([Expr::Name(name)], Some(Expr::Await(await_expr))) = (targets, value)
+                    && let Expr::Call(call) = &*await_expr.value
+                {
+                    self.awaited.push((call, Some(name.id.as_str())));
+                }
+                walk_stmt(self, stmt);
+            }
+        }
+    }
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        match expr {
+            Expr::Lambda(_) => return,
+            Expr::Await(await_expr) => {
+                if let Expr::Call(call) = &*await_expr.value
+                    && !self.awaited.iter().any(|(c, _)| std::ptr::eq(*c, call))
+                {
+                    self.awaited.push((call, None));
+                }
+            }
+            Expr::Call(call) => self.calls.push(call),
+            Expr::Name(name) if name.ctx == ExprContext::Store => {
+                self.stores.push((name.id.as_str(), name.start().to_u32()));
+            }
+            Expr::Attribute(attr) if attr.ctx == ExprContext::Load => {
+                if let Expr::Name(name) = &*attr.value {
+                    self.reads.push((name.id.as_str(), attr.attr.as_str(), attr.start().to_u32()));
+                }
+            }
+            _ => {}
+        }
+        walk_expr(self, expr);
+    }
+}
+
+fn scope_items(body: &[Stmt]) -> ScopeItems<'_> {
+    let mut items = ScopeItems::default();
+    items.visit_body(body);
+    items
+}
+
+impl ScopeItems<'_> {
+    /// Whether relationship `name` of the instance in variable `var` is loaded when the body
+    /// ends: read (`len(var.name)`) or refreshed by name (`db.refresh(var, attribute_names=[...])`)
+    /// after anything that may expire it and after the variable is last assigned.
+    fn preloads(&self, var: &str, name: &str) -> bool {
+        let refreshes = self.calls.iter().filter(|c| {
+            let names = c.arguments.find_keyword("attribute_names").map(|k| &k.value).or(c.arguments.args.get(1));
+            let named = match names {
+                Some(Expr::List(ast::ExprList { elts, .. }))
+                | Some(Expr::Tuple(ast::ExprTuple { elts, .. }))
+                | Some(Expr::Set(ast::ExprSet { elts, .. })) => {
+                    elts.iter().any(|e| matches!(e, Expr::StringLiteral(s) if s.value.to_str() == name))
+                }
+                _ => false,
+            };
+            called_name(c) == Some("refresh") && named && first_argument_is(c, var)
+        });
+        let loaded = self
+            .reads
+            .iter()
+            .filter(|(v, attribute, _)| *v == var && *attribute == name)
+            .map(|(_, _, at)| *at)
+            .chain(refreshes.map(|c| c.start().to_u32()))
+            .max();
+        let unloaded = self
+            .calls
+            .iter()
+            .filter(|c| expires(c, var))
+            .map(|c| c.start().to_u32())
+            .chain(self.stores.iter().filter(|(v, _)| *v == var).map(|(_, at)| *at))
+            .max();
+        loaded.is_some_and(|loaded| unloaded.is_none_or(|unloaded| loaded > unloaded))
+    }
+}
+
+/// Whether a call may expire the loaded attributes of the instance in variable `var`:
+/// `commit()` (`expire_on_commit`), `rollback()`, `expire_all()`, `expire(var)`, and
+/// `refresh(var)` without `attribute_names` (which leaves lazy relationships unloaded).
+fn expires(call: &ast::ExprCall, var: &str) -> bool {
+    match called_name(call) {
+        Some("commit" | "rollback" | "expire_all") => true,
+        Some("expire") => call.arguments.args.is_empty() || first_argument_is(call, var),
+        Some("refresh") => {
+            first_argument_is(call, var)
+                && call.arguments.args.len() < 2
+                && call.arguments.find_keyword("attribute_names").is_none()
+        }
+        _ => false,
+    }
+}
+
+fn first_argument_is(call: &ast::ExprCall, var: &str) -> bool {
+    matches!(call.arguments.args.first(), Some(Expr::Name(n)) if n.id.as_str() == var)
 }
 
 /// Whether an `except` clause catches `RuntimeError`: bare, `RuntimeError` or a base of it, or

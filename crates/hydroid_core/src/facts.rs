@@ -158,6 +158,30 @@ pub struct Call {
     /// The logging level the call passes: its `level=` keyword, or the first argument of
     /// `setLevel(...)` and `log(...)`.
     pub level: Option<Level>,
+    /// See [`LogUse`]: set on logging calls, on calls attaching handlers, filters and formatters,
+    /// and on constructions whose instance only gets attached.
+    pub logging: Option<LogUse>,
+}
+
+/// How a call takes part in the logging setup.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LogUse {
+    /// The logger the call is made on (`log.info(...)`, `log.addHandler(h)`; the root logger
+    /// for `logging.info(...)`), when it is known to be one with a known name.
+    pub logger: Option<LoggerName>,
+    /// `addHandler(h)`, `addFilter(f)`, `setFormatter(f)`: the class of the instance attached.
+    pub attaches: Option<ClassId>,
+    /// A construction whose instance is only attached (`log.addHandler(Handler())`, or held in
+    /// a variable that is only configured and attached).
+    pub attach_only: bool,
+}
+
+/// A logger name: `getLogger("audit")`, `getLogger(__name__)` (the module), `""` for the root
+/// logger. Not `exact`: only the start of it is known (`getLogger(f"svc.{name}")`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoggerName {
+    pub name: String,
+    pub exact: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -222,6 +246,8 @@ pub struct Facts {
     pub signatures: Vec<Signature>,
     /// Lines carrying a `# hydroid: ignore` comment.
     pub suppressed: Vec<(String, u32)>,
+    /// `logger.propagate = value` on a logger with a known name: `(name, value is False)`.
+    pub stops_propagation: Vec<(String, bool)>,
 }
 
 impl Facts {

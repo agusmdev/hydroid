@@ -121,7 +121,9 @@ drop it and the upload step to fail the build instead.
    `@validates` validators run by `Model(field=...)` and `obj.field = ...`, and reads of lazily
    loaded `relationship()` attributes, which query through `Session.execute` unless the
    relationship is eager (`lazy="selectin"`, ...) or the function loads it with an eager option
-   like `selectinload(Model.attr)`). Callables passed as arguments are recorded as flows
+   like `selectinload(Model.attr)`, or it was already loaded off the loop: the instance was
+   returned by (or passed to) an awaited offloaded helper that reads the relationship or
+   refreshes it by name, with no `commit()`/`expire` in between). Callables passed as arguments are recorded as flows
    (`to_thread(f)`, `Depends(dep)`, `on_startup=[f]`, decorators), and so are callables stored
    on `self` and returned by functions. Calls through dispatch tables (`TABLE[key](...)`, or
    `send = TABLE[key]; send(...)`, where `TABLE` is a dict, list or tuple literal) resolve to the
@@ -148,7 +150,13 @@ drop it and the upload step to fail the build instead.
    `filter`/`emit`/`format` overrides of the `logging.Filter`, `logging.Handler` and
    `logging.Formatter` subclasses the project constructs, and the file and socket I/O of the
    stdlib rotating, watched and socket handlers, when the record's level reaches the lowest
-   logger level the project sets (`WARNING` when it sets none) and the handler's level. Offload APIs cut the graph; callbacks are attributed to the call site passing
+   logger level the project sets (`WARNING` when it sets none) and the handler's level. A hook
+   the project only attaches with `addHandler`/`addFilter`/`setFormatter` runs only for the
+   loggers it is attached to: a handler for records of its logger and the loggers below it (by
+   dotted name, up to one with `propagate = False`), a logger's filter only for that logger's
+   own records; logger names come from `getLogger("x")`, `getLogger(__name__)`, the literal start
+   of an f-string, and `logging.info(...)` logs on the root logger. Records of a logger whose
+   name is not known may reach any hook. Offload APIs cut the graph; callbacks are attributed to the call site passing
    them; overrides are found by class-hierarchy analysis (test doubles only stand in for real
    classes in test code); calling a generator function runs nothing until the generator is
    iterated; a decorated function is reached through its decorator's wrappers only when they call
