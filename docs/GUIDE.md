@@ -97,6 +97,9 @@ def get_user(user_id: int):
 | `lifespan`, startup/shutdown handlers (also `def` ones) | sync background tasks |
 | async background tasks | `asyncio.to_thread`, `run_in_threadpool`, `loop.run_in_executor`, `anyio.to_thread.run_sync` |
 | callbacks given to `loop.call_soon`, `call_later`, `add_done_callback` | `ThreadPoolExecutor.submit`, `threading.Thread(target=...)` |
+| pydantic validators of request parameters and bodies (also for `def` endpoints and dependencies) | |
+| `@computed_field`, `@field_serializer`, `@model_serializer` of the returned model (every endpoint) | |
+| validators of the `response_model` (or return annotation) of `async def` endpoints | validators of the `response_model` of `def` endpoints |
 
 Awaiting an API is never blocking: `await redis.asyncio.Redis().get(k)` is fine,
 `redis.Redis().get(k)` is reported.

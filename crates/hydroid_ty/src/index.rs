@@ -29,6 +29,7 @@ pub struct FnEntry {
     pub property: Option<Accessor>,
     pub is_generator: bool,
     pub is_validator: bool,
+    pub is_serializer: bool,
     pub params: Vec<String>,
     /// How many of `params` can be passed positionally.
     pub positional: usize,
@@ -43,6 +44,8 @@ pub struct ClassEntry {
     pub bases: Vec<Key>,
     pub is_protocol: bool,
     pub methods: Vec<(String, u32)>,
+    /// Classes named in the annotations of class-level fields (project classes only).
+    pub fields: Vec<Key>,
 }
 
 pub struct FileIndex {
@@ -98,6 +101,7 @@ impl FileIndex {
             property: None,
             is_generator: false,
             is_validator: false,
+            is_serializer: false,
             params: Vec::new(),
             positional: 0,
             parent: None,
@@ -279,8 +283,63 @@ fn is_validator(def: &ast::StmtFunctionDef) -> bool {
     })
 }
 
+fn is_serializer(def: &ast::StmtFunctionDef) -> bool {
+    def.decorator_list
+        .iter()
+        .any(|d| matches!(decorator_name(d), Some("computed_field" | "field_serializer" | "model_serializer")))
+}
+
+/// The classes an annotation names (`Item`, `list[Item] | None`, `Annotated[Item, Body()]`),
+/// outside the standard library. Calls in the annotation (`Annotated` metadata) are handed to
+/// `call` instead.
+pub fn annotation_classes<'e>(
+    model: &SemanticModel<'_>,
+    annotation: &'e Expr,
+    classes: &mut Vec<Key>,
+    call: &mut dyn FnMut(&'e ast::ExprCall),
+) {
+    match annotation {
+        Expr::Name(_) | Expr::Attribute(_) => {
+            let db = model.db();
+            // Names in a type expression have the instance type (`Item`), in a value expression
+            // (`response_model=Item`) the class type.
+            let Some(ty) = annotation.inferred_type(model) else { return };
+            if !is_class_object(&ty) && !matches!(ty, Type::NominalInstance(_)) {
+                return;
+            }
+            let Some(TypeDefinition::StaticClass(def)) = ty.definition(db, &model.program_environment()) else {
+                return;
+            };
+            let file = def.file(db);
+            if file.path(db).is_vendored_path() {
+                return;
+            }
+            let module = parsed_module(db, def.python_file(db)).load(db);
+            let key = (file, def.focus_range(db, &module).start().to_u32());
+            if !classes.contains(&key) {
+                classes.push(key);
+            }
+        }
+        Expr::Subscript(subscript) => {
+            annotation_classes(model, &subscript.value, classes, call);
+            annotation_classes(model, &subscript.slice, classes, call);
+        }
+        Expr::Tuple(tuple) => {
+            for element in &tuple.elts {
+                annotation_classes(model, element, classes, call);
+            }
+        }
+        Expr::BinOp(binop) => {
+            annotation_classes(model, &binop.left, classes, call);
+            annotation_classes(model, &binop.right, classes, call);
+        }
+        Expr::Call(c) => call(c),
+        _ => {}
+    }
+}
+
 /// Whether a body yields (in its own scope: not in nested functions or classes).
-fn yields(body: &[Stmt]) -> bool {
+pub fn yields(body: &[Stmt]) -> bool {
     struct Finder(bool);
     impl<'ast> SourceOrderVisitor<'ast> for Finder {
         fn visit_stmt(&mut self, stmt: &'ast Stmt) {
@@ -339,6 +398,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                         // decorator, which decides when the body runs.
                         is_generator: !def.is_async && def.decorator_list.is_empty() && yields(&def.body),
                         is_validator: is_validator(def),
+                        is_serializer: is_serializer(def),
                         params,
                         positional,
                         parent: self.enclosing_function(),
@@ -368,7 +428,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                 let is_protocol = def.bases().iter().any(is_protocol_base);
                 self.index.classes.insert(
                     key,
-                    ClassEntry { qualname: qualname.clone(), bases, is_protocol, methods: Vec::new() },
+                    ClassEntry { qualname: qualname.clone(), bases, is_protocol, methods: Vec::new(), fields: Vec::new() },
                 );
                 self.scopes.push((Scope::Class(key), qualname));
                 walk_stmt(self, stmt);
@@ -381,11 +441,23 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                 }
                 walk_stmt(self, stmt);
             }
-            Stmt::AnnAssign(ast::StmtAnnAssign { target, value: Some(value), .. })
-                if self.direct_class().is_some() && value.is_call_expr() =>
-            {
-                if let Some(name) = target.as_name_expr() {
+            Stmt::AnnAssign(ast::StmtAnnAssign { target, annotation, value, .. }) if self.direct_class().is_some() => {
+                let class = self.direct_class().expect("in a class body");
+                if value.as_deref().is_some_and(Expr::is_call_expr)
+                    && let Some(name) = target.as_name_expr()
+                {
                     self.index.class_attributes.push(name.id.to_string());
+                }
+                // Pydantic neither validates nor dumps class variables and private attributes.
+                let is_class_var = matches!(&**annotation, Expr::Subscript(s) if matches!(&*s.value,
+                    Expr::Name(n) if n.id == "ClassVar") || matches!(&*s.value, Expr::Attribute(a) if a.attr.as_str() == "ClassVar"));
+                let is_private = target.as_name_expr().is_some_and(|n| n.id.starts_with('_'));
+                if self.index.origin == Origin::Project && !is_class_var && !is_private {
+                    let mut fields = Vec::new();
+                    annotation_classes(self.model, annotation, &mut fields, &mut |_| {});
+                    if let Some(entry) = self.index.classes.get_mut(&class) {
+                        entry.fields.extend(fields.into_iter().filter(|f| *f != (self.index.file, class)));
+                    }
                 }
                 walk_stmt(self, stmt);
             }
@@ -409,6 +481,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     property: None,
                     is_generator: false,
                     is_validator: false,
+                    is_serializer: false,
                     params,
                     positional,
                     parent: self.enclosing_function(),

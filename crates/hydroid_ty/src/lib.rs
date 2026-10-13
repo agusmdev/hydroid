@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use hydroid_core::catalog::qualname_matches;
-use hydroid_core::facts::{Call, Class, ClassId, Facts, FnId, Flow, Function, Origin, Slot, Store, Value};
+use hydroid_core::facts::{Call, Class, ClassId, Facts, FnId, Flow, Function, Origin, Signature, Slot, Store, Value};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use ruff_db::files::{File, system_path_to_file};
@@ -323,6 +323,21 @@ fn referenced(facts: &[FileFacts]) -> (FxHashSet<File>, FxHashSet<Key>) {
         }
         files.extend(f.calls.iter().flat_map(|c| c.returned_by.iter().map(|key| key.0)));
         files.extend(f.dispatches.iter().map(|(key, _)| key.0));
+        for signature in &f.signatures {
+            classes.extend(signature.annotation.iter().chain(&signature.returned).copied());
+            for value in &signature.params {
+                match value {
+                    RawValue::Class(key) => {
+                        classes.insert(*key);
+                    }
+                    RawValue::Function((file, _)) => {
+                        files.insert(*file);
+                    }
+                    RawValue::Param(..) => {}
+                }
+            }
+            files.extend(classes.iter().map(|key| key.0));
+        }
         files.extend(f.calls.iter().filter_map(|c| c.attribute.as_ref().map(|(key, _)| key.0)));
         for store in &f.stores {
             files.insert(store.class.0);
@@ -412,6 +427,7 @@ impl<'a> Merger<'a> {
             property: entry.property,
             is_generator: entry.is_generator,
             is_validator: entry.is_validator,
+            is_serializer: entry.is_serializer,
             params: entry.params.clone(),
             parent: None,
             class: None,
@@ -439,6 +455,7 @@ impl<'a> Merger<'a> {
             bases: Vec::new(),
             is_protocol: entry.is_protocol,
             methods: Vec::new(),
+            fields: Vec::new(),
         });
         let bases = self.indexes.bases(key).into_iter().filter_map(|b| self.class_id(b)).collect();
         let methods = entry
@@ -446,9 +463,11 @@ impl<'a> Merger<'a> {
             .iter()
             .filter_map(|(name, m)| Some((name.clone(), self.fn_id((key.0, *m))?)))
             .collect();
+        let fields = entry.fields.iter().filter_map(|&f| self.class_id(f)).collect();
         let class = &mut self.facts.classes[id.0 as usize];
         class.bases = bases;
         class.methods = methods;
+        class.fields = fields;
         Some(id)
     }
 
@@ -503,6 +522,14 @@ impl<'a> Merger<'a> {
                 continue;
             };
             self.facts.returns.push((function, value));
+        }
+        for raw in file_facts.signatures {
+            let Some(function) = self.fn_id((file, raw.function)) else { continue };
+            let params = raw.params.into_iter().filter_map(|v| self.value(file, v)).collect();
+            let annotation = raw.annotation.into_iter().filter_map(|k| self.class_id(k)).collect();
+            let returned = raw.returned.into_iter().filter_map(|k| self.class_id(k)).collect();
+            let returns_unknown = raw.returns_unknown;
+            self.facts.signatures.push(Signature { function, params, annotation, returned, returns_unknown });
         }
         for raw in file_facts.stores {
             let Some(class) = self.class_id(raw.class) else { continue };

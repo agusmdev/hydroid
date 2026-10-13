@@ -63,6 +63,9 @@ pub struct Function {
     pub is_generator: bool,
     /// A pydantic validator: constructing or validating its model runs it.
     pub is_validator: bool,
+    /// A pydantic serialization hook (`@computed_field`, `@field_serializer`,
+    /// `@model_serializer`): dumping its model runs it.
+    pub is_serializer: bool,
     pub params: Vec<String>,
     /// Lexically enclosing function (closures read its parameters).
     pub parent: Option<FnId>,
@@ -81,6 +84,28 @@ pub struct Class {
     pub is_protocol: bool,
     /// Methods defined directly in the class body.
     pub methods: Vec<(String, FnId)>,
+    /// Classes named in the annotations of its class-level fields (nested models). Project
+    /// classes only.
+    pub fields: Vec<ClassId>,
+}
+
+/// What FastAPI validates and serializes around a function when it is an endpoint or a
+/// dependency (see `fastapi.dependencies.utils.solve_dependencies` and
+/// `fastapi.routing.serialize_response`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Signature {
+    pub function: FnId,
+    /// What validating the parameters FastAPI fills from the request (not `Depends(...)` ones)
+    /// runs: the classes named in their annotations, and the validators attached to them with
+    /// `Annotated[str, AfterValidator(f)]`.
+    pub params: Vec<Value>,
+    /// Classes named in the return annotation (the default `response_model`). Empty for
+    /// generators, whose items are streamed.
+    pub annotation: Vec<ClassId>,
+    /// Classes of the instances it returns (inferred). Empty for generators.
+    pub returned: Vec<ClassId>,
+    /// Some value it returns has a type ty does not know (it may be a model instance).
+    pub returns_unknown: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -161,6 +186,8 @@ pub struct Facts {
     /// `(dispatcher, implementation)`: calling the dispatcher may run the implementation
     /// (`@render.register` on a `functools.singledispatch` function).
     pub dispatches: Vec<(FnId, FnId)>,
+    /// Signatures of the functions that annotate or return classes, see [`Signature`].
+    pub signatures: Vec<Signature>,
     /// Lines carrying a `# hydroid: ignore` comment.
     pub suppressed: Vec<(String, u32)>,
 }

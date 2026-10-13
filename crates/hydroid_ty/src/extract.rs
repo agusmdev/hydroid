@@ -1,6 +1,6 @@
 //! Walks function bodies and records calls (with their resolved callees) and callable flows.
 
-use hydroid_core::facts::{Accessor, Location};
+use hydroid_core::facts::{Accessor, Location, Origin};
 use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::visitor::source_order::{SourceOrderVisitor, walk_expr, walk_stmt};
@@ -17,7 +17,7 @@ use ty_python_semantic::{
 };
 
 use crate::db::HydroidDb;
-use crate::index::{FileIndex, Key, MODULE_KEY, is_class_object};
+use crate::index::{FileIndex, Key, MODULE_KEY, annotation_classes, is_class_object, yields};
 
 pub struct RawCall {
     pub caller: u32,
@@ -81,8 +81,18 @@ pub struct RawFlow {
     pub literal: Option<String>,
 }
 
+/// See [`hydroid_core::facts::Signature`].
+pub struct RawSignature {
+    pub function: u32,
+    pub params: Vec<RawValue>,
+    pub annotation: Vec<Key>,
+    pub returned: Vec<Key>,
+    pub returns_unknown: bool,
+}
+
 pub struct FileFacts {
     pub file: File,
+    pub signatures: Vec<RawSignature>,
     pub calls: Vec<RawCall>,
     pub flows: Vec<RawFlow>,
     pub stores: Vec<RawStore>,
@@ -114,6 +124,7 @@ pub fn extract_file(
         callees: FxHashSet::default(),
         out: FileFacts {
             file: index.file,
+            signatures: Vec::new(),
             calls: Vec::new(),
             flows: Vec::new(),
             stores: Vec::new(),
@@ -142,6 +153,12 @@ const CONSUMERS: &[&str] = &[
 /// Builtins returning lazy iterators over their arguments: iterating one iterates those.
 const LAZY: &[&str] = &["map", "filter", "zip", "enumerate", "reversed", "iter"];
 
+/// `Annotated` metadata attaching a validator callable to a field or parameter (pydantic).
+const VALIDATOR_METADATA: &[&str] = &["AfterValidator", "BeforeValidator", "PlainValidator", "WrapValidator"];
+
+/// Parameter markers whose value FastAPI gets by calling a dependency, not from the request.
+const DEPENDENCY_MARKERS: &[&str] = &["Depends", "Security"];
+
 /// Pydantic classmethods that validate input into the model (running its validators).
 const VALIDATES: &[&str] =
     &["model_validate", "model_validate_json", "model_validate_strings", "parse_obj", "parse_raw"];
@@ -161,6 +178,15 @@ struct Extractor<'a, 'db> {
     /// Ranges of callee expressions (attribute reads there are calls, not property reads).
     callees: FxHashSet<(u32, u32)>,
     out: FileFacts,
+}
+
+/// `Depends` in `Depends(dep)` and `fastapi.Depends(dep)`.
+fn called_name(call: &ast::ExprCall) -> Option<&str> {
+    match &*call.func {
+        Expr::Name(name) => Some(name.id.as_str()),
+        Expr::Attribute(attr) => Some(attr.attr.as_str()),
+        _ => None,
+    }
 }
 
 fn first_string_literal(call: &ast::ExprCall) -> Option<String> {
@@ -748,6 +774,14 @@ impl<'db> Extractor<'_, 'db> {
                 }
                 _ => self.value_of(argument).into_iter().collect(),
             };
+            // `response_model=list[Item]`: the classes it names.
+            let values = if values.is_empty() && matches!(&slot, RawSlot::Keyword(k) if k == "response_model") {
+                let mut classes = Vec::new();
+                annotation_classes(self.model, argument, &mut classes, &mut |_| {});
+                classes.into_iter().map(RawValue::Class).collect()
+            } else {
+                values
+            };
             for value in values {
                 for &(into, bound) in &resolution.targets {
                     self.out.flows.push(RawFlow {
@@ -829,6 +863,53 @@ impl<'db> Extractor<'_, 'db> {
         self.out.decorators.push((key, decorators));
     }
 
+    /// What FastAPI validates and serializes around `def` if it is an endpoint or a dependency.
+    fn signature(&mut self, def: &ast::StmtFunctionDef) {
+        let key = def.name.start().to_u32();
+        let parameters = &def.parameters;
+        let mut params = Vec::new();
+        for parameter in parameters.posonlyargs.iter().chain(&parameters.args).chain(&parameters.kwonlyargs) {
+            let name = parameter.parameter.name.as_str();
+            let Some(annotation) = parameter.parameter.annotation.as_deref() else { continue };
+            let is_dependency =
+                |call: &ast::ExprCall| called_name(call).is_some_and(|n| DEPENDENCY_MARKERS.contains(&n));
+            let default_dependency = matches!(parameter.default.as_deref(), Some(Expr::Call(c)) if is_dependency(c));
+            if name == "self" || name == "cls" || default_dependency {
+                continue;
+            }
+            let mut classes = Vec::new();
+            let mut calls = Vec::new();
+            annotation_classes(self.model, annotation, &mut classes, &mut |call| calls.push(call));
+            if calls.iter().any(|c| is_dependency(c)) {
+                continue;
+            }
+            params.extend(classes.into_iter().map(RawValue::Class));
+            for call in calls.into_iter().filter(|c| called_name(c).is_some_and(|n| VALIDATOR_METADATA.contains(&n))) {
+                let func = call.arguments.args.first().or_else(|| call.arguments.find_keyword("func").map(|k| &k.value));
+                if let Some(value @ RawValue::Function(_)) = func.and_then(|f| self.value_of(f)) {
+                    params.push(value);
+                }
+            }
+        }
+        let (mut annotation, mut returned, mut returns_unknown) = (Vec::new(), Vec::new(), false);
+        if !yields(&def.body) {
+            if let Some(returns) = def.returns.as_deref() {
+                annotation_classes(self.model, returns, &mut annotation, &mut |_| {});
+            }
+            let db = self.model.db();
+            returned = self.returned_classes((self.index.file, key));
+            returned.retain(|(file, _)| !file.path(db).is_vendored_path());
+            returns_unknown = return_values(&def.body).iter().any(|value| match value.inferred_type(self.model) {
+                Some(Type::Union(union)) => union.elements(db).iter().any(|t| matches!(t, Type::Dynamic(_))),
+                Some(ty) => matches!(ty, Type::Dynamic(_)),
+                None => true,
+            });
+        }
+        if !params.is_empty() || !annotation.is_empty() || !returned.is_empty() || returns_unknown {
+            self.out.signatures.push(RawSignature { function: key, params, annotation, returned, returns_unknown });
+        }
+    }
+
     fn in_scope(&mut self, key: u32, f: impl FnOnce(&mut Self)) {
         let previous = std::mem::replace(&mut self.current, key);
         f(self);
@@ -846,6 +927,9 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                 }
                 if self.recording() || self.wanted.is_some_and(|w| w.contains(&key)) {
                     self.handle_decorators(def);
+                }
+                if self.wanted.is_none() && self.index.origin == Origin::Project {
+                    self.signature(def);
                 }
                 if let Some(type_params) = &def.type_params {
                     self.visit_type_params(type_params);

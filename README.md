@@ -119,13 +119,18 @@ drop it and the upload step to fail the build instead.
    `sorted(xs, key=f)` or `stack.enter_context(cm)`, `singledispatch` implementations). Callables passed as arguments are recorded as flows
    (`to_thread(f)`, `Depends(dep)`, `on_startup=[f]`, decorators), and so are callables stored
    on `self` and returned by functions. When ty does not know a value's type because it comes
-   from an unannotated function, the class that function returns is used. The facts of an unchanged project are reused from `.hydroid_cache/` (keyed by the
+   from an unannotated function, the class that function returns is used. Signatures record
+   what FastAPI validates and serializes: the models (and `AfterValidator`-style callables) in
+   parameter annotations, the return annotation, the classes returned. The facts of an unchanged project are reused from `.hydroid_cache/` (keyed by the
    binary, the options, the installed packages and every source file's contents).
 2. **Analysis** (`crates/hydroid_core`, plain graph code): where code runs is a property of the
    call, so "does calling `f` block?" is computed once per function by a backwards BFS from
    blocking functions — shortest witness chains, no recursion, any depth. Diagnostics are the
    call sites inside loop code (`async def` bodies, sync callbacks scheduled on the loop) whose
-   callee blocks. Offload APIs cut the graph; callbacks are attributed to the call site passing
+   callee blocks. Pydantic code FastAPI runs on the loop is loop code too: validators of request
+   parameters and bodies (of `def` endpoints and dependencies as well: only their bodies go to
+   the threadpool), computed fields and serializers of the response, and response-model
+   validators of `async def` endpoints. Offload APIs cut the graph; callbacks are attributed to the call site passing
    them; overrides are found by class-hierarchy analysis (test doubles only stand in for real
    classes in test code); calling a generator function runs nothing until the generator is
    iterated; a decorated function is reached through its decorator's wrappers only when they call

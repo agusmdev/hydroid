@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, VecDeque};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::catalog::Catalog;
-use crate::facts::{Call, ClassId, Facts, FnId, Flow, FunctionKind, Origin, Slot, Value};
+use crate::facts::{Call, ClassId, Facts, FnId, Flow, FunctionKind, Location, Origin, Signature, Slot, Value};
 use crate::report::{Diagnostic, Frame, ReachedFrom, Report, Sink, Unresolved};
 
 pub fn analyze(facts: &Facts, catalog: &Catalog) -> Report {
@@ -92,6 +92,8 @@ struct Graph<'a> {
     direct: Vec<bool>,
     /// Parameters that are called, or handed to something other than an offload API.
     used_params: HashSet<ParamKey>,
+    /// See [`Graph::framework_hooks`].
+    hooks: Vec<(FnId, String)>,
 }
 
 type ParamKey = (FnId, String);
@@ -137,6 +139,7 @@ impl<'a> Graph<'a> {
             offload,
             direct,
             used_params: HashSet::default(),
+            hooks: Vec::new(),
         };
         let used_from_calls = facts.calls.iter().filter_map(|c| c.param.clone());
         let used_from_flows: Vec<ParamKey> = facts
@@ -184,6 +187,7 @@ impl<'a> Graph<'a> {
                 graph.effective_targets(call, flows, &cx, &mut runs)
             })
             .collect();
+        graph.hooks = graph.framework_hooks();
         graph
     }
 
@@ -425,6 +429,116 @@ impl<'a> Graph<'a> {
         hooks
     }
 
+    /// What validating `class` from request data runs: its construction hooks, and those of the
+    /// models nested in its fields.
+    fn validation_hooks(&self, class: ClassId) -> Vec<FnId> {
+        let mut hooks = Vec::new();
+        let mut seen = HashSet::from_iter([class]);
+        let mut queue = VecDeque::from([class]);
+        while let Some(c) = queue.pop_front() {
+            hooks.extend(self.construction_hooks(c));
+            queue.extend(self.facts.class(c).fields.iter().filter(|f| seen.insert(**f)));
+        }
+        hooks
+    }
+
+    /// What dumping an instance of `class` runs: serialization hooks of the class, its bases and
+    /// the models nested in its fields.
+    fn serialization_hooks(&self, class: ClassId) -> Vec<FnId> {
+        let mut hooks = Vec::new();
+        let mut seen = HashSet::from_iter([class]);
+        let mut queue = VecDeque::from([class]);
+        while let Some(c) = queue.pop_front() {
+            let cls = self.facts.class(c);
+            hooks.extend(cls.methods.iter().map(|(_, m)| *m).filter(|m| self.facts.function(*m).is_serializer));
+            queue.extend(cls.bases.iter().chain(&cls.fields).filter(|b| seen.insert(**b)));
+        }
+        hooks
+    }
+
+    /// Whether `class` is `base` or a subclass of it.
+    fn inherits(&self, class: ClassId, base: ClassId) -> bool {
+        let mut seen = HashSet::from_iter([class]);
+        let mut queue = VecDeque::from([class]);
+        while let Some(c) = queue.pop_front() {
+            if c == base {
+                return true;
+            }
+            queue.extend(self.facts.class(c).bases.iter().filter(|b| seen.insert(**b)));
+        }
+        false
+    }
+
+    /// Pydantic code FastAPI runs on the loop around endpoints and dependencies, with what runs
+    /// it. `solve_dependencies` validates the request parameters of every endpoint and
+    /// dependency on the loop, sync ones included (only their bodies go to the threadpool).
+    /// `serialize_response` validates the return value against the response model on the loop
+    /// for `async def` endpoints only, then dumps it on the loop for every endpoint.
+    fn framework_hooks(&self) -> Vec<(FnId, String)> {
+        let signatures: HashMap<FnId, &Signature> = self.facts.signatures.iter().map(|s| (s.function, s)).collect();
+        let mut response_models: HashMap<(FnId, &Location), Vec<ClassId>> = HashMap::default();
+        for flow in &self.facts.flows {
+            if let (Value::Class(class), Slot::Param(slot)) = (&flow.value, &flow.slot)
+                && slot == "response_model"
+            {
+                response_models.entry((flow.caller, &flow.location)).or_default().push(*class);
+            }
+        }
+        let mut hooks = Vec::new();
+        for flow in &self.facts.flows {
+            let into = &self.facts.function(flow.into).qualname;
+            let kind = self.catalog.entry_kind(into);
+            let slot = |name: &str| matches!(&flow.slot, Slot::Param(p) if p == name);
+            let is_route =
+                matches!(kind, Some("route" | "websocket")) && (flow.slot == Slot::Decorated || slot("endpoint"));
+            let is_dependency = kind == Some("dependency") && slot("dependency");
+            // Starlette routes neither validate nor serialize.
+            if !into.starts_with("fastapi.") || (!is_route && !is_dependency) {
+                continue;
+            }
+            let function = match flow.value {
+                Value::Function(f) => f,
+                // A class dependency: FastAPI fills the parameters of its `__init__`.
+                Value::Class(class) if is_dependency => {
+                    let Some(init) = Hierarchy::lookup(self.facts, class, "__init__") else { continue };
+                    init
+                }
+                _ => continue,
+            };
+            let none =
+                Signature { function, params: Vec::new(), annotation: Vec::new(), returned: Vec::new(), returns_unknown: false };
+            let signature = signatures.get(&function).copied().unwrap_or(&none);
+            let label = entry_label(kind.unwrap_or_default(), into, flow);
+            let mut add = |found: Vec<FnId>, what: &str| hooks.extend(found.into_iter().map(|h| (h, format!("{label} ({what})"))));
+            for value in &signature.params {
+                match value {
+                    Value::Class(class) => add(self.validation_hooks(*class), "request validation"),
+                    Value::Function(f) => add(vec![*f], "request validation"),
+                    Value::Param(..) => {}
+                }
+            }
+            if kind != Some("route") {
+                continue;
+            }
+            let declared = response_models.get(&(flow.caller, &flow.location));
+            let models = declared.map_or(&signature.annotation[..], |m| &m[..]);
+            // Without a response model, `jsonable_encoder` dumps whatever is returned.
+            let dumped = if models.is_empty() { &signature.returned[..] } else { models };
+            for &class in dumped {
+                add(self.serialization_hooks(class), "response serialization");
+            }
+            // Validating an instance of the model (or of a subclass) keeps it as is.
+            if self.facts.function(function).is_async && !signature.returns_unknown {
+                let validated = models.iter().filter(|&&m| !signature.returned.iter().any(|&r| self.inherits(r, m)));
+                for &class in validated {
+                    add(self.construction_hooks(class), "response validation");
+                }
+            }
+        }
+        hooks.retain(|(h, _)| self.facts.function(*h).analyzed);
+        hooks
+    }
+
     /// Whether decorating with `decorator` keeps calling the original on the loop: one of its
     /// wrappers calls the decorated parameter, or hands it to something other than an offload API
     /// (`asyncio.to_thread(func)` does not run it here). Undecorated library decorators count as
@@ -451,7 +565,8 @@ impl<'a> Graph<'a> {
         !self.facts.function(target).is_generator || self.facts.calls[call].iterates
     }
 
-    /// Loop code: every analyzed `async def`, plus sync callables scheduled on the loop.
+    /// Loop code: every analyzed `async def`, plus sync callables scheduled on the loop and
+    /// pydantic code FastAPI runs on the loop.
     fn roots(&self) -> Vec<FnId> {
         let mut roots: BTreeSet<FnId> = self
             .facts
@@ -472,6 +587,7 @@ impl<'a> Graph<'a> {
                 roots.insert(f);
             }
         }
+        roots.extend(self.hooks.iter().map(|(h, _)| *h));
         roots.into_iter().collect()
     }
 
@@ -575,6 +691,7 @@ impl<'a> Graph<'a> {
                 Value::Param(..) => {}
             }
         }
+        entries.extend(self.hooks.iter().cloned());
         let project_async = self
             .facts
             .functions
