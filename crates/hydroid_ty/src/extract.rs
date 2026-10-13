@@ -14,15 +14,15 @@ use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinition
 use ty_python_semantic::types::ide_support::{
     ResolvedDefinition, call_signature_details, static_member_type_for_attribute,
 };
-use ty_python_semantic::types::{Type, TypeDefinition};
+use ty_python_semantic::types::{SpecialFormType, Type, TypeDefinition};
 use ty_python_semantic::{
     HasType, ImportAliasResolution, SemanticModel, definitions_for_attribute, definitions_for_name,
 };
 
 use crate::db::HydroidDb;
 use crate::index::{
-    FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, class_method, class_qualname, describe, inherits, inherits_from,
-    instance_class, is_class_object,
+    FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, class_method, class_of, class_qualname, describe, inherits,
+    inherits_from, instance_class, is_class_object, is_class_variable,
     json_only, state_owner, yield_values, yields,
 };
 
@@ -302,7 +302,9 @@ fn is_project_instance(db: &HydroidDb, model: &SemanticModel<'_>, expr: &Expr) -
 }
 
 /// Whether an annotation declares instances of project classes, or a collection of them
-/// (`list[Attachment]`, `dict[str, Attachment] | None`).
+/// (`list[Attachment]`, `dict[str, Attachment] | None`), as ty resolves the annotation: unions
+/// declare what all their members do, stdlib collections what their elements are (the leading
+/// key type of a two-argument one, `dict[str, T]`, aside).
 fn declares_instances(db: &HydroidDb, model: &SemanticModel<'_>, annotation: &Expr) -> bool {
     match annotation {
         Expr::NoneLiteral(_) => true,
@@ -310,28 +312,47 @@ fn declares_instances(db: &HydroidDb, model: &SemanticModel<'_>, annotation: &Ex
             declares_instances(db, model, left) && declares_instances(db, model, right)
         }
         Expr::Subscript(subscript) => {
-            let container = match &*subscript.value {
-                Expr::Name(n) => n.id.as_str(),
-                Expr::Attribute(a) => a.attr.as_str(),
-                _ => return false,
-            };
             let elements = match &*subscript.slice {
                 Expr::Tuple(tuple) => &tuple.elts[..],
                 slice => std::slice::from_ref(slice),
             };
-            match container {
-                "list" | "List" | "set" | "Set" | "frozenset" | "FrozenSet" | "Sequence" | "Optional" | "Union" => {
-                    elements.iter().all(|e| declares_instances(db, model, e))
+            match generic_kind(db, model, &subscript.value) {
+                Some(Generic::Union) => elements.iter().all(|e| declares_instances(db, model, e)),
+                Some(Generic::Collection) => {
+                    let keyed = elements.len() == 2 && !elements[1].is_ellipsis_literal_expr();
+                    let mut values = elements.iter().skip(usize::from(keyed)).filter(|e| !e.is_ellipsis_literal_expr());
+                    let mut any = false;
+                    values.all(|e| {
+                        any = true;
+                        declares_instances(db, model, e)
+                    }) && any
                 }
-                "tuple" | "Tuple" => {
-                    elements.iter().all(|e| e.is_ellipsis_literal_expr() || declares_instances(db, model, e))
-                }
-                "dict" | "Dict" | "Mapping" => elements.last().is_some_and(|e| declares_instances(db, model, e)),
-                _ => false,
+                None => false,
             }
         }
         Expr::Name(_) | Expr::Attribute(_) => is_project_instance(db, model, annotation),
         _ => false,
+    }
+}
+
+/// What a subscripted annotation is generic over.
+enum Generic {
+    /// A union (`Union[A, B]`, `Optional[A]`).
+    Union,
+    /// A stdlib collection (`list[T]`, `typing.Dict[K, V]`, `Sequence[T]`, `tuple[T, ...]`).
+    Collection,
+}
+
+fn generic_kind(db: &HydroidDb, model: &SemanticModel<'_>, value: &Expr) -> Option<Generic> {
+    match value.inferred_type(model)? {
+        Type::SpecialForm(SpecialFormType::Union | SpecialFormType::Optional) => Some(Generic::Union),
+        Type::SpecialForm(SpecialFormType::LegacyStdlibAlias(_) | SpecialFormType::Tuple) => Some(Generic::Collection),
+        ty @ Type::ClassLiteral(_) => {
+            let class = class_of(model, ty)?;
+            let collection = class.0.path(db).is_vendored_path() && class_method(db, class, "__iter__").is_some();
+            collection.then_some(Generic::Collection)
+        }
+        _ => None,
     }
 }
 
@@ -2334,15 +2355,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
     fn model_field(&mut self, class: u32, field: &Stmt) {
         let Stmt::AnnAssign(ast::StmtAnnAssign { target, annotation, value, .. }) = field else { return };
         let Expr::Name(name) = &**target else { return };
-        let is_class_var = match &**annotation {
-            Expr::Subscript(s) => match &*s.value {
-                Expr::Name(n) => n.id == "ClassVar",
-                Expr::Attribute(a) => a.attr.as_str() == "ClassVar",
-                _ => false,
-            },
-            _ => false,
-        };
-        if self.index.origin != Origin::Project || is_class_var || name.id.starts_with('_') {
+        if self.index.origin != Origin::Project || is_class_variable(self.model, target) || name.id.starts_with('_') {
             return;
         }
         let mut field = RawField { names: vec![name.id.to_string()], ..RawField::default() };

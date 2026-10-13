@@ -11,7 +11,7 @@ use ruff_source_file::LineIndex;
 use ruff_text_size::{Ranged, TextSize};
 use rustc_hash::FxHashMap;
 use ty_python_semantic::types::{Type, TypeDefinition};
-use ty_python_semantic::{HasType, SemanticModel};
+use ty_python_semantic::{HasType, SemanticModel, TypeQualifiers};
 
 use crate::db::HydroidDb;
 
@@ -355,8 +355,15 @@ fn resolve_base(model: &SemanticModel<'_>, base: &Expr) -> Option<Key> {
     class_of(model, base.inferred_type(model)?)
 }
 
+/// Whether the name an annotated assignment in a class body declares is a class variable
+/// (`ClassVar[...]`), as ty reads its type qualifiers.
+pub fn is_class_variable(model: &SemanticModel<'_>, target: &Expr) -> bool {
+    let Expr::Name(name) = target else { return false };
+    model.type_qualifiers(ast::ExprRef::Name(name)).contains(TypeQualifiers::CLASS_VAR)
+}
+
 /// The class a class object or an instance type is defined by.
-fn class_of<'db>(model: &SemanticModel<'db>, ty: Type<'db>) -> Option<Key> {
+pub fn class_of<'db>(model: &SemanticModel<'db>, ty: Type<'db>) -> Option<Key> {
     let db = model.db();
     let def = match ty.definition(db, &model.program_environment())? {
         TypeDefinition::StaticClass(def) | TypeDefinition::DynamicClass(def) => def,
@@ -983,9 +990,8 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     self.index.class_attributes.push(name.id.to_string());
                     self.relationship(name, value.as_deref().expect("a call value"));
                 }
-                // Pydantic neither validates nor dumps class variables and private attributes.
-                let is_class_var = matches!(&**annotation, Expr::Subscript(s) if matches!(&*s.value,
-                    Expr::Name(n) if n.id == "ClassVar") || matches!(&*s.value, Expr::Attribute(a) if a.attr.as_str() == "ClassVar"));
+                // Models neither validate nor dump class variables and private attributes.
+                let is_class_var = is_class_variable(self.model, target);
                 let is_private = target.as_name_expr().is_some_and(|n| n.id.starts_with('_'));
                 if self.index.origin == Origin::Project && !is_class_var && !is_private {
                     let mut fields = Vec::new();
