@@ -131,7 +131,8 @@ drop it and the upload step to fail the build instead.
    callee blocks. Pydantic code FastAPI runs on the loop is loop code too: validators of request
    parameters and bodies (of `def` endpoints and dependencies as well: only their bodies go to
    the threadpool), computed fields and serializers of the response, and response-model
-   validators of `async def` endpoints. Offload APIs cut the graph; callbacks are attributed to the call site passing
+   validators of `async def` endpoints, and the `render`/`__init__` of a `response_class=` (or
+   `default_response_class=`) FastAPI constructs after every endpoint. Offload APIs cut the graph; callbacks are attributed to the call site passing
    them; overrides are found by class-hierarchy analysis (test doubles only stand in for real
    classes in test code); calling a generator function runs nothing until the generator is
    iterated; a decorated function is reached through its decorator's wrappers only when they call

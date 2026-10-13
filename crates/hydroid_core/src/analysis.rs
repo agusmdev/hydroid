@@ -469,11 +469,12 @@ impl<'a> Graph<'a> {
         false
     }
 
-    /// Pydantic code FastAPI runs on the loop around endpoints and dependencies, with what runs
+    /// Pydantic (and response class) code FastAPI runs on the loop around endpoints and dependencies, with what runs
     /// it. `solve_dependencies` validates the request parameters of every endpoint and
     /// dependency on the loop, sync ones included (only their bodies go to the threadpool).
     /// `serialize_response` validates the return value against the response model on the loop
     /// for `async def` endpoints only, then dumps it on the loop for every endpoint.
+    /// The response class is constructed on the loop for every endpoint.
     fn framework_hooks(&self) -> Vec<(FnId, String)> {
         let signatures: HashMap<FnId, &Signature> = self.facts.signatures.iter().map(|s| (s.function, s)).collect();
         let mut response_models: HashMap<(FnId, &Location), Vec<ClassId>> = HashMap::default();
@@ -489,6 +490,22 @@ impl<'a> Graph<'a> {
             let into = &self.facts.function(flow.into).qualname;
             let kind = self.catalog.entry_kind(into);
             let slot = |name: &str| matches!(&flow.slot, Slot::Param(p) if p == name);
+            // `response_class=` on a route (or `default_response_class=` on the app, a router or
+            // `include_router`): `get_request_handler` constructs it on the loop after the
+            // endpoint returns, sync endpoints included, and Starlette's `Response.__init__`
+            // calls `render` and `init_headers` synchronously.
+            if let Value::Class(class) = flow.value
+                && into.starts_with("fastapi.")
+                && (slot("response_class") || slot("default_response_class"))
+            {
+                let label = match kind {
+                    Some(kind @ "route") => entry_label(kind, into, flow),
+                    _ => "default response class".to_string(),
+                };
+                let methods = ["__init__", "render", "init_headers"].map(|m| Hierarchy::lookup(self.facts, class, m));
+                hooks.extend(methods.into_iter().flatten().map(|h| (h, format!("{label} (response rendering)"))));
+                continue;
+            }
             let is_route =
                 matches!(kind, Some("route" | "websocket")) && (flow.slot == Slot::Decorated || slot("endpoint"));
             let is_dependency = kind == Some("dependency") && slot("dependency");
