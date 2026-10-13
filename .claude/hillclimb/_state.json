@@ -194,6 +194,13 @@
           23240
         ]
       }
+    },
+    {
+      "round": 6,
+      "lever": "protocol",
+      "protocol": "holdout batch 3 sealed: new holdout cases promoted by the self-improve loop from round 6 on (batches 1-2 were unsealed into train in rounds 3-4). Baseline scored at bff7a46, before any round-6 fix; gate.py ratchets holdout recall against this entry, not round 2's batch-1 score.",
+      "holdout_recall": "0/1",
+      "holdout_fp": 0
     }
   ],
   "ground_truth": "scripts/hillclimb/oracle_runtime.py via check.py: a case is promoted only when the runtime proves every line where hydroid disagrees (verdict BREAKS), or with a reviewer's note"
