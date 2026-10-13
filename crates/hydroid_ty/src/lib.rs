@@ -14,7 +14,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use hydroid_core::catalog::qualname_matches;
 use hydroid_core::facts::{
-    Call, Class, ClassId, Facts, FnId, Flow, Function, Level, LogUse, Origin, Signature, Slot, Store, Value,
+    Call, Class, ClassId, Facts, FnId, Flow, Function, Level, LogUse, ModelField, Origin, ResponseOptions, Signature, Slot,
+    Store, Value,
 };
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -541,6 +542,7 @@ impl<'a> Merger<'a> {
             is_generator: entry.is_generator,
             is_validator: entry.is_validator,
             is_serializer: entry.is_serializer,
+            serializes: entry.serializes.clone(),
             validates: entry.validates.clone(),
             params: entry.params.clone(),
             parent: None,
@@ -571,6 +573,7 @@ impl<'a> Merger<'a> {
             methods: Vec::new(),
             fields: Vec::new(),
             default_factories: Vec::new(),
+            model_fields: Vec::new(),
         });
         let bases = self.indexes.bases(key).into_iter().filter_map(|b| self.class_id(b)).collect();
         let methods = entry
@@ -633,6 +636,8 @@ impl<'a> Merger<'a> {
                 returned_by,
                 sets,
                 given: raw.given,
+                unpacks: raw.unpacks,
+                instances: raw.instances,
                 level,
                 receiver,
                 super_name: raw.super_name,
@@ -658,8 +663,8 @@ impl<'a> Merger<'a> {
             let params = raw.params.into_iter().filter_map(|v| self.value(file, v)).collect();
             let annotation = raw.annotation.into_iter().filter_map(|k| self.class_id(k)).collect();
             let returned = raw.returned.into_iter().filter_map(|k| self.class_id(k)).collect();
-            let returns_unknown = raw.returns_unknown;
-            self.facts.signatures.push(Signature { function, params, annotation, returned, returns_unknown });
+            let (returns_unknown, returns_response) = (raw.returns_unknown, raw.returns_response);
+            self.facts.signatures.push(Signature { function, params, annotation, returned, returns_unknown, returns_response });
         }
         for raw in file_facts.stores {
             let Some(class) = self.class_id(raw.class) else { continue };
@@ -669,6 +674,25 @@ impl<'a> Merger<'a> {
         for (class, names, value) in file_facts.default_factories {
             let (Some(class), Some(value)) = (self.class_id((file, class)), self.value(file, value)) else { continue };
             self.facts.classes[class.0 as usize].default_factories.push((names, value));
+        }
+        for (class, raw) in file_facts.model_fields {
+            let Some(class) = self.class_id((file, class)) else { continue };
+            let functions = |this: &mut Self, values: Vec<RawValue>| -> Vec<FnId> {
+                values.into_iter().filter_map(|v| match this.value(file, v) {
+                    Some(Value::Function(f)) => Some(f),
+                    _ => None,
+                }).collect()
+            };
+            let classes = raw.classes.into_iter().filter_map(|k| self.class_id(k)).collect();
+            let validators = functions(self, raw.validators);
+            let serializers = functions(self, raw.serializers);
+            let field = ModelField { names: raw.names, classes, validators, serializers };
+            self.facts.classes[class.0 as usize].model_fields.push(field);
+        }
+        for raw in file_facts.response_options {
+            let Some(caller) = self.fn_id((file, raw.caller)) else { continue };
+            let (location, no_model, exclude) = (raw.location, raw.no_model, raw.exclude);
+            self.facts.response_options.push(ResponseOptions { caller, location, no_model, exclude });
         }
         for raw in file_facts.flows {
             let (Some(caller), Some(into)) = (self.fn_id((file, raw.caller)), self.fn_id(raw.into)) else {

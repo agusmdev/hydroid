@@ -135,7 +135,10 @@ drop it and the upload step to fail the build instead.
    `request.state.x = ...` for `request.state.x`) when every store agrees on it, and
    `request.app` is the project's one `FastAPI` subclass, if it defines one. Signatures record
    what FastAPI validates and serializes: the models (and `AfterValidator`-style callables) in
-   parameter annotations, the return annotation, the classes returned. The facts of an unchanged project are reused from `.hydroid_cache/` (keyed by the
+   parameter annotations, the return annotation, the classes returned, whether every return
+   gives a `Response` (sent as is); model fields record their nested models and their
+   `Annotated` validators and serializers (through type aliases), which constructions giving
+   the field data and `model_dump()` calls run. The facts of an unchanged project are reused from `.hydroid_cache/` (keyed by the
    binary, the options, the installed packages and every source file's contents).
 2. **Analysis** (`crates/hydroid_core`, plain graph code): where code runs is a property of the
    call, so "does calling `f` block?" is computed once per function by a backwards BFS from

@@ -66,6 +66,9 @@ pub struct Function {
     /// A pydantic serialization hook (`@computed_field`, `@field_serializer`,
     /// `@model_serializer`): dumping its model runs it.
     pub is_serializer: bool,
+    /// The fields a serialization hook is for (`@field_serializer("a", "b")`, the name of a
+    /// `@computed_field`): excluding all of them from a dump skips it. Empty: any field.
+    pub serializes: Vec<String>,
     /// A SQLAlchemy attribute validator (`@validates("email")`): setting one of these attributes
     /// on an instance of its class (in the constructor, or `obj.email = ...`) runs it.
     pub validates: Vec<String>,
@@ -94,6 +97,24 @@ pub struct Class {
     /// (dataclasses): constructing the class without giving the field calls the factory. Each is
     /// `(the names the field can be given by, the factory)`.
     pub default_factories: Vec<(Vec<String>, Value)>,
+    /// The class-level fields of a project class (pydantic model fields), see [`ModelField`].
+    pub model_fields: Vec<ModelField>,
+}
+
+/// A class-level field of a project class: `name: Annotated[list[Item], AfterValidator(f)]`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ModelField {
+    /// The names the field can be given by (its name and aliases).
+    pub names: Vec<String>,
+    /// Classes named in its annotation (looking through type aliases): data given to the field
+    /// is validated into these models.
+    pub classes: Vec<ClassId>,
+    /// Validators attached by `Annotated` metadata (`AfterValidator(f)`, ...): validating data
+    /// given to the field runs them.
+    pub validators: Vec<FnId>,
+    /// Serializers attached by `Annotated` metadata (`PlainSerializer(f)`, ...): dumping the
+    /// field runs them.
+    pub serializers: Vec<FnId>,
 }
 
 /// What FastAPI validates and serializes around a function when it is an endpoint or a
@@ -113,6 +134,20 @@ pub struct Signature {
     pub returned: Vec<ClassId>,
     /// Some value it returns has a type ty does not know (it may be a model instance).
     pub returns_unknown: bool,
+    /// Every value it returns is a Starlette `Response`, which FastAPI sends as is (no response
+    /// validation, serialization or `response_class`).
+    pub returns_response: bool,
+}
+
+/// Response options of a route registration (`@app.get(..., response_model=None)`) at a call.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResponseOptions {
+    pub caller: FnId,
+    pub location: Location,
+    /// `response_model=None`: no response model, not even the return annotation.
+    pub no_model: bool,
+    /// `response_model_exclude={"a", "b"}`: the top-level fields left out of the response.
+    pub exclude: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -153,6 +188,11 @@ pub struct Call {
     /// for these fields do not run, and sinks skip their blocking work for some (catalog
     /// `unless_given`). `None` when that is not known (positional arguments).
     pub given: Option<Vec<String>>,
+    /// The call passes `**mapping`: any keyword may be given.
+    pub unpacks: bool,
+    /// Keyword arguments given model instances (or nothing to validate, like `[]`): pydantic
+    /// does not validate them into nested models again.
+    pub instances: Vec<String>,
     /// Why nothing was resolved (only set when `targets` is empty and `param` is `None`).
     pub unresolved: Option<String>,
     /// The logging level the call passes: its `level=` keyword, or the first argument of
@@ -244,6 +284,8 @@ pub struct Facts {
     pub dispatches: Vec<(FnId, FnId)>,
     /// Signatures of the functions that annotate or return classes, see [`Signature`].
     pub signatures: Vec<Signature>,
+    /// See [`ResponseOptions`].
+    pub response_options: Vec<ResponseOptions>,
     /// Lines carrying a `# hydroid: ignore` comment.
     pub suppressed: Vec<(String, u32)>,
     /// `logger.propagate = value` on a logger with a known name: `(name, value is False)`.

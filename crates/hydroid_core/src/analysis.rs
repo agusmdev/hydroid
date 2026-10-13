@@ -15,9 +15,18 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::catalog::Catalog;
 use crate::facts::{
-    Call, ClassId, Facts, FnId, Flow, FunctionKind, Location, LoggerName, Origin, Signature, Slot, Value,
+    Call, ClassId, Facts, FnId, Flow, FunctionKind, Location, LoggerName, Origin, ResponseOptions, Signature, Slot,
+    Value,
 };
 use crate::report::{Diagnostic, Frame, ReachedFrom, Report, Sink, Unresolved};
+
+/// Pydantic methods dumping a model.
+const DUMPS: &[&str] = &[
+    "pydantic.main.BaseModel.model_dump",
+    "pydantic.main.BaseModel.model_dump_json",
+    "pydantic.main.BaseModel.dict",
+    "pydantic.main.BaseModel.json",
+];
 
 pub fn analyze(facts: &Facts, catalog: &Catalog) -> Report {
     let graph = Graph::new(facts, catalog);
@@ -110,6 +119,8 @@ struct Graph<'a> {
     log_threshold: u32,
     /// See [`Graph::logger_stops`].
     log_stops: Vec<String>,
+    /// Memoized [`Graph::validation_hooks`].
+    validated: RefCell<HashMap<ClassId, Rc<[FnId]>>>,
 }
 
 type ParamKey = (FnId, String);
@@ -161,6 +172,7 @@ impl<'a> Graph<'a> {
             log_dispatch: Vec::new(),
             log_threshold: 0,
             log_stops: Vec::new(),
+            validated: RefCell::default(),
         };
         let used_from_calls = facts.calls.iter().filter_map(|c| c.param.clone());
         let used_from_flows: Vec<ParamKey> = facts
@@ -401,6 +413,15 @@ impl<'a> Graph<'a> {
             if let Some(given) = &call.given {
                 out.extend(self.default_factories(class, given));
             }
+            let given = if call.unpacks { None } else { call.given.as_deref() };
+            out.extend(self.field_hooks(class, given, &call.instances));
+        }
+        // `model.model_dump()` runs the serialization hooks of the model.
+        if let Some(class) = call.receiver
+            && call.super_name.is_none()
+            && call.targets.iter().any(|t| DUMPS.contains(&self.facts.function(*t).qualname.as_str()))
+        {
+            out.extend(self.serialization_hooks(class, &[]));
         }
         if let Some((class, names)) = &call.sets {
             out.extend(self.attribute_hooks(*class, names));
@@ -542,31 +563,92 @@ impl<'a> Graph<'a> {
         hooks
     }
 
-    /// What validating `class` from request data runs: its construction hooks and default
-    /// factories (the request may leave those fields out), and those of the models nested in its
-    /// fields.
-    fn validation_hooks(&self, class: ClassId) -> Vec<FnId> {
+    /// `class` and its bases, transitively.
+    fn ancestors(&self, class: ClassId) -> Vec<ClassId> {
+        let mut seen = HashSet::from_iter([class]);
+        let mut queue = VecDeque::from([class]);
+        let mut out = Vec::new();
+        while let Some(c) = queue.pop_front() {
+            out.push(c);
+            queue.extend(self.facts.class(c).bases.iter().filter(|b| seen.insert(**b)));
+        }
+        out
+    }
+
+    /// What constructing `class` runs for the fields it is given (`None`: any field): their
+    /// `Annotated` validators, and the validation of the data given into the models nested in
+    /// them, unless they are given model instances (`instances`), which pydantic keeps as is.
+    fn field_hooks(&self, class: ClassId, given: Option<&[String]>, instances: &[String]) -> Vec<FnId> {
+        let mut hooks = Vec::new();
+        for c in self.ancestors(class) {
+            for field in &self.facts.class(c).model_fields {
+                if given.is_some_and(|g| !field.names.iter().any(|n| g.contains(n))) {
+                    continue;
+                }
+                hooks.extend(&field.validators);
+                if !field.names.iter().any(|n| instances.contains(n)) {
+                    for &nested in &field.classes {
+                        hooks.extend(self.validation_hooks(nested).iter());
+                    }
+                }
+            }
+        }
+        hooks
+    }
+
+    /// What validating `class` from data runs: its construction hooks and default factories
+    /// (the data may leave those fields out), the `Annotated` validators of its fields, and those
+    /// of the models nested in its fields.
+    fn validation_hooks(&self, class: ClassId) -> Rc<[FnId]> {
+        if let Some(hooks) = self.validated.borrow().get(&class) {
+            return hooks.clone();
+        }
         let mut hooks = Vec::new();
         let mut seen = HashSet::from_iter([class]);
         let mut queue = VecDeque::from([class]);
         while let Some(c) = queue.pop_front() {
             hooks.extend(self.construction_hooks(c));
             hooks.extend(self.default_factories(c, &[]));
-            queue.extend(self.facts.class(c).fields.iter().filter(|f| seen.insert(**f)));
+            for a in self.ancestors(c) {
+                let cls = self.facts.class(a);
+                hooks.extend(cls.model_fields.iter().flat_map(|f| &f.validators));
+                let nested = cls.fields.iter().chain(cls.model_fields.iter().flat_map(|f| &f.classes));
+                queue.extend(nested.filter(|f| seen.insert(**f)));
+            }
         }
+        hooks.sort_unstable();
+        hooks.dedup();
+        let hooks: Rc<[FnId]> = hooks.into();
+        self.validated.borrow_mut().insert(class, hooks.clone());
         hooks
     }
 
     /// What dumping an instance of `class` runs: serialization hooks of the class, its bases and
-    /// the models nested in its fields.
-    fn serialization_hooks(&self, class: ClassId) -> Vec<FnId> {
+    /// the models nested in its fields, and the `Annotated` serializers of their fields. Fields
+    /// of `class` named in `exclude` are not dumped.
+    fn serialization_hooks(&self, class: ClassId, exclude: &[String]) -> Vec<FnId> {
         let mut hooks = Vec::new();
         let mut seen = HashSet::from_iter([class]);
-        let mut queue = VecDeque::from([class]);
-        while let Some(c) = queue.pop_front() {
-            let cls = self.facts.class(c);
-            hooks.extend(cls.methods.iter().map(|(_, m)| *m).filter(|m| self.facts.function(*m).is_serializer));
-            queue.extend(cls.bases.iter().chain(&cls.fields).filter(|b| seen.insert(**b)));
+        let mut queue = VecDeque::from([(class, exclude)]);
+        while let Some((c, exclude)) = queue.pop_front() {
+            for a in self.ancestors(c) {
+                let cls = self.facts.class(a);
+                let dumped = |m: &FnId| {
+                    let f = self.facts.function(*m);
+                    f.is_serializer && (f.serializes.is_empty() || !f.serializes.iter().all(|n| exclude.contains(n)))
+                };
+                hooks.extend(cls.methods.iter().map(|(_, m)| *m).filter(dumped));
+                let fields = cls.model_fields.iter().filter(|f| !exclude.contains(&f.names[0]));
+                let mut nested: Vec<ClassId> = Vec::new();
+                for field in fields {
+                    hooks.extend(&field.serializers);
+                    nested.extend(&field.classes);
+                }
+                if exclude.is_empty() {
+                    nested.extend(&cls.fields);
+                }
+                queue.extend(nested.into_iter().filter(|f| seen.insert(*f)).map(|f| (f, &[][..])));
+            }
         }
         hooks
     }
@@ -885,17 +967,28 @@ impl<'a> Graph<'a> {
     /// dependency on the loop, sync ones included (only their bodies go to the threadpool).
     /// `serialize_response` validates the return value against the response model on the loop
     /// for `async def` endpoints only, then dumps it on the loop for every endpoint.
-    /// The response class is constructed on the loop for every endpoint.
+    /// The response class is constructed on the loop for every endpoint. Endpoints returning
+    /// `Response` instances skip all three (`get_request_handler` sends them as is).
     fn framework_hooks(&self) -> Vec<(FnId, String)> {
         let signatures: HashMap<FnId, &Signature> = self.facts.signatures.iter().map(|s| (s.function, s)).collect();
         let mut response_models: HashMap<(FnId, &Location), Vec<ClassId>> = HashMap::default();
+        let mut endpoints: HashMap<(FnId, &Location), Vec<FnId>> = HashMap::default();
         for flow in &self.facts.flows {
             if let (Value::Class(class), Slot::Param(slot)) = (&flow.value, &flow.slot)
                 && slot == "response_model"
             {
                 response_models.entry((flow.caller, &flow.location)).or_default().push(*class);
             }
+            if let Value::Function(f) = flow.value
+                && (flow.slot == Slot::Decorated || matches!(&flow.slot, Slot::Param(p) if p == "endpoint"))
+                && self.catalog.entry_kind(&self.facts.function(flow.into).qualname) == Some("route")
+            {
+                endpoints.entry((flow.caller, &flow.location)).or_default().push(f);
+            }
         }
+        let options: HashMap<(FnId, &Location), &ResponseOptions> =
+            self.facts.response_options.iter().map(|o| ((o.caller, &o.location), o)).collect();
+        let returns_response = |f: &FnId| signatures.get(f).is_some_and(|s| s.returns_response);
         let mut hooks = Vec::new();
         for flow in &self.facts.flows {
             let into = &self.facts.function(flow.into).qualname;
@@ -909,6 +1002,11 @@ impl<'a> Graph<'a> {
                 && into.starts_with("fastapi.")
                 && (slot("response_class") || slot("default_response_class"))
             {
+                if slot("response_class")
+                    && endpoints.get(&(flow.caller, &flow.location)).is_some_and(|e| e.iter().all(returns_response))
+                {
+                    continue;
+                }
                 let label = match kind {
                     Some(kind @ "route") => entry_label(kind, into, flow),
                     _ => "default response class".to_string(),
@@ -950,32 +1048,39 @@ impl<'a> Graph<'a> {
                 _ => continue,
             };
             let none =
-                Signature { function, params: Vec::new(), annotation: Vec::new(), returned: Vec::new(), returns_unknown: false };
+                Signature { function, params: Vec::new(), annotation: Vec::new(), returned: Vec::new(), returns_unknown: false, returns_response: false };
             let signature = signatures.get(&function).copied().unwrap_or(&none);
             let label = entry_label(kind.unwrap_or_default(), into, flow);
             let mut add = |found: Vec<FnId>, what: &str| hooks.extend(found.into_iter().map(|h| (h, format!("{label} ({what})"))));
             for value in &signature.params {
                 match value {
-                    Value::Class(class) => add(self.validation_hooks(*class), "request validation"),
+                    Value::Class(class) => add(self.validation_hooks(*class).to_vec(), "request validation"),
                     Value::Function(f) => add(vec![*f], "request validation"),
                     Value::Param(..) => {}
                 }
             }
-            if kind != Some("route") {
+            if kind != Some("route") || signature.returns_response {
                 continue;
             }
-            let declared = response_models.get(&(flow.caller, &flow.location));
-            let models = declared.map_or(&signature.annotation[..], |m| &m[..]);
-            // Without a response model, `jsonable_encoder` dumps whatever is returned.
-            let dumped = if models.is_empty() { &signature.returned[..] } else { models };
+            let options = options.get(&(flow.caller, &flow.location));
+            // `response_model=None` leaves the route without a response model.
+            let models = match response_models.get(&(flow.caller, &flow.location)) {
+                Some(models) => &models[..],
+                None if options.is_some_and(|o| o.no_model) => &[],
+                None => &signature.annotation[..],
+            };
+            // Without a response model, `jsonable_encoder` dumps whatever is returned (and
+            // ignores `response_model_exclude`).
+            let exclude = options.map_or(&[][..], |o| &o.exclude[..]);
+            let (dumped, exclude) = if models.is_empty() { (&signature.returned[..], &[][..]) } else { (models, exclude) };
             for &class in dumped {
-                add(self.serialization_hooks(class), "response serialization");
+                add(self.serialization_hooks(class, exclude), "response serialization");
             }
             // Validating an instance of the model (or of a subclass) keeps it as is.
             if self.facts.function(function).is_async && !signature.returns_unknown {
                 let validated = models.iter().filter(|&&m| !signature.returned.iter().any(|&r| self.inherits(r, m)));
                 for &class in validated {
-                    add(self.construction_hooks(class), "response validation");
+                    add(self.validation_hooks(class).to_vec(), "response validation");
                 }
             }
         }

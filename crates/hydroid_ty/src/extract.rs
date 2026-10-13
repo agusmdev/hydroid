@@ -18,7 +18,7 @@ use ty_python_semantic::{
 
 use crate::db::HydroidDb;
 use crate::index::{
-    FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, describe, instance_class, is_class_object,
+    FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, describe, inherits_from, instance_class, is_class_object,
     state_owner, yield_values, yields,
 };
 
@@ -46,6 +46,10 @@ pub struct RawCall {
     pub sets: Option<(Key, Vec<String>)>,
     /// See [`hydroid_core::facts::Call::given`].
     pub given: Option<Vec<String>>,
+    /// See [`hydroid_core::facts::Call::unpacks`].
+    pub unpacks: bool,
+    /// See [`hydroid_core::facts::Call::instances`].
+    pub instances: Vec<String>,
     /// See [`hydroid_core::facts::Call::level`]: `(value, receiver class of a `setLevel`)`.
     pub level: Option<(Option<u32>, Option<Key>)>,
     /// See [`hydroid_core::facts::Call::receiver`].
@@ -129,6 +133,24 @@ pub struct RawSignature {
     pub annotation: Vec<Key>,
     pub returned: Vec<Key>,
     pub returns_unknown: bool,
+    pub returns_response: bool,
+}
+
+/// See [`hydroid_core::facts::ModelField`].
+#[derive(Default)]
+pub struct RawField {
+    pub names: Vec<String>,
+    pub classes: Vec<Key>,
+    pub validators: Vec<RawValue>,
+    pub serializers: Vec<RawValue>,
+}
+
+/// See [`hydroid_core::facts::ResponseOptions`].
+pub struct RawResponseOptions {
+    pub caller: u32,
+    pub location: Location,
+    pub no_model: bool,
+    pub exclude: Vec<String>,
 }
 
 pub struct FileFacts {
@@ -144,6 +166,9 @@ pub struct FileFacts {
     /// `(class defined in this file, names the field can be given by, factory)`, see
     /// [`hydroid_core::facts::Class::default_factories`].
     pub default_factories: Vec<(u32, Vec<String>, RawValue)>,
+    /// `(class defined in this file, field)`.
+    pub model_fields: Vec<(u32, RawField)>,
+    pub response_options: Vec<RawResponseOptions>,
     /// See [`hydroid_core::facts::Facts::stops_propagation`].
     pub stops_propagation: Vec<(String, bool)>,
 }
@@ -189,6 +214,8 @@ pub fn extract_file(
             dispatches: Vec::new(),
             decorators: Vec::new(),
             default_factories: Vec::new(),
+            model_fields: Vec::new(),
+            response_options: Vec::new(),
             stops_propagation: Vec::new(),
         },
     };
@@ -215,6 +242,9 @@ const LAZY: &[&str] = &["map", "filter", "zip", "enumerate", "reversed", "iter"]
 
 /// `Annotated` metadata attaching a validator callable to a field or parameter (pydantic).
 const VALIDATOR_METADATA: &[&str] = &["AfterValidator", "BeforeValidator", "PlainValidator", "WrapValidator"];
+
+/// `Annotated` metadata attaching a serializer callable to a field (pydantic).
+const SERIALIZER_METADATA: &[&str] = &["PlainSerializer", "WrapSerializer"];
 
 /// Parameter markers whose value FastAPI gets by calling a dependency, not from the request.
 const DEPENDENCY_MARKERS: &[&str] = &["Depends", "Security"];
@@ -648,6 +678,8 @@ impl<'db> Extractor<'_, 'db> {
             returned_by: Vec::new(),
             sets: None,
             given: None,
+            unpacks: false,
+            instances: Vec::new(),
             level: None,
             receiver: None,
             super_name: None,
@@ -937,6 +969,8 @@ impl<'db> Extractor<'_, 'db> {
                 returned_by: Vec::new(),
                 sets: None,
                 given: None,
+                unpacks: false,
+                instances: Vec::new(),
                 level: None,
                 receiver: None,
                 super_name: None,
@@ -1095,6 +1129,8 @@ impl<'db> Extractor<'_, 'db> {
             returned_by: Vec::new(),
             sets: None,
             given: None,
+            unpacks: false,
+            instances: Vec::new(),
             level: None,
             receiver: None,
             super_name: None,
@@ -1176,6 +1212,18 @@ impl<'db> Extractor<'_, 'db> {
         let given = (!validates && call.arguments.args.is_empty()).then(|| {
             call.arguments.keywords.iter().filter_map(|k| k.arg.as_ref().map(|a| a.to_string())).collect()
         });
+        let unpacks = call.arguments.keywords.iter().any(|k| k.arg.is_none());
+        let instances = if resolution.constructs.is_some() {
+            call.arguments
+                .keywords
+                .iter()
+                .filter(|k| self.holds_instances(&k.value))
+                .filter_map(|k| k.arg.as_ref().map(|a| a.to_string()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.response_options(call, &location);
         let level = self.level_argument(call);
         let logging = self.log_use(call, resolution.constructs.is_some());
         self.out.calls.push(RawCall {
@@ -1195,6 +1243,8 @@ impl<'db> Extractor<'_, 'db> {
             returned_by,
             sets,
             given,
+            unpacks,
+            instances,
             level,
             receiver,
             super_name,
@@ -1203,6 +1253,47 @@ impl<'db> Extractor<'_, 'db> {
     }
 
     /// See [`hydroid_core::facts::Call::logging`].
+    /// Whether a keyword argument of a construction holds nothing pydantic validates into a
+    /// nested model: an instance of a project class (`Attachment(...)`, a variable holding one),
+    /// `None`, or a literal collection of those (`[]`).
+    fn holds_instances(&self, value: &Expr) -> bool {
+        match value {
+            Expr::NoneLiteral(_) => true,
+            Expr::List(ast::ExprList { elts, .. })
+            | Expr::Tuple(ast::ExprTuple { elts, .. })
+            | Expr::Set(ast::ExprSet { elts, .. }) => elts.iter().all(|e| self.holds_instances(e)),
+            _ => {
+                instance_class(self.model, value).is_some_and(|(file, _)| describe(self.db, file).1 == Origin::Project)
+            }
+        }
+    }
+
+    /// `response_model=None` and `response_model_exclude={...}` (a literal set of field names, or
+    /// a dict mapping names to `True`) given to a call.
+    fn response_options(&mut self, call: &ast::ExprCall, location: &Location) {
+        let no_model = call.arguments.find_keyword("response_model").is_some_and(|k| k.value.is_none_literal_expr());
+        let mut exclude = Vec::new();
+        match call.arguments.find_keyword("response_model_exclude").map(|k| &k.value) {
+            Some(Expr::Set(set)) => {
+                exclude.extend(set.elts.iter().filter_map(|e| Some(e.as_string_literal_expr()?.value.to_str().to_string())));
+            }
+            Some(Expr::Dict(dict)) => {
+                for item in &dict.items {
+                    if matches!(item.value, Expr::BooleanLiteral(ast::ExprBooleanLiteral { value: true, .. }) | Expr::EllipsisLiteral(_))
+                        && let Some(Expr::StringLiteral(key)) = &item.key
+                    {
+                        exclude.push(key.value.to_str().to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        if no_model || !exclude.is_empty() {
+            let (caller, location) = (self.current, location.clone());
+            self.out.response_options.push(RawResponseOptions { caller, location, no_model, exclude });
+        }
+    }
+
     fn log_use(&self, call: &ast::ExprCall, constructs: bool) -> Option<(Option<LoggerName>, Option<Key>, bool)> {
         if constructs {
             return self.attach_only.contains(&call.start().to_u32()).then_some((None, None, true));
@@ -1440,6 +1531,7 @@ impl<'db> Extractor<'_, 'db> {
             }
         }
         let (mut annotation, mut returned, mut returns_unknown) = (Vec::new(), Vec::new(), false);
+        let mut returns_response = false;
         if !yields(&def.body) {
             if let Some(returns) = def.returns.as_deref() {
                 annotation_classes(self.model, returns, &mut annotation, &mut |_| {});
@@ -1452,10 +1544,32 @@ impl<'db> Extractor<'_, 'db> {
                 Some(ty) => matches!(ty, Type::Dynamic(_)),
                 None => true,
             });
+            returns_response = self.returns_response(&def.body);
         }
-        if !params.is_empty() || !annotation.is_empty() || !returned.is_empty() || returns_unknown {
-            self.out.signatures.push(RawSignature { function: key, params, annotation, returned, returns_unknown });
+        if !params.is_empty() || !annotation.is_empty() || !returned.is_empty() || returns_unknown || returns_response {
+            let signature = RawSignature { function: key, params, annotation, returned, returns_unknown, returns_response };
+            self.out.signatures.push(signature);
         }
+    }
+
+    /// Whether a function body always returns a Starlette `Response` (every `return` gives an
+    /// instance of one, and the body cannot end without returning).
+    fn returns_response(&self, body: &[Stmt]) -> bool {
+        let db = self.model.db();
+        let values = return_values(body);
+        !values.is_empty()
+            && ends_in_return(body)
+            && values.iter().all(|value| {
+                let types = match value.inferred_type(self.model) {
+                    Some(Type::Union(union)) => union.elements(db).to_vec(),
+                    Some(ty) => vec![ty],
+                    None => return false,
+                };
+                types.iter().all(|ty| {
+                    matches!(ty, Type::NominalInstance(_))
+                        && self.class_key(ty).is_some_and(|c| inherits_from(self.db, c, "starlette.responses.Response"))
+                })
+            })
     }
 
     /// Implicit SQLAlchemy work on an attribute of a mapped instance: `obj.email = ...` runs the
@@ -1499,6 +1613,8 @@ impl<'db> Extractor<'_, 'db> {
             returned_by: Vec::new(),
             sets,
             given: None,
+            unpacks: false,
+            instances: Vec::new(),
             level: None,
             receiver: None,
             super_name: None,
@@ -1764,6 +1880,121 @@ impl<'db> Extractor<'_, 'db> {
         self.out.default_factories.push((class, names, factory));
     }
 
+    /// `name: T = ...` in the body of a project `class` (not a class variable or a private
+    /// attribute, which pydantic neither validates nor dumps): see [`RawField`].
+    fn model_field(&mut self, class: u32, field: &Stmt) {
+        let Stmt::AnnAssign(ast::StmtAnnAssign { target, annotation, value, .. }) = field else { return };
+        let Expr::Name(name) = &**target else { return };
+        let is_class_var = match &**annotation {
+            Expr::Subscript(s) => match &*s.value {
+                Expr::Name(n) => n.id == "ClassVar",
+                Expr::Attribute(a) => a.attr.as_str() == "ClassVar",
+                _ => false,
+            },
+            _ => false,
+        };
+        if self.index.origin != Origin::Project || is_class_var || name.id.starts_with('_') {
+            return;
+        }
+        let mut field = RawField { names: vec![name.id.to_string()], ..RawField::default() };
+        if let Some(Expr::Call(call)) = value.as_deref() {
+            for alias in ["alias", "validation_alias"] {
+                if let Some(Expr::StringLiteral(alias)) = call.arguments.find_keyword(alias).map(|k| &k.value) {
+                    field.names.push(alias.value.to_str().to_string());
+                }
+            }
+        }
+        self.field_types(self.model, annotation, 3, &mut field);
+        field.classes.retain(|&c| c != (self.index.file, class));
+        if !field.classes.is_empty() || !field.validators.is_empty() || !field.serializers.is_empty() {
+            self.out.model_fields.push((class, field));
+        }
+    }
+
+    /// The classes a field annotation names and the validators and serializers its `Annotated`
+    /// metadata attaches, looking through type aliases (`Label = Annotated[str, ...]`, also in
+    /// other modules) up to `depth` levels.
+    fn field_types(&self, model: &SemanticModel<'db>, annotation: &Expr, depth: u8, out: &mut RawField) {
+        let db = self.model.db();
+        match annotation {
+            Expr::Name(_) | Expr::Attribute(_) => {
+                let found = out.classes.len();
+                annotation_classes(model, annotation, &mut out.classes, &mut |_| {});
+                if out.classes.len() > found || depth == 0 {
+                    return;
+                }
+                let definitions = match annotation {
+                    Expr::Name(name) => {
+                        definitions_for_name(model, &name.id, annotation.into(), ImportAliasResolution::ResolveAliases)
+                    }
+                    Expr::Attribute(attr) => definitions_for_attribute(model, attr),
+                    _ => Vec::new(),
+                };
+                for definition in definitions {
+                    let ResolvedDefinition::Definition(def) = definition else { continue };
+                    let file = def.file(db);
+                    if file.path(db).is_vendored_path() {
+                        continue;
+                    }
+                    let module = parsed_module(db, def.python_file(db)).load(db);
+                    let value = match def.kind(db) {
+                        DefinitionKind::TypeAlias(alias) => Some(&*alias.node(&module).value),
+                        kind => kind.value(&module),
+                    };
+                    let Some(value @ (Expr::Subscript(_) | Expr::Name(_) | Expr::Attribute(_) | Expr::BinOp(_))) = value
+                    else {
+                        continue;
+                    };
+                    let other = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, file));
+                    self.field_types(&other, value, depth - 1, out);
+                }
+            }
+            Expr::Subscript(subscript) => {
+                self.field_types(model, &subscript.value, depth, out);
+                self.field_types(model, &subscript.slice, depth, out);
+            }
+            Expr::Tuple(tuple) => {
+                for element in &tuple.elts {
+                    self.field_types(model, element, depth, out);
+                }
+            }
+            Expr::BinOp(binop) => {
+                self.field_types(model, &binop.left, depth, out);
+                self.field_types(model, &binop.right, depth, out);
+            }
+            Expr::Call(call) => {
+                let into = match called_name(call) {
+                    Some(name) if VALIDATOR_METADATA.contains(&name) => &mut out.validators,
+                    Some(name) if SERIALIZER_METADATA.contains(&name) => &mut out.serializers,
+                    _ => return,
+                };
+                let func = call.arguments.args.first().or_else(|| call.arguments.find_keyword("func").map(|k| &k.value));
+                if let Some(value @ RawValue::Function(_)) = func.and_then(|f| self.function_value(model, f)) {
+                    into.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The function an expression refers to, in the file of `model` (which may be another one).
+    fn function_value(&self, model: &SemanticModel<'db>, expr: &Expr) -> Option<RawValue> {
+        if model.python_file() == self.model.python_file() {
+            return self.value_of(expr);
+        }
+        let db = self.model.db();
+        if let Expr::Lambda(lambda) = expr {
+            return Some(RawValue::Function((model.python_file().file(db), lambda.start().to_u32())));
+        }
+        match expr.inferred_type(model)? {
+            ty @ (Type::FunctionLiteral(_) | Type::BoundMethod(_)) => match ty.definition(db, &model.program_environment())? {
+                TypeDefinition::Function(def) => self.function_key(def).map(RawValue::Function),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Whether a `try` body only asks for the running loop (`asyncio.get_running_loop()`, maybe
     /// assigned): the only exception it can raise is the `RuntimeError` of "no running loop".
     fn probes_running_loop(&self, body: &[Stmt]) -> bool {
@@ -1830,6 +2061,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
             Stmt::ClassDef(def) if self.recording() => {
                 for field in &def.body {
                     self.default_factory(def.name.start().to_u32(), field);
+                    self.model_field(def.name.start().to_u32(), field);
                 }
                 walk_stmt(self, stmt);
             }
@@ -1996,6 +2228,8 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                         returned_by: Vec::new(),
                         sets: None,
                         given: None,
+                        unpacks: false,
+                        instances: Vec::new(),
                         level: None,
                         receiver: None,
                         super_name: None,
@@ -2306,6 +2540,41 @@ fn find_function(module: &ast::ModModule, offset: u32) -> Option<&ast::StmtFunct
 }
 
 /// The values a function body returns (in its own scope).
+/// Whether a body cannot complete without a `return` (or `raise`), and has no bare `return`.
+fn ends_in_return(body: &[Stmt]) -> bool {
+    struct Bare(bool);
+    impl<'a> SourceOrderVisitor<'a> for Bare {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            match stmt {
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+                Stmt::Return(ast::StmtReturn { value: None, .. }) => self.0 = true,
+                _ => walk_stmt(self, stmt),
+            }
+        }
+        fn visit_expr(&mut self, _: &'a Expr) {}
+    }
+    fn ends(body: &[Stmt]) -> bool {
+        match body.last() {
+            Some(Stmt::Return(_) | Stmt::Raise(_)) => true,
+            Some(Stmt::If(stmt)) => {
+                ends(&stmt.body)
+                    && stmt.elif_else_clauses.last().is_some_and(|c| c.test.is_none())
+                    && stmt.elif_else_clauses.iter().all(|c| ends(&c.body))
+            }
+            Some(Stmt::With(stmt)) => ends(&stmt.body),
+            Some(Stmt::Try(stmt)) => {
+                (ends(&stmt.body) || ends(&stmt.orelse)) && stmt.handlers.iter().all(|h| match h {
+                    ast::ExceptHandler::ExceptHandler(h) => ends(&h.body),
+                })
+            }
+            _ => false,
+        }
+    }
+    let mut bare = Bare(false);
+    bare.visit_body(body);
+    !bare.0 && ends(body)
+}
+
 fn return_values(body: &[Stmt]) -> Vec<&Expr> {
     struct Returns<'a>(Vec<&'a Expr>);
     impl<'a> SourceOrderVisitor<'a> for Returns<'a> {

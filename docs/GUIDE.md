@@ -97,11 +97,12 @@ def get_user(user_id: int):
 | `lifespan`, startup/shutdown handlers (also `def` ones) | sync background tasks |
 | async background tasks | `asyncio.to_thread`, `run_in_threadpool`, `loop.run_in_executor`, `anyio.to_thread.run_sync` |
 | callbacks given to `loop.call_soon`, `call_later`, `add_done_callback` | `ThreadPoolExecutor.submit`, `threading.Thread(target=...)` |
-| pydantic validators of request parameters and bodies (also for `def` endpoints and dependencies) | |
-| `@computed_field`, `@field_serializer`, `@model_serializer` of the returned model (every endpoint) | |
-| validators of the `response_model` (or return annotation) of `async def` endpoints | validators of the `response_model` of `def` endpoints |
+| pydantic validators of request parameters and bodies (also for `def` endpoints and dependencies), nested models and `Annotated[T, AfterValidator(f)]` fields included | |
+| `@computed_field`, `@field_serializer`, `@model_serializer` and `Annotated[T, PlainSerializer(f)]` fields of the returned model (every endpoint; not the fields in a literal `response_model_exclude`) | |
+| validators of the `response_model` (or return annotation, unless `response_model=None`) of `async def` endpoints | validators of the `response_model` of `def` endpoints |
+| validators of the models nested in the fields a construction (`Model(items=[{...}])`) or `Model.model_validate(...)` gives data to, and serializers run by `model.model_dump()` / `model_dump_json()` | |
 | the constructor of a middleware class (`app.add_middleware(Cls, ...)`, `Middleware(Cls, ...)`), which Starlette calls when the first lifespan or request event builds the stack | |
-| `render`, `__init__`, `init_headers` of a `response_class=` / `default_response_class=` (every endpoint) | |
+| `render`, `__init__`, `init_headers` of a `response_class=` / `default_response_class=` (every endpoint) | the response validation, serialization and `response_class=` of endpoints that always return a `Response` instance, which FastAPI sends as is |
 | `filter`, `emit`, `format` of the project's logging filters, handlers and formatters, run by `logger.info(...)` and above on the logger they are attached to or below it (and rotating/watched file and socket handlers' I/O) | handlers attached to a `QueueListener` |
 
 Awaiting an API is never blocking: `await redis.asyncio.Redis().get(k)` is fine,
