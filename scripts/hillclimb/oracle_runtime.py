@@ -16,6 +16,18 @@ returns a `Stub` (the text "{}" that accepts any use), so the code after it keep
 lock is free, and a later release needs it taken).
 Locks, queues and other synchronization calls count only when case code makes them: libraries
 take their own guard locks for a moment all the time.
+
+Calls that cannot block are not recorded:
+- a call whose result is awaitable only built a coroutine: sync and async clients share method
+  definitions (`redis.commands.core`). A catalog method called on an object whose class has
+  `async def` methods is first probed, with every catalog call under it refused; it is recorded
+  only if it returns something else, or reaches a catalog call;
+- a socket operation on a non-blocking socket (timeout 0, as asyncio's transports use) returns or
+  fails at once;
+- a call giving an argument the catalog lists in `unless_given` skips the blocking work;
+- blocking that happens wholly inside library code, below a library coroutine the case awaits,
+  with no case frame under that coroutine, is the library's own (FastAPI reading the endpoint's
+  source on the first request): the case made no call that leads to it.
 Off the loop, sleeps return at once, and network connections and process starts fail at once: no
 case reaches the network or runs a command (multiprocessing pools still start Python workers).
 
@@ -97,37 +109,40 @@ class Recorder:
         elif case_after:
             at = case_after[0]  # a sync callback the loop (or a library coroutine) calls
         else:
-            before = [f for f in stack[:inner_async] if self.in_case(f.f_code)]
-            if not before:
-                return None
-            at = before[-1]
+            # No case code under the innermost coroutine: the call is the library's own work (case
+            # frames above it only await the library), or no case code is on the stack at all.
+            return None
         innermost_case = next(f for f in reversed(stack) if self.in_case(f.f_code))
         return self.rel(at.f_code), at.f_lineno, innermost_case is at
 
     def depth(self) -> int:
         return getattr(self.local, "depth", 0)
 
-    def record(self, name: str, category: str, direct_only: bool, caller: types.FrameType | None,
-               case_caller_only: bool = False) -> bool:
-        """Records a blocking call if it runs on the loop with case code on the stack. Returns
-        whether it was recorded (the caller then applies the on-loop policy)."""
+    def probing(self) -> bool:
+        return getattr(self.local, "probing", False)
+
+    def locate(self, name: str, category: str, direct_only: bool, caller: types.FrameType | None,
+               case_caller_only: bool = False) -> tuple[str, int, str] | None:
+        """Where a blocking call would be recorded: it runs on the loop with case code on the
+        stack. None when it does not count."""
         if self.depth() or not self.on_loop():
-            return False
+            return None
         while caller is not None and caller.f_code.co_filename == __file__:
             caller = caller.f_back  # the shims (WatchedLock.__enter__) are not callers
         if (category == "synchronization" or case_caller_only) and (caller is None or not self.in_case(caller.f_code)):
-            return False  # a library's own guard lock, or its in-memory file
+            return None  # a library's own guard lock, or its in-memory file
         loc = self.location(caller)
         if loc is None:
-            return False
+            return None
         path, line, direct = loc
         if direct_only and not direct:
-            return False
-        key = (path, line, name)
+            return None
+        return path, line, name
+
+    def record(self, key: tuple[str, int, str], category: str) -> None:
         if key not in self.seen:
             self.seen.add(key)
-            emit({"kind": "block", "path": path, "line": line, "name": name, "category": category})
-        return True
+            emit({"kind": "block", "path": key[0], "line": key[1], "name": key[2], "category": category})
 
 
 REC: Recorder  # set in main()
@@ -188,11 +203,37 @@ def stub(name: str):
     return Stub() if STUB_CALLS[name] <= 3 else Stub("")
 
 
-def make_wrapper(orig, name: str, category: str, direct_only: bool, case_caller_only: bool = False):
+class ProbeHit(BaseException):
+    """Raised by a catalog call made while a probe runs: the probed call would block. A
+    BaseException, so the library's `except Exception` does not swallow it."""
+
+
+ASYNC_CAPABLE: dict[type, bool] = {}
+
+
+def async_capable(obj) -> bool:
+    """Whether obj's class has `async def` methods: a method it shares with a sync class (a
+    command mixin) may only build a coroutine."""
+    cls = type(obj)
+    if cls not in ASYNC_CAPABLE:
+        ASYNC_CAPABLE[cls] = any(inspect.iscoroutinefunction(v) for k in cls.__mro__ for v in vars(k).values())
+    return ASYNC_CAPABLE[cls]
+
+
+def make_wrapper(orig, name: str, category: str, direct_only: bool, case_caller_only: bool = False,
+                 cannot_block=None):
+    """`cannot_block(args, kwargs)`: true when this call returns or fails at once."""
+    real_work = category == "file" or (category == "synchronization" and name.endswith((".acquire", ".__enter__")))
+    # Only a plain method can return an awaitable instead of doing its work: not a generator
+    # function, not a protocol dunder (`__init__`, `__enter__`), and not under the sleep and
+    # real-work policies, which never stub.
+    method = (inspect.isfunction(orig) and not inspect.isgeneratorfunction(orig)
+              and not name.rsplit(".", 1)[-1].startswith("__") and category != "sleep" and not real_work)
+
     def policy_on_loop(args, kwargs):
         if category == "sleep":
             return None
-        if category == "file" or (category == "synchronization" and name.endswith((".acquire", ".__enter__"))):
+        if real_work:
             # Files live in the temporary copy, and in a single request a lock is free: doing the
             # real work keeps the state right (a lock released later must have been taken).
             try:
@@ -201,14 +242,43 @@ def make_wrapper(orig, name: str, category: str, direct_only: bool, case_caller_
                 return stub(name)
         return stub(name)
 
+    def probe_call(args, kwargs):
+        """Runs the call with every catalog call under it refused: ("awaitable", result) when it
+        only built an awaitable (its I/O happens when that is awaited, in async code), ("ran",
+        result) when it finished without a catalog call, ("blocks", None) otherwise."""
+        REC.local.probing, REC.local.probe_hit = True, False
+        try:
+            result = orig(*args, **kwargs)
+        except (ProbeHit, Exception):  # noqa: BLE001  a refused catalog call, or a failure before its I/O
+            return "blocks", None
+        finally:
+            REC.local.probing = False
+        if REC.local.probe_hit:
+            return "blocks", None  # a refused catalog call (or case code) ran and the library went on
+        return ("awaitable" if inspect.isawaitable(result) else "ran"), result
+
     def wrapper(*args, **kwargs):
-        if REC.record(name, category, direct_only, sys._getframe(1), case_caller_only):
+        if REC.probing():
+            REC.local.probe_hit = True
+            raise ProbeHit(name)
+        idle = cannot_block is not None and cannot_block(args, kwargs)
+        key = None if idle else REC.locate(name, category, direct_only, sys._getframe(1), case_caller_only)
+        if key is not None:
             REC.local.depth = REC.depth() + 1
             try:
+                if inspect.iscoroutinefunction(orig):
+                    return orig(*args, **kwargs)
+                if method and args and async_capable(args[0]):
+                    outcome, result = probe_call(args, kwargs)
+                    if outcome == "awaitable":
+                        return result
+                    REC.record(key, category)
+                    return result if outcome == "ran" else policy_on_loop(args, kwargs)
+                REC.record(key, category)
                 return policy_on_loop(args, kwargs)
             finally:
                 REC.local.depth -= 1
-        if not REC.on_loop() or REC.depth():
+        if idle or not REC.on_loop() or REC.depth():
             if category == "sleep":
                 return None
             local = name == "_socket.socket.connect" and args[0].family == socket.AF_UNIX
@@ -276,6 +346,25 @@ def expand(pattern: str) -> list[tuple[str, object, str]]:
     return out
 
 
+def given_skips(func, names: list[str]):
+    """`unless_given`: a call giving one of these arguments (not None) skips the blocking work."""
+    if not names:
+        return None
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return lambda args, kwargs: any(kwargs.get(n) is not None for n in names)
+
+    def given(args, kwargs) -> bool:
+        try:
+            bound = sig.bind_partial(*args, **kwargs).arguments
+        except TypeError:
+            return False
+        return any(bound.get(n) is not None for n in names)
+
+    return given
+
+
 def patch_catalog(cpu: bool) -> list[str]:
     catalog = tomllib.loads(CATALOG.read_text())
     replaced: dict[int, object] = {}
@@ -300,7 +389,8 @@ def patch_catalog(cpu: bool) -> list[str]:
                 # Low-level file calls inside a library are its plumbing (multiprocessing writes a
                 # byte to a pipe); its real file work goes through `open`, which counts anywhere.
                 low_level = qual.startswith(("os.", "genericpath.", "posixpath."))
-                wrapper = make_wrapper(func, qual, category, bool(group.get("direct")), low_level)
+                wrapper = make_wrapper(func, qual, category, bool(group.get("direct")), low_level,
+                                       given_skips(func, group.get("unless_given", [])))
                 wrapper = kind(wrapper) if kind else wrapper
                 try:
                     setattr(owner, attr, wrapper)
@@ -335,10 +425,15 @@ def install_shims(case_dir: str) -> None:
     def from_case(depth: int = 2) -> bool:
         return sys._getframe(depth).f_code.co_filename.startswith(case_dir)
 
-    # socket.socket is a Python subclass of _socket.socket: its methods can be wrapped there.
+    # socket.socket is a Python subclass of _socket.socket: its methods can be wrapped there. On a
+    # non-blocking socket (timeout 0: asyncio's transports) they return or fail at once.
+    def nonblocking(args, kwargs) -> bool:
+        return isinstance(args[0], socket.socket) and args[0].gettimeout() == 0.0
+
     for meth in ("connect", "recv", "recv_into", "recvfrom", "send", "sendall", "sendto"):
         orig = getattr(socket.socket, meth)
-        setattr(socket.socket, meth, make_wrapper(orig, f"_socket.socket.{meth}", "network", False))
+        setattr(socket.socket, meth, make_wrapper(orig, f"_socket.socket.{meth}", "network", False,
+                                                  cannot_block=nonblocking))
 
     # queue.SimpleQueue is a C type: a subclass whose get is wrapped.
     import queue
@@ -452,6 +547,9 @@ def watch_lines(case_dir: str) -> dict[str, set[int]]:
     def on_line(code, line):
         if not code.co_filename.startswith(case_dir):
             return mon.DISABLE
+        if REC.probing():
+            REC.local.probe_hit = True  # case code under a probed call: not a coroutine builder
+            return None
         if asyncio._get_running_loop() is not None:
             lines.setdefault(code.co_filename[len(case_dir):].replace(os.sep, "/"), set()).add(line)
         return None
