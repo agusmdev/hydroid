@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use hydroid_core::catalog::qualname_matches;
-use hydroid_core::facts::{Call, Class, ClassId, Facts, FnId, Flow, Function, Origin, Signature, Slot, Store, Value};
+use hydroid_core::facts::{
+    Call, Class, ClassId, Facts, FnId, Flow, Function, Level, Origin, Signature, Slot, Store, Value,
+};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use ruff_db::files::{File, system_path_to_file};
@@ -605,6 +607,7 @@ impl<'a> Merger<'a> {
             let constructs = raw.constructs.and_then(|k| self.class_id(k));
             let attribute = raw.attribute.and_then(|(k, name)| Some((self.class_id(k)?, name)));
             let returned_by = raw.returned_by.into_iter().filter_map(|k| self.fn_id(k)).collect();
+            let level = raw.level.map(|(value, receiver)| Level { value, receiver: receiver.and_then(|k| self.class_id(k)) });
             self.facts.calls.push(Call {
                 caller,
                 location: raw.location,
@@ -624,6 +627,7 @@ impl<'a> Merger<'a> {
                 returned_by,
                 sets,
                 given: raw.given,
+                level,
             });
         }
         for (dispatcher, implementation) in file_facts.dispatches {

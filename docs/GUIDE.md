@@ -101,6 +101,7 @@ def get_user(user_id: int):
 | `@computed_field`, `@field_serializer`, `@model_serializer` of the returned model (every endpoint) | |
 | validators of the `response_model` (or return annotation) of `async def` endpoints | validators of the `response_model` of `def` endpoints |
 | `render`, `__init__`, `init_headers` of a `response_class=` / `default_response_class=` (every endpoint) | |
+| `filter`, `emit`, `format` of the project's logging filters, handlers and formatters, run by `logger.info(...)` and above (and rotating/watched file and socket handlers' I/O) | handlers attached to a `QueueListener` |
 
 Awaiting an API is never blocking: `await redis.asyncio.Redis().get(k)` is fine,
 `redis.Redis().get(k)` is reported.

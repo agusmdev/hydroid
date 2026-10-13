@@ -143,7 +143,12 @@ drop it and the upload step to fail the build instead.
    parameters and bodies (of `def` endpoints and dependencies as well: only their bodies go to
    the threadpool), computed fields and serializers of the response, and response-model
    validators of `async def` endpoints, and the `render`/`__init__` of a `response_class=` (or
-   `default_response_class=`) FastAPI constructs after every endpoint. Offload APIs cut the graph; callbacks are attributed to the call site passing
+   `default_response_class=`) FastAPI constructs after every endpoint. A logging call
+   (`logger.info(...)` and above; `debug` is below the levels applications run with) runs the
+   `filter`/`emit`/`format` overrides of the `logging.Filter`, `logging.Handler` and
+   `logging.Formatter` subclasses the project constructs, and the file and socket I/O of the
+   stdlib rotating, watched and socket handlers, when the record's level reaches the lowest
+   logger level the project sets (`WARNING` when it sets none) and the handler's level. Offload APIs cut the graph; callbacks are attributed to the call site passing
    them; overrides are found by class-hierarchy analysis (test doubles only stand in for real
    classes in test code); calling a generator function runs nothing until the generator is
    iterated; a decorated function is reached through its decorator's wrappers only when they call

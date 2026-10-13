@@ -46,6 +46,8 @@ pub struct RawCall {
     pub sets: Option<(Key, Vec<String>)>,
     /// See [`hydroid_core::facts::Call::given`].
     pub given: Option<Vec<String>>,
+    /// See [`hydroid_core::facts::Call::level`]: `(value, receiver class of a `setLevel`)`.
+    pub level: Option<(Option<u32>, Option<Key>)>,
 }
 
 /// What code can run implicitly, from the definitions indexed so far.
@@ -609,6 +611,7 @@ impl<'db> Extractor<'_, 'db> {
             returned_by: Vec::new(),
             sets: None,
             given: None,
+            level: None,
         });
     }
 
@@ -894,6 +897,7 @@ impl<'db> Extractor<'_, 'db> {
                 returned_by: Vec::new(),
                 sets: None,
                 given: None,
+                level: None,
             });
         }
     }
@@ -1048,6 +1052,7 @@ impl<'db> Extractor<'_, 'db> {
             returned_by: Vec::new(),
             sets: None,
             given: None,
+            level: None,
         });
     }
 
@@ -1124,6 +1129,7 @@ impl<'db> Extractor<'_, 'db> {
         let given = (!validates && call.arguments.args.is_empty()).then(|| {
             call.arguments.keywords.iter().filter_map(|k| k.arg.as_ref().map(|a| a.to_string())).collect()
         });
+        let level = self.level_argument(call);
         self.out.calls.push(RawCall {
             caller: self.current,
             location,
@@ -1141,7 +1147,50 @@ impl<'db> Extractor<'_, 'db> {
             returned_by,
             sets,
             given,
+            level,
         });
+    }
+
+    /// The logging level a call passes: its `level=` keyword, or the first argument of
+    /// `setLevel(...)` (with the class of the receiver), `log(...)` and `__init__(...)`. See
+    /// [`hydroid_core::facts::Call::level`].
+    fn level_argument(&self, call: &ast::ExprCall) -> Option<(Option<u32>, Option<Key>)> {
+        if let Some(keyword) = call.arguments.find_keyword("level") {
+            return Some((self.level_value(&keyword.value), None));
+        }
+        let Expr::Attribute(attr) = &*call.func else { return None };
+        let first = call.arguments.args.first().filter(|a| !a.is_starred_expr())?;
+        match attr.attr.as_str() {
+            "setLevel" => Some((self.level_value(first), self.receiver_class(&attr.value))),
+            // `super().__init__(logging.ERROR)` in a `logging.Handler` subclass.
+            "log" | "__init__" => Some((self.level_value(first), None)),
+            _ => None,
+        }
+    }
+
+    /// `logging.ERROR`, `ERROR`, `40`, `"ERROR"`, or a name ty knows the literal value of.
+    fn level_value(&self, expr: &Expr) -> Option<u32> {
+        let named = |name: &str| match name {
+            "NOTSET" => Some(0),
+            "DEBUG" => Some(10),
+            "INFO" => Some(20),
+            "WARN" | "WARNING" => Some(30),
+            "ERROR" => Some(40),
+            "FATAL" | "CRITICAL" => Some(50),
+            _ => None,
+        };
+        match expr {
+            Expr::StringLiteral(s) => named(s.value.to_str()),
+            Expr::NumberLiteral(n) => n.value.as_int().and_then(|i| i.as_u16()).map(u32::from),
+            Expr::Attribute(attr) if matches!(&*attr.value, Expr::Name(n) if n.id.as_str() == "logging") => {
+                named(attr.attr.as_str())
+            }
+            _ => {
+                let ty = expr.inferred_type(self.model)?;
+                let shown = ty.display(self.model.db(), &self.model.program_environment()).to_string();
+                shown.strip_prefix("Literal[")?.strip_suffix(']')?.parse().ok()
+            }
+        }
     }
 
     fn handle_decorators(&mut self, def: &ast::StmtFunctionDef) {
@@ -1270,6 +1319,7 @@ impl<'db> Extractor<'_, 'db> {
             returned_by: Vec::new(),
             sets,
             given: None,
+            level: None,
         });
     }
 
@@ -1683,6 +1733,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                         returned_by: Vec::new(),
                         sets: None,
                         given: None,
+                        level: None,
                     });
                 }
                 walk_expr(self, expr);

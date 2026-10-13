@@ -24,6 +24,9 @@ struct CatalogFile {
     /// Functions that only inspect the callables passed to them (`functools.wraps(func)`).
     #[serde(default)]
     inspects: Group,
+    /// Logging calls that run the attached filters and handlers on the calling thread.
+    #[serde(default)]
+    log_dispatch: Group,
     #[serde(default)]
     entry: Vec<EntryGroup>,
 }
@@ -139,6 +142,7 @@ pub struct Catalog {
     offload: Patterns<()>,
     loop_callbacks: Patterns<()>,
     inspectors: Patterns<()>,
+    log_dispatch: Patterns<()>,
     entries: Patterns<usize>,
     entry_kinds: Vec<String>,
 }
@@ -176,6 +180,9 @@ impl Catalog {
         }
         for name in &file.inspects.functions {
             self.inspectors.insert(name, ());
+        }
+        for name in &file.log_dispatch.functions {
+            self.log_dispatch.insert(name, ());
         }
         for group in file.entry {
             let index = self.entry_kinds.len();
@@ -218,6 +225,11 @@ impl Catalog {
         self.inspectors.get(qualname).is_some()
     }
 
+    /// Whether calling `qualname` runs the filters and handlers attached to the loggers.
+    pub fn is_log_dispatch(&self, qualname: &str) -> bool {
+        self.log_dispatch.get(qualname).is_some()
+    }
+
     /// The entry-point kind registered by passing a callable to `qualname`.
     pub fn entry_kind(&self, qualname: &str) -> Option<&str> {
         self.entries.get(qualname).map(|&i| self.entry_kinds[i].as_str())
@@ -232,6 +244,7 @@ impl Catalog {
             .chain(self.offload.all())
             .chain(self.loop_callbacks.all())
             .chain(self.inspectors.all())
+            .chain(self.log_dispatch.all())
             .chain(self.entries.all())
             .collect();
         names.sort();

@@ -148,6 +148,17 @@ pub struct Call {
     pub given: Option<Vec<String>>,
     /// Why nothing was resolved (only set when `targets` is empty and `param` is `None`).
     pub unresolved: Option<String>,
+    /// The logging level the call passes: its `level=` keyword, or the first argument of
+    /// `setLevel(...)` and `log(...)`.
+    pub level: Option<Level>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Level {
+    /// `None`: not a known level (a variable, a setting).
+    pub value: Option<u32>,
+    /// `obj.setLevel(...)` on an instance of this class.
+    pub receiver: Option<ClassId>,
 }
 
 /// `self.name = value` in a method of `class`, with a callable (or a parameter) as the value.

@@ -181,6 +181,23 @@ functions = [
     "shutil._RmtreeType.__call__",
 ]
 
+# Stdlib handlers doing I/O in `emit`, which a logging call runs on the calling thread (see
+# `[log_dispatch]`). Typeshed declares no `emit` on them: these are the methods their `emit`
+# calls on every record.
+[[sink]]
+category = "file"
+advice = "log through a `logging.handlers.QueueHandler` and attach the handler to a `QueueListener`, which emits from its own thread"
+functions = [
+    "logging.handlers.RotatingFileHandler.shouldRollover",
+    "logging.handlers.TimedRotatingFileHandler.shouldRollover",
+    "logging.handlers.WatchedFileHandler.reopenIfNeeded",
+]
+
+[[sink]]
+category = "network"
+advice = "log through a `logging.handlers.QueueHandler` and attach the handler to a `QueueListener`, which emits from its own thread"
+functions = ["logging.handlers.SocketHandler.send"]
+
 [[sink]]
 category = "subprocess"
 advice = "use `asyncio.create_subprocess_exec` or `await asyncio.to_thread(...)`"
@@ -369,6 +386,39 @@ functions = [
     "concurrent.futures._base.Executor.map",
     "threading.Thread.__init__",
     "multiprocessing.process.BaseProcess.__init__",
+]
+
+# ---------------------------------------------------------------------------------------------
+# Logging calls that hand the record to the filters and handlers attached to the loggers, on the
+# calling thread (`Logger._log -> handle -> callHandlers -> Handler.handle -> filter / emit`).
+# The `filter`, `emit` and `format` overrides of the project's `logging.Filter`,
+# `logging.Handler` and `logging.Formatter` subclasses (and the I/O of the stdlib handlers above)
+# run there, for records at or above the logger and handler levels the project sets. `debug` is
+# left out: below the levels applications run with, it returns before any filter or handler runs.
+# ---------------------------------------------------------------------------------------------
+[log_dispatch]
+functions = [
+    "logging.Logger.info",
+    "logging.Logger.warning",
+    "logging.Logger.warn",
+    "logging.Logger.error",
+    "logging.Logger.exception",
+    "logging.Logger.critical",
+    "logging.Logger.log",
+    "logging.LoggerAdapter.info",
+    "logging.LoggerAdapter.warning",
+    "logging.LoggerAdapter.warn",
+    "logging.LoggerAdapter.error",
+    "logging.LoggerAdapter.exception",
+    "logging.LoggerAdapter.critical",
+    "logging.LoggerAdapter.log",
+    "logging.info",
+    "logging.warning",
+    "logging.warn",
+    "logging.error",
+    "logging.exception",
+    "logging.critical",
+    "logging.log",
 ]
 
 # ---------------------------------------------------------------------------------------------
