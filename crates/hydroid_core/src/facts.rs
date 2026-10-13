@@ -195,7 +195,9 @@ pub struct Call {
     /// callables the class stores in that attribute (see [`Facts::stores`]).
     pub attribute: Option<(ClassId, String)>,
     /// The callee is the value returned by calling these functions (`get_loader()()`,
-    /// `nap = make_sleeper(); nap()`), see [`Facts::returns`].
+    /// `nap = make_sleeper(); nap()`), see [`Facts::returns`]. Recorded for resolved callees
+    /// too: a decorator applied by hand (`safe = retrying.wraps(fetch)`) returns a wrapper ty
+    /// types as the function it wraps.
     pub returned_by: Vec<FnId>,
     /// Attributes this call sets on an instance of the class: the keyword arguments of a
     /// construction, or the target of `obj.name = value`. Their ORM validators run (see

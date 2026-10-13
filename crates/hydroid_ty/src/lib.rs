@@ -138,6 +138,10 @@ pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
         // all in parallel first.
         let (referenced_files, classes) = referenced(&round);
         indexes.prebuild(&db, referenced_files, classes);
+        let overriding = indexes.method_classes(&round);
+        if !overriding.is_empty() {
+            indexes.prebuild(&db, FxHashSet::default(), overriding);
+        }
         timings.phase("referenced indexes");
         if std::mem::take(&mut first) {
             for &file in &files {
@@ -262,6 +266,26 @@ impl Indexes {
                 break;
             }
         }
+    }
+
+    /// The library classes defining the library methods `facts` call whose bases are not
+    /// resolved yet: a method overriding a blocking method of a base blocks like it.
+    fn method_classes(&self, facts: &[FileFacts]) -> FxHashSet<Key> {
+        let map = self.0.lock();
+        let resolved = self.1.lock();
+        let mut classes = FxHashSet::default();
+        for (file, offset) in facts.iter().flat_map(|f| f.calls.iter().flat_map(|c| c.targets.iter().map(|(k, _)| *k))) {
+            let Some(index) = map.get(&file) else { continue };
+            if index.origin != Origin::Library {
+                continue;
+            }
+            if let Some(class) = index.functions.get(&offset).and_then(|f| f.class)
+                && !resolved.contains_key(&(file, class))
+            {
+                classes.insert((file, class));
+            }
+        }
+        classes
     }
 
     /// What project files store on application and connection state: see [`AppState`].

@@ -367,8 +367,8 @@ fn class_of<'db>(model: &SemanticModel<'db>, ty: Type<'db>) -> Option<Key> {
     Some((range.file(), range.start().to_u32()))
 }
 
-/// The bases of the class whose name starts at `class.1` in `class.0`.
-pub fn class_bases(db: &HydroidDb, class: Key) -> Vec<Key> {
+/// The definition of the class whose name starts at `offset`.
+fn find_class(module: &ast::ModModule, offset: u32) -> Option<&ast::StmtClassDef> {
     struct Finder<'a> {
         offset: u32,
         found: Option<&'a ast::StmtClassDef>,
@@ -388,12 +388,39 @@ pub fn class_bases(db: &HydroidDb, class: Key) -> Vec<Key> {
         }
         fn visit_expr(&mut self, _: &'a Expr) {}
     }
+    let mut finder = Finder { offset, found: None };
+    finder.visit_body(&module.body);
+    finder.found
+}
+
+/// The bases of the class whose name starts at `class.1` in `class.0`.
+pub fn class_bases(db: &HydroidDb, class: Key) -> Vec<Key> {
     let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, class.0));
     let parsed = parsed_module(db, model.python_file()).load(db);
-    let mut finder = Finder { offset: class.1, found: None };
-    finder.visit_body(&parsed.syntax().body);
-    let Some(def) = finder.found else { return Vec::new() };
+    let Some(def) = find_class(parsed.syntax(), class.1) else { return Vec::new() };
     def.bases().iter().filter_map(|b| resolve_base(&model, b)).collect()
+}
+
+/// The method `name` an instance of `class` has: defined in the class or inherited (bases
+/// searched depth-first, which is the MRO without diamonds).
+pub fn class_method(db: &HydroidDb, class: Key, name: &str) -> Option<Key> {
+    let (mut stack, mut seen) = (vec![class], rustc_hash::FxHashSet::default());
+    while let Some(class) = stack.pop() {
+        if !seen.insert(class) || seen.len() > 32 {
+            continue;
+        }
+        let parsed = parsed_module(db, ty_python_semantic::Db::program_file(db, class.0).python_file(db)).load(db);
+        let def = find_class(parsed.syntax(), class.1)?;
+        let method = def.body.iter().find_map(|stmt| match stmt {
+            Stmt::FunctionDef(f) if f.name.as_str() == name => Some(f.name.start().to_u32()),
+            _ => None,
+        });
+        if let Some(method) = method {
+            return Some((class.0, method));
+        }
+        stack.extend(class_bases(db, class).into_iter().rev());
+    }
+    None
 }
 
 /// The class an expression's value is an instance of (`T | None`: `T`), if it is one class.

@@ -20,7 +20,7 @@ use ty_python_semantic::{
 
 use crate::db::HydroidDb;
 use crate::index::{
-    FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, class_qualname, describe, inherits_from, instance_class,
+    FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, class_method, class_qualname, describe, inherits_from, instance_class,
     is_class_object,
     json_only, state_owner, yield_values, yields,
 };
@@ -961,6 +961,9 @@ impl<'db> Extractor<'_, 'db> {
                 if let Some(class) = self.state_class(receiver, 0) {
                     return Some(class);
                 }
+                if let Some(class) = self.entered_class(receiver) {
+                    return Some(class);
+                }
                 if let Some(class) = self.dependency_classes(receiver).first() {
                     return Some(*class);
                 }
@@ -973,6 +976,60 @@ impl<'db> Extractor<'_, 'db> {
             }
             _ => None,
         }
+    }
+
+    /// The class of a `with ... as name` target ty leaves unknown because the context manager's
+    /// `__enter__` is unannotated (`with conn.cursor() as cur:` on a PyMySQL connection): the
+    /// context manager's own class, when that `__enter__` only ever returns `self`.
+    fn entered_class(&self, receiver: &Expr) -> Option<Key> {
+        let Expr::Name(name) = receiver else { return None };
+        let db = self.model.db();
+        let mut class = None;
+        for definition in definitions_for_name(self.model, &name.id, receiver.into(), ImportAliasResolution::ResolveAliases)
+        {
+            let ResolvedDefinition::Definition(def) = definition else { return None };
+            let DefinitionKind::WithItem(item) = def.kind(db) else { return None };
+            if def.file(db) != self.index.file || item.is_async() {
+                return None;
+            }
+            let module = parsed_module(db, def.python_file(db)).load(db);
+            if !matches!(item.target(&module), Expr::Name(_)) {
+                return None;
+            }
+            // The manager's class: its type, or what the function returning it returns.
+            let manager = item.context_expr(&module);
+            let found = match manager.inferred_type(self.model)? {
+                ty @ Type::NominalInstance(_) => self.class_key(&ty)?,
+                Type::Dynamic(_) => match self.returned_by(manager).as_slice() {
+                    [function] => match self.returned_classes(*function).as_slice() {
+                        [class] => *class,
+                        _ => return None,
+                    },
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            let enter = class_method(self.db, found, "__enter__")?;
+            if !self.returns_self(enter) || class.is_some_and(|c| c != found) {
+                return None;
+            }
+            class = Some(found);
+        }
+        class
+    }
+
+    /// Whether a method has no return annotation and every `return` gives back its receiver.
+    fn returns_self(&self, (file, offset): Key) -> bool {
+        let db = self.model.db();
+        let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, file));
+        let parsed = parsed_module(db, model.python_file()).load(db);
+        let Some(def) = find_function(parsed.syntax(), offset) else { return false };
+        let Some(receiver) = def.parameters.posonlyargs.iter().chain(&def.parameters.args).next() else { return false };
+        let values = return_values(&def.body);
+        def.returns.is_none()
+            && !def.is_async
+            && !values.is_empty()
+            && values.iter().all(|v| matches!(v, Expr::Name(n) if n.id == receiver.parameter.name.id))
     }
 
     /// The class of an object read back from application or connection state:
@@ -1412,8 +1469,8 @@ impl<'db> Extractor<'_, 'db> {
             self.builtin_call(name, call);
         }
         let attribute = if resolution.targets.is_empty() { self.attribute_slot(&call.func) } else { None };
-        let returned_by =
-            if resolution.targets.is_empty() && param.is_none() { self.returned_by(&call.func) } else { Vec::new() };
+        // Also when resolved: ty types `retrying.wraps(f)` as `f` itself, the call runs a wrapper.
+        let returned_by = if param.is_none() { self.returned_by(&call.func) } else { Vec::new() };
         let (receiver, super_name) = self.mro_receiver(&call.func, &resolution);
         let instance = self.instance(&call.func, &resolution);
         let unresolved =

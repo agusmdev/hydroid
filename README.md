@@ -174,7 +174,12 @@ drop it and the upload step to fail the build instead.
    a generator function runs nothing until the generator is iterated, and the elements of a
    generator expression or `map`/`filter` given to a `StreamingResponse` are computed in
    Starlette's threadpool; a decorated function is reached through its decorator's wrappers only when they call
-   it (not when they only hand it to an offload API, or to `functools.wraps`). Starting an event
+   it (not when they only hand it to an offload API, or to `functools.wraps`), and calling what
+   a blocking decorator returns when applied by hand (`safe = retrying.wraps(fetch); safe()`)
+   blocks like a decorated function. A sync library method overriding a catalog function of a
+   library base class (`sqlmodel`'s `Session.execute`) blocks like it, and the target of
+   `with conn.cursor() as cur:` is typed as the context manager's class when its unannotated
+   `__enter__` returns `self` (PyMySQL). Starting an event
    loop (`asyncio.run`) is only reported when loop code does it directly: sync bridges reaching
    it almost always check for a running loop first. Code in the `except RuntimeError:` of a `try`
    that only calls `asyncio.get_running_loop()` runs only when no loop is running: it is skipped.

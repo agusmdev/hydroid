@@ -388,10 +388,11 @@ advice = "use `tenacity.AsyncRetrying` / decorate the coroutine, whose waits use
 functions = ["tenacity.Retrying.__call__", "tenacity.BaseRetrying.__iter__"]
 
 # Calling a sync function decorated with these runs a retry loop that sleeps between attempts.
+# So does calling what they return when applied by hand (`safe = retrying.wraps(fetch)`).
 [[blocking_decorator]]
 category = "retry"
 advice = "decorate a coroutine instead (tenacity then waits with `asyncio.sleep`), or run the call with `await asyncio.to_thread(...)`"
-functions = ["tenacity.retry"]
+functions = ["tenacity.retry", "tenacity.BaseRetrying.wraps"]
 
 [[sink]]
 category = "cpu"

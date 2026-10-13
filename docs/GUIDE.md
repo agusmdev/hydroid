@@ -143,7 +143,7 @@ functions = [
     "acme.client.Client.*",       # `*` matches within one dotted segment
 ]
 
-[[tool.hydroid.blocking_decorator]]   # sync functions decorated with these block when called
+[[tool.hydroid.blocking_decorator]]   # sync functions decorated with these (or wrapped by hand) block when called
 category = "retry"
 advice = "decorate a coroutine instead"
 functions = ["mylib.retry.retrying"]

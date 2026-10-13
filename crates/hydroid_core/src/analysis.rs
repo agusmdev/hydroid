@@ -108,6 +108,9 @@ struct Graph<'a> {
     offload: Vec<bool>,
     /// Sinks that only count when called directly from loop code, by function.
     direct: Vec<bool>,
+    /// Blocking decorators (not sinks themselves), by function: calling the wrapper one returns
+    /// when applied by hand blocks (see [`Graph::blocks_here`]), applying it does not.
+    wrapper: Vec<bool>,
     /// Arguments that make a call to a sink not block (catalog `unless_given`), by function.
     unless_given: Vec<&'a [String]>,
     /// Parameters that are called, or handed to something other than an offload API or a
@@ -158,12 +161,18 @@ impl<'a> Graph<'a> {
             .functions
             .iter()
             .map(|f| {
-                catalog.sink(&f.qualname).or_else(|| {
-                    let decorators = f.decorators.iter().map(|d| &facts.function(*d).qualname);
-                    (!f.is_async).then(|| decorators.filter_map(|d| catalog.blocking_decorator(d)).next())?
-                })
+                catalog
+                    .sink(&f.qualname)
+                    .or_else(|| {
+                        let decorators = f.decorators.iter().map(|d| &facts.function(*d).qualname);
+                        (!f.is_async).then(|| decorators.filter_map(|d| catalog.blocking_decorator(d)).next())?
+                    })
+                    .or_else(|| inherited_sink(facts, catalog, f))
+                    .or_else(|| catalog.blocking_decorator(&f.qualname))
             })
             .collect();
+        let wrapper =
+            facts.functions.iter().map(|f| catalog.sink(&f.qualname).is_none() && catalog.blocking_decorator(&f.qualname).is_some()).collect();
         let offload = facts.functions.iter().map(|f| catalog.is_offload(&f.qualname)).collect();
         let direct = facts.functions.iter().map(|f| catalog.is_direct_sink(&f.qualname)).collect();
         let mut graph = Self {
@@ -175,6 +184,7 @@ impl<'a> Graph<'a> {
             called: HashSet::default(),
             offload,
             direct,
+            wrapper,
             unless_given: facts.functions.iter().map(|f| catalog.unless_given(&f.qualname)).collect(),
             used_params: HashSet::default(),
             hooks: Vec::new(),
@@ -448,7 +458,13 @@ impl<'a> Graph<'a> {
             out.extend(self.attribute_hooks(*class, names));
         }
         for f in &call.returned_by {
-            out.extend(returned.get(f).into_iter().flatten());
+            if call.targets.is_empty() {
+                out.extend(returned.get(f).into_iter().flatten());
+            }
+            // Calling what a blocking decorator applied by hand returns runs its wrapper.
+            if self.wrapper[f.0 as usize] {
+                out.push(*f);
+            }
         }
         // The method, when ty could not type the receiver; else a callable stored in an
         // attribute of the class or of one of its bases.
@@ -1262,6 +1278,9 @@ impl<'a> Graph<'a> {
     /// Whether the sink `target` blocks when called at `call`: calls giving one of its
     /// `unless_given` arguments, or not known to leave them out, skip the blocking work.
     fn blocks_here(&self, call: usize, target: FnId) -> bool {
+        if self.wrapper[target.0 as usize] {
+            return self.facts.calls[call].returned_by.contains(&target);
+        }
         let unless = self.unless_given[target.0 as usize];
         unless.is_empty() || self.facts.calls[call].given.as_ref().is_some_and(|g| !g.iter().any(|a| unless.contains(a)))
     }
@@ -1618,6 +1637,21 @@ impl EntryPaths<'_> {
             frames: steps.steps[..upto].iter().map(|&(_, call, target)| self.graph.frame(call, target)).collect(),
         }
     }
+}
+
+/// The sink a library method overrides: `sqlmodel`'s `Session.execute` overrides SQLAlchemy's
+/// `Session.execute` and delegates to it through `super()`. Library bodies are not analyzed (or,
+/// with `--follow-libs`, are, and need no help), and a sync override of a blocking method keeps
+/// its base's contract: it blocks like it.
+fn inherited_sink(facts: &Facts, catalog: &Catalog, f: &crate::facts::Function) -> Option<Sink> {
+    if f.origin != Origin::Library || f.analyzed || f.is_async || f.property.is_some() {
+        return None;
+    }
+    let class = facts.class(f.class?);
+    let name = f.qualname.rsplit('.').next()?;
+    let base = class.bases.iter().find_map(|&b| Hierarchy::lookup(facts, b, name))?;
+    let base = facts.function(base);
+    catalog.sink(&base.qualname).or_else(|| inherited_sink(facts, catalog, base))
 }
 
 /// Class hierarchy analysis: which methods may run for `obj.method()`.
