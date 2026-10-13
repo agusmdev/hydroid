@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use hydroid_core::catalog::qualname_matches;
+use hydroid_core::catalog::{Arguments, Catalog, qualname_matches};
 use hydroid_core::facts::{
     Call, Class, ClassId, Facts, FnId, Flow, Function, Instance, Level, LogUse, ModelField, Origin, ResponseOptions, Signature, Slot,
     Store, Value,
@@ -25,7 +25,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use ty_module_resolver::{ModuleName, resolve_module_confident};
 
 use crate::db::HydroidDb;
-use crate::extract::{AppState, FileFacts, Implicit, Instances, Orm, RawInstance, RawSlot, RawValue, extract_file};
+use crate::extract::{AppState, FileFacts, Implicit, Instances, Orm, RawInstance, RawSlot, RawValue, Shared, extract_file};
 use crate::index::{FileIndex, Key, class_bases};
 
 pub struct Extraction {
@@ -37,13 +37,14 @@ pub struct ExtractOptions<'a> {
     pub root: &'a Path,
     pub python: Option<&'a Path>,
     /// Also analyze the bodies of third-party functions reachable from project code, except
-    /// those for which `follow` returns `false` (catalog functions).
+    /// catalog sinks and offload APIs.
     pub follow_libs: bool,
-    pub follow: &'a (dyn Fn(&str) -> bool + Sync),
+    /// What extraction reads of the catalog: what library functions do with their arguments.
+    pub catalog: &'a Catalog,
     /// Gitignore-style globs, relative to `root`, of project files to skip.
     pub exclude: &'a [String],
     /// Reuse (and save) the facts of an unchanged project in `<root>/.hydroid_cache`.
-    /// `cache_salt` must capture everything else the extraction depends on (`follow`).
+    /// `cache_salt` must capture everything else the extraction depends on (the catalogs).
     pub cache: bool,
     pub cache_salt: &'a str,
 }
@@ -63,25 +64,40 @@ fn python_path(path: &Path) -> anyhow::Result<SystemPathBuf> {
 pub fn unknown_names(root: &Path, python: Option<&Path>, names: &[String]) -> anyhow::Result<Vec<String>> {
     let python = python.map(python_path).transpose()?;
     let db = HydroidDb::new(&system_path(root)?, python.as_deref())?;
-    let environment = db.program().resolver_environment(&db);
-    let mut indexes: FxHashMap<File, FileIndex> = FxHashMap::default();
-    let mut unknown = Vec::new();
-    for name in names {
-        let segments: Vec<&str> = name.split('.').collect();
-        let found = (1..segments.len()).rev().any(|split| {
-            let Some(module) = ModuleName::new(&segments[..split].join(".")) else { return false };
-            let Some(file) = resolve_module_confident(&db, environment, &module).and_then(|m| m.file(&db))
-            else {
-                return false;
-            };
-            let index = indexes.entry(file).or_insert_with(|| FileIndex::build(&db, file));
-            index.functions.values().any(|f| qualname_matches(name, &f.qualname))
-        });
-        if !found {
-            unknown.push(name.clone());
+    let indexes = Indexes::default();
+    Ok(names.iter().filter(|name| catalog_definitions(&db, &indexes, name).is_empty()).cloned().collect())
+}
+
+/// The definitions a catalog name (or pattern) names, in the module its longest importable
+/// prefix resolves to: functions, and classes (calling a class constructs it).
+fn catalog_definitions(db: &HydroidDb, indexes: &Indexes, name: &str) -> Vec<Key> {
+    let environment = db.program().resolver_environment(db);
+    let segments: Vec<&str> = name.split('.').collect();
+    for split in (1..segments.len()).rev() {
+        let Some(module) = ModuleName::new(&segments[..split].join(".")) else { continue };
+        let Some(file) = resolve_module_confident(db, environment, &module).and_then(|m| m.file(db)) else {
+            continue;
+        };
+        let index = indexes.get(db, file);
+        let functions = index.functions.iter().filter(|(_, f)| qualname_matches(name, &f.qualname));
+        let classes = index.classes.iter().filter(|(_, c)| qualname_matches(name, &c.qualname));
+        let keys: Vec<Key> = functions.map(|(&o, _)| (file, o)).chain(classes.map(|(&o, _)| (file, o))).collect();
+        if !keys.is_empty() {
+            return keys;
         }
     }
-    Ok(unknown)
+    Vec::new()
+}
+
+/// The definitions the catalog's `[[arguments]]` name, with what each does with its arguments.
+fn argument_definitions<'c>(db: &HydroidDb, indexes: &Indexes, catalog: &'c Catalog) -> FxHashMap<Key, &'c Arguments> {
+    let mut found = FxHashMap::default();
+    for (name, arguments) in catalog.argument_entries() {
+        for key in catalog_definitions(db, indexes, &name) {
+            found.insert(key, arguments);
+        }
+    }
+    found
 }
 
 /// Phase timings on stderr when `HYDROID_TIMINGS` is set (for profiling large projects).
@@ -126,11 +142,12 @@ pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
     timings.phase("environment and project files");
 
     let indexes = Indexes::default();
+    let arguments = argument_definitions(&db, &indexes, options.catalog);
     let mut merger = Merger::new(&db, &indexes);
     let units: Vec<(File, Option<FxHashSet<u32>>)> = files.iter().map(|&f| (f, None)).collect();
     indexes.prebuild(&db, files.iter().copied().collect(), FxHashSet::default());
     timings.phase("project indexes");
-    let mut round = run(&db, &indexes, &units, options.follow_libs);
+    let mut round = run(&db, &indexes, &units, options.follow_libs, options.catalog, &arguments);
     timings.phase("bodies");
     let mut first = true;
     loop {
@@ -154,11 +171,12 @@ pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
         if !options.follow_libs {
             break;
         }
-        let next = merger.library_frontier(options.follow);
+        let follow = |q: &str| options.catalog.sink(q).is_none() && !options.catalog.is_offload(q);
+        let next = merger.library_frontier(&follow);
         if next.is_empty() {
             break;
         }
-        round = run(&db, &indexes, &next, true);
+        round = run(&db, &indexes, &next, true, options.catalog, &arguments);
     }
     let entry = cache::Entry { files: files.len(), facts: merger.finish() };
     timings.phase("merged");
@@ -512,6 +530,8 @@ fn run(
     indexes: &Indexes,
     units: &[(File, Option<FxHashSet<u32>>)],
     all_implicit: bool,
+    catalog: &Catalog,
+    arguments: &FxHashMap<Key, &Arguments>,
 ) -> Vec<FileFacts> {
     let implicit = (!all_implicit).then(|| indexes.implicit());
     let state = indexes.app_state();
@@ -524,7 +544,8 @@ fn run(
             || shared.lock().clone(),
             |db, (file, wanted)| {
                 let index = indexes.get(db, *file);
-                extract_file(db, &index, wanted.as_ref(), implicit.as_ref(), &state, &orm, &instances)
+                let shared = Shared { state: &state, orm: &orm, instances: &instances, catalog, arguments };
+                extract_file(db, &index, wanted.as_ref(), implicit.as_ref(), &shared)
             },
         )
         .collect()

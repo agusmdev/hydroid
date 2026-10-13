@@ -459,6 +459,100 @@ functions = [
 ]
 
 # ---------------------------------------------------------------------------------------------
+# What functions do with their arguments, in the thread calling them (stub and library bodies are
+# not analyzed). A class stands for constructing it. Slots are a position (0: the first argument
+# after `self`), a keyword, or "*" (every positional argument not in `calls`).
+#   calls     callables given there are called during the call
+#   iterates  iterables given there are iterated during the call
+#   enters    context managers given there are entered and exited
+#   methods   methods called on the first positional argument
+#   lazy      the call returns a lazy iterator over what `iterates` names: iterating it iterates
+#             those, and `calls` runs where it is consumed (in a worker thread when it is
+#             consumed there, see `[offload]`)
+# ---------------------------------------------------------------------------------------------
+[[arguments]]
+iterates = ["*"]
+functions = [
+    "builtins.list",
+    "builtins.tuple",
+    "builtins.set",
+    "builtins.frozenset",
+    "builtins.dict",
+    "builtins.sum",
+    "builtins.any",
+    "builtins.all",
+    "builtins.next",
+    "builtins.*.join",
+    "builtins.*.extend",
+    "builtins.*.update",
+]
+
+[[arguments]]
+iterates = ["*"]
+calls = ["key"]
+functions = ["builtins.sorted", "builtins.min", "builtins.max"]
+
+[[arguments]]
+calls = ["key"]
+functions = ["builtins.list.sort"]
+
+[[arguments]]
+calls = [0]
+iterates = [1]
+functions = ["functools.reduce"]
+
+[[arguments]]
+calls = [0]
+functions = ["_contextvars.Context.run", "contextlib._BaseExitStack.callback"]
+
+[[arguments]]
+calls = [0]
+iterates = ["*"]
+lazy = true
+functions = ["builtins.map", "builtins.filter"]
+
+[[arguments]]
+iterates = ["*"]
+lazy = true
+functions = ["builtins.zip", "builtins.enumerate", "builtins.reversed"]
+
+# `iter(x)` only calls `x.__iter__()`: a generator `__iter__` (like a generator function) creates
+# its generator, whose body runs when the result is advanced (`next`, `for`), maybe in a worker
+# thread (`to_thread(next, it)`).
+[[arguments]]
+iterates = [0]
+methods = ["__iter__"]
+lazy = true
+functions = ["builtins.iter"]
+
+[[arguments]]
+methods = ["__len__"]
+functions = ["builtins.len"]
+
+[[arguments]]
+enters = [0]
+functions = ["contextlib._BaseExitStack.enter_context"]
+
+[[arguments]]
+methods = ["close"]
+functions = ["contextlib.closing"]
+
+# The same for a third-party library, sortedcontainers: the sorted collections iterate the
+# iterable they are built from and call `key` on every element.
+# [[arguments]]
+# iterates = [0, "iterable"]
+# calls = [1, "key"]
+# functions = [
+#     "sortedcontainers.sortedlist.SortedList",
+#     "sortedcontainers.sortedlist.SortedKeyList",
+#     "sortedcontainers.sortedset.SortedSet",
+# ]
+#
+# [[arguments]]
+# iterates = ["*"]
+# functions = ["sortedcontainers.sortedlist.SortedList.update", "sortedcontainers.sortedset.SortedSet.update"]
+
+# ---------------------------------------------------------------------------------------------
 # Callables passed to these are only inspected (name, signature, docstring), never called: a
 # decorator's `@functools.wraps(func)` does not make its wrapper call `func`.
 # ---------------------------------------------------------------------------------------------

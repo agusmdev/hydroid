@@ -1,7 +1,8 @@
 //! Walks function bodies and records calls (with their resolved callees) and callable flows.
 
+use hydroid_core::catalog::{ArgumentSlot, Arguments, Catalog};
 use hydroid_core::facts::{Accessor, Dump, Location, LoggerName, Origin};
-use ruff_db::files::{File, FilePath};
+use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::visitor::source_order::{SourceOrderVisitor, walk_expr, walk_stmt};
 use ruff_python_ast::{self as ast, AtomicNodeIndex, Expr, ExprContext, Stmt};
@@ -204,16 +205,26 @@ pub struct FileFacts {
     pub stops_propagation: Vec<(String, bool)>,
 }
 
+/// What every file's extraction reads besides its own index: what the project's indexes say,
+/// and the catalog.
+pub struct Shared<'a> {
+    pub state: &'a AppState,
+    pub orm: &'a Orm,
+    pub instances: &'a Instances,
+    pub catalog: &'a Catalog,
+    /// The definitions the catalog says what they do with their arguments (`[[arguments]]`).
+    pub arguments: &'a FxHashMap<Key, &'a Arguments>,
+}
+
 /// Extracts the bodies of `wanted` functions (every function and the module body when `None`).
 pub fn extract_file(
     db: &HydroidDb,
     index: &FileIndex,
     wanted: Option<&FxHashSet<u32>>,
     implicit: Option<&Implicit>,
-    state: &AppState,
-    orm: &Orm,
-    instances: &Instances,
+    shared: &Shared,
 ) -> FileFacts {
+    let Shared { state, orm, instances, catalog, arguments } = *shared;
     let program_file = ty_python_semantic::Db::program_file(db, index.file);
     let model = SemanticModel::new(db, program_file);
     let parsed = parsed_module(db, model.python_file()).load(db);
@@ -222,6 +233,9 @@ pub fn extract_file(
         state,
         orm,
         instances,
+        catalog,
+        arguments,
+        call_arguments: RefCell::default(),
         lazy_reads: Vec::new(),
         model: &model,
         index,
@@ -255,8 +269,11 @@ pub fn extract_file(
         },
     };
     let streaming = index.text(parsed.syntax().range()).contains("StreamingResponse");
-    let (streamed, deferred) =
-        lazy_arguments(&parsed.syntax().body, &|call| streaming && extractor.is_streaming_response(call));
+    let (streamed, deferred) = lazy_arguments(
+        &parsed.syntax().body,
+        &|call| streaming && extractor.is_streaming_response(call),
+        &|call| extractor.call_arguments(call).filter(|a| a.lazy),
+    );
     (extractor.streamed, extractor.deferred) = (streamed, deferred);
     extractor.visit_body(&parsed.syntax().body);
     extractor.drop_eager_reads();
@@ -331,15 +348,6 @@ fn excluded_fields(call: &ast::ExprCall, keyword: &str) -> Vec<String> {
     exclude
 }
 
-/// Builtins that iterate their positional arguments during the call.
-const CONSUMERS: &[&str] = &[
-    "list", "tuple", "set", "frozenset", "dict", "sorted", "sum", "min", "max", "any", "all", "next", "join",
-    "extend", "update", "reduce",
-];
-
-/// Builtins returning lazy iterators over their arguments: iterating one iterates those.
-const LAZY: &[&str] = &["map", "filter", "zip", "enumerate", "reversed", "iter"];
-
 /// `Annotated` metadata attaching a validator callable to a field or parameter (pydantic).
 const VALIDATOR_METADATA: &[&str] = &["AfterValidator", "BeforeValidator", "PlainValidator", "WrapValidator"];
 
@@ -364,6 +372,11 @@ struct Extractor<'a, 'db> {
     state: &'a AppState,
     orm: &'a Orm,
     instances: &'a Instances,
+    catalog: &'a Catalog,
+    /// See [`Shared::arguments`].
+    arguments: &'a FxHashMap<Key, &'a Arguments>,
+    /// Memoized [`Extractor::call_arguments`], by call offset.
+    call_arguments: RefCell<FxHashMap<u32, Option<&'a Arguments>>>,
     /// Lazy relationship reads recorded: `(function, location, relationship)`.
     lazy_reads: Vec<(u32, Location, String)>,
     model: &'a SemanticModel<'db>,
@@ -435,7 +448,7 @@ fn first_string_literal(call: &ast::ExprCall) -> Option<String> {
     }
 }
 
-impl<'db> Extractor<'_, 'db> {
+impl<'a, 'db> Extractor<'a, 'db> {
     fn recording(&self) -> bool {
         self.wanted.is_none_or(|w| w.contains(&self.current))
     }
@@ -810,30 +823,25 @@ impl<'db> Extractor<'_, 'db> {
         }
     }
 
-    /// The name of a builtin (or a `functools`, `contextlib` or `contextvars` function) the
-    /// resolved call targets.
-    fn builtin_name<'e>(&self, func: &'e Expr, resolution: &Resolution) -> Option<&'e str> {
-        let db = self.model.db();
-        let is_builtin = |file: File| match file.path(db) {
-            FilePath::Vendored(path) => {
-                matches!(
-                path.as_str(),
-                "stdlib/builtins.pyi" | "stdlib/functools.pyi" | "stdlib/contextlib.pyi" | "stdlib/_contextvars.pyi"
-            )
-            }
-            _ => false,
-        };
-        // Builtin classes like `tuple` have no constructor definition: check the class itself.
-        let by_targets =
-            !resolution.targets.is_empty() && resolution.targets.iter().all(|((file, _), _)| is_builtin(*file));
-        if !by_targets && !resolution.constructs.is_some_and(|(file, _)| is_builtin(file)) {
-            return None;
+    /// What the callee does with its arguments (catalog `[[arguments]]`): the class constructed,
+    /// or the function called.
+    fn arguments_of(&self, resolution: &Resolution) -> Option<&'a Arguments> {
+        let mut keys = resolution.constructs.into_iter().chain(resolution.targets.iter().map(|(k, _)| *k));
+        keys.find_map(|key| self.arguments.get(&key).copied())
+    }
+
+    /// [`Extractor::arguments_of`] for a call met outside [`Extractor::handle_call`]: calls to a
+    /// callee whose name no `[[arguments]]` entry has are not resolved.
+    fn call_arguments(&self, call: &ast::ExprCall) -> Option<&'a Arguments> {
+        let offset = call.start().to_u32();
+        if let Some(&found) = self.call_arguments.borrow().get(&offset) {
+            return found;
         }
-        match func {
-            Expr::Name(name) => Some(name.id.as_str()),
-            Expr::Attribute(attr) => Some(attr.attr.as_str()),
-            _ => None,
-        }
+        let found = called_name(call)
+            .filter(|name| self.catalog.may_take_arguments(name))
+            .and_then(|_| self.arguments_of(&self.resolve(&call.func, Some(call))));
+        self.call_arguments.borrow_mut().insert(offset, found);
+        found
     }
 
     /// Iterating `expr` right away: its `__iter__` runs, and, for a generator created by a call,
@@ -844,11 +852,9 @@ impl<'db> Extractor<'_, 'db> {
         }
         self.iterate_later(expr);
         if let Expr::Call(call) = expr {
-            if let Expr::Name(name) = &*call.func
-                && LAZY.contains(&name.id.as_str())
-            {
-                let skip = usize::from(matches!(name.id.as_str(), "map" | "filter"));
-                for argument in call.arguments.args.iter().skip(skip) {
+            // A lazy iterator (`map(f, xs)`) iterates what it was given.
+            if let Some(arguments) = self.call_arguments(call).filter(|a| a.lazy) {
+                for argument in slot_arguments(call, &arguments.iterates, &arguments.calls) {
                     self.iterate(argument);
                 }
                 return;
@@ -866,7 +872,8 @@ impl<'db> Extractor<'_, 'db> {
     /// Iterating (or entering) a variable of this function only ever assigned a call: the call
     /// recorded there now creates what is advanced here, `gen()` or what a `@contextmanager`
     /// function returns (`rows = gen()` ... `for row in rows`), or the generator a generator
-    /// `__iter__` returns (`rows = iter(export)`), whose body runs here.
+    /// `__iter__` returns when a lazy iterator calls it (`rows = iter(export)`, catalog
+    /// `[[arguments]]` with `lazy` and `methods`), whose body runs here.
     fn iterate_later(&mut self, var: &Expr) {
         let Expr::Name(name) = var else { return };
         let db = self.model.db();
@@ -880,11 +887,12 @@ impl<'db> Extractor<'_, 'db> {
             let module = parsed_module(db, def.python_file(db)).load(db);
             let DefinitionKind::Assignment(a) = def.kind(db) else { return };
             let (None, Expr::Call(call)) = (a.unpack(), a.value(&module)) else { return };
-            assigned.push(match (&*call.func, &call.arguments.args[..]) {
-                (Expr::Name(f), [x]) if f.id.as_str() == "iter" => {
-                    (self.index.location(x.start()), format!("iter({})", self.text(x.range())), true)
+            let lazy = self.call_arguments(call).is_some_and(|a| a.lazy && !a.methods.is_empty());
+            assigned.push(match &call.arguments.args[..] {
+                [x, ..] if lazy && !x.is_starred_expr() => {
+                    (self.index.location(x.start()), self.argument_text(call, x), true)
                 }
-                (func, _) => (self.index.location(call.start()), self.text(func.range()), false),
+                _ => (self.index.location(call.start()), self.text(call.func.range()), false),
             });
         }
         for call in self.out.calls.iter_mut().filter(|c| c.caller == self.current) {
@@ -1311,82 +1319,53 @@ impl<'db> Extractor<'_, 'db> {
         }
     }
 
-    /// What builtins do with their arguments: iterate them, call them.
-    fn builtin_call(&mut self, name: &str, call: &ast::ExprCall) {
-        let args = &call.arguments.args;
-        match name {
-            "map" | "filter" | "reduce" => {
-                if let Some(f) = args.first().filter(|_| !self.streamed.contains(&call.start().to_u32())) {
-                    let from = self.out.calls.len();
-                    self.call_value(call, f);
-                    if let Some(&to) = self.deferred.get(&call.start().to_u32()) {
-                        self.defer_calls(from, to, None);
-                    }
+    /// What a library function does with its arguments during the call (catalog
+    /// `[[arguments]]`): call them, iterate them, enter them, call methods on the first one.
+    fn argument_call(&mut self, arguments: &Arguments, call: &ast::ExprCall) {
+        if let Some(x) = call.arguments.args.first().filter(|x| !x.is_starred_expr()) {
+            for method in &arguments.methods {
+                // A method of a stdlib class runs no project code.
+                if !self.stub_instance(x) {
+                    self.implicit_call(x, method, self.argument_text(call, x), false, false);
                 }
-                if name == "reduce"
-                    && let Some(xs) = args.get(1)
-                {
-                    self.iterate(xs);
-                }
-                return;
-            }
-            // contextlib: `stack.enter_context(cm)` enters `cm`, `closing(x)` closes `x`.
-            "enter_context" => {
-                if let Some(cm) = args.first() {
-                    if let Expr::Call(call) = cm {
-                        self.iterated.insert(call.start().to_u32());
-                    }
-                    self.iterate_later(cm);
-                    let text = format!("enter_context({})", self.text(cm.range()));
-                    self.implicit_call(cm, "__enter__", text.clone(), false, false);
-                    self.implicit_call(cm, "__exit__", text, false, false);
-                }
-                return;
-            }
-            "closing" => {
-                if let Some(x) = args.first() {
-                    let text = format!("closing({})", self.text(x.range()));
-                    self.implicit_call(x, "close", text, false, false);
-                }
-                return;
-            }
-            // `ExitStack.callback(f)`; `Context.run(f, *args)` calls `f` right away, in this thread.
-            "callback" | "run" => {
-                if let Some(f) = args.first() {
-                    self.call_value(call, f);
-                }
-                return;
-            }
-            // `iter(x)` only calls `x.__iter__()`: a generator `__iter__` (like a generator
-            // function) creates its generator, whose body runs when that is advanced (`next`,
-            // `for`, see `LAZY`), maybe in a worker thread (`to_thread(next, it)`).
-            "iter" => {
-                if let [x] = &args[..] {
-                    self.implicit_call(x, "__iter__", format!("iter({})", self.text(x.range())), false, false);
-                }
-                return;
-            }
-            "len" => {
-                if let Some(x) = args.first()
-                    && self.operator_may_run(x, "__len__")
-                {
-                    self.implicit_call(x, "__len__", format!("len({})", self.text(x.range())), false, false);
-                }
-            }
-            "sorted" | "min" | "max" | "sort" => {
-                for keyword in &call.arguments.keywords {
-                    if keyword.arg.as_ref().is_some_and(|a| a.as_str() == "key") {
-                        self.call_value(call, &keyword.value);
-                    }
-                }
-            }
-            _ => {}
-        }
-        if CONSUMERS.contains(&name) {
-            for argument in args.iter().take_while(|a| !a.is_starred_expr()) {
-                self.iterate(argument);
             }
         }
+        for cm in slot_arguments(call, &arguments.enters, &[]) {
+            if let Expr::Call(call) = cm {
+                self.iterated.insert(call.start().to_u32());
+            }
+            self.iterate_later(cm);
+            let text = self.argument_text(call, cm);
+            self.implicit_call(cm, "__enter__", text.clone(), false, false);
+            self.implicit_call(cm, "__exit__", text, false, false);
+        }
+        // Callables a lazy iterator calls run where it is consumed: computed in a worker thread
+        // when it is streamed from one, and deferred to the consumer it is given to.
+        if !arguments.lazy || !self.streamed.contains(&call.start().to_u32()) {
+            for f in slot_arguments(call, &arguments.calls, &[]) {
+                let from = self.out.calls.len();
+                self.call_value(call, f);
+                if let Some(&to) = self.deferred.get(&call.start().to_u32()) {
+                    self.defer_calls(from, to, None);
+                }
+            }
+        }
+        if !arguments.lazy {
+            for x in slot_arguments(call, &arguments.iterates, &arguments.calls) {
+                self.iterate(x);
+            }
+        }
+    }
+
+    /// `f(x)`, the text of an implicit call a library function `f` makes on its argument `x`.
+    fn argument_text(&self, call: &ast::ExprCall, x: &Expr) -> String {
+        format!("{}({})", self.text(call.func.range()), self.text(x.range()))
+    }
+
+    /// Whether `expr` is an instance of a class defined in a stub (stdlib).
+    fn stub_instance(&self, expr: &Expr) -> bool {
+        let Some(ty @ Type::NominalInstance(_)) = expr.inferred_type(self.model) else { return false };
+        self.class_key(&ty).is_some_and(|(file, _)| file.path(self.model.db()).is_vendored_path())
     }
 
     /// The callable an argument evaluates to, if any.
@@ -1548,8 +1527,10 @@ impl<'db> Extractor<'_, 'db> {
                 }
             }
         }
-        if let Some(name) = self.builtin_name(&call.func, &resolution) {
-            self.builtin_call(name, call);
+        let arguments = self.arguments_of(&resolution);
+        self.call_arguments.borrow_mut().insert(call.start().to_u32(), arguments);
+        if let Some(arguments) = arguments {
+            self.argument_call(arguments, call);
         }
         let attribute = if resolution.targets.is_empty() { self.attribute_slot(&call.func) } else { None };
         // Also when resolved: ty types `retrying.wraps(f)` as `f` itself, the call runs a wrapper.
@@ -2758,9 +2739,10 @@ fn body_calls(body: &[Stmt]) -> Vec<&ast::ExprCall> {
 /// - the others, with the offset of the call they are given to: their elements are computed
 ///   wherever that call pulls them, a worker thread when it is an offload API handed a consumer
 ///   (`to_thread(list, map(f, xs))`), see [`hydroid_core::facts::Call::lazy_in`].
-fn lazy_arguments(
+fn lazy_arguments<'c>(
     body: &[Stmt],
     is_streaming: &dyn Fn(&ast::ExprCall) -> bool,
+    lazy_iterator: &dyn Fn(&ast::ExprCall) -> Option<&'c Arguments>,
 ) -> (FxHashSet<u32>, FxHashMap<u32, u32>) {
     #[derive(Default)]
     struct Scope<'a> {
@@ -2810,30 +2792,33 @@ fn lazy_arguments(
             walk_expr(self, expr);
         }
     }
-    fn lazy(expr: &Expr, out: &mut FxHashSet<u32>) {
+    /// The lazy parts of an iterable: generator expressions, and lazy iterators (catalog
+    /// `[[arguments]]` with `lazy`) calling something per element (`map(f, xs)`), with those of
+    /// what they iterate.
+    fn lazy<'c>(
+        expr: &Expr,
+        out: &mut FxHashSet<u32>,
+        lazy_iterator: &dyn Fn(&ast::ExprCall) -> Option<&'c Arguments>,
+    ) {
         match expr {
             Expr::Generator(generator)
                 if generator.generators.iter().all(|g| !g.is_async) && !contains_await(expr) =>
             {
                 out.insert(expr.start().to_u32());
                 if let Some(first) = generator.generators.first() {
-                    lazy(&first.iter, out);
+                    lazy(&first.iter, out, lazy_iterator);
                 }
             }
-            Expr::Call(call) => match called_name(call) {
-                Some("map" | "filter") if matches!(&*call.func, Expr::Name(_)) && call.arguments.keywords.is_empty() => {
-                    out.insert(expr.start().to_u32());
-                    for argument in call.arguments.args.iter().skip(1) {
-                        lazy(argument, out);
+            Expr::Call(call) => {
+                if let Some(arguments) = lazy_iterator(call) {
+                    if !arguments.calls.is_empty() {
+                        out.insert(expr.start().to_u32());
+                    }
+                    for argument in slot_arguments(call, &arguments.iterates, &arguments.calls) {
+                        lazy(argument, out, lazy_iterator);
                     }
                 }
-                Some("zip" | "enumerate" | "iter") if matches!(&*call.func, Expr::Name(_)) => {
-                    for argument in &call.arguments.args {
-                        lazy(argument, out);
-                    }
-                }
-                _ => {}
-            },
+            }
             _ => {}
         }
     }
@@ -2857,7 +2842,7 @@ fn lazy_arguments(
                 argument => argument,
             };
             let mut parts = FxHashSet::default();
-            lazy(argument, &mut parts);
+            lazy(argument, &mut parts, lazy_iterator);
             if parts.is_empty() {
                 continue;
             }
@@ -2874,6 +2859,28 @@ fn lazy_arguments(
         }
     }
     (streamed, deferred)
+}
+
+/// The arguments of `call` at `slots` (see [`ArgumentSlot`]): `"*"` stands for every positional
+/// argument (before any `*args`) whose position `except` does not name.
+fn slot_arguments<'c>(call: &'c ast::ExprCall, slots: &[ArgumentSlot], except: &[ArgumentSlot]) -> Vec<&'c Expr> {
+    let all = slots.iter().any(|s| matches!(s, ArgumentSlot::Keyword(k) if k == "*"));
+    let positional = call.arguments.args.iter().take_while(|a| !a.is_starred_expr()).enumerate();
+    let mut found: Vec<&Expr> = positional
+        .filter(|(i, _)| {
+            let at = ArgumentSlot::Position(*i);
+            slots.contains(&at) || (all && !except.contains(&at))
+        })
+        .map(|(_, a)| a)
+        .collect();
+    for keyword in &call.arguments.keywords {
+        if let Some(name) = &keyword.arg
+            && slots.iter().any(|s| matches!(s, ArgumentSlot::Keyword(k) if k == name.as_str()))
+        {
+            found.push(&keyword.value);
+        }
+    }
+    found
 }
 
 /// Whether an expression awaits (outside nested lambdas, which cannot).

@@ -153,6 +153,30 @@ functions = ["mylib.jobs.run_in_worker"]
 ```
 
 The builtin list lives in [`crates/hydroid_core/catalog.toml`](../crates/hydroid_core/catalog.toml).
+Every table below can be added to from `pyproject.toml` as `[tool.hydroid.<table>]` (or
+`[[tool.hydroid.<table>]]`). Names are the **defining** qualified names (`module.Class.method`);
+a class name stands for constructing the class.
+
+| Table | Says | Fields |
+|---|---|---|
+| `[[sink]]` | these functions block | `category`, `advice`, `functions`; `direct` (only calls made directly from loop code count), `opt_in` (only with `--cpu`), `unless_given` (keyword arguments that make a call skip the blocking work), `blocks_in` (the function to name in diagnostics) |
+| `[[blocking_decorator]]` | sync functions decorated with these block | as `[[sink]]` |
+| `[offload]` | callables passed to these run in a worker thread | `functions` |
+| `[loop_callback]` | callables passed to these run on the event loop later | `functions` |
+| `[inspects]` | callables passed to these are only inspected, never called | `functions` |
+| `[[arguments]]` | what these functions do with their arguments, in the calling thread | `functions`, and any of: `calls` (callables given there are called), `iterates` (iterables given there are iterated), `enters` (context managers given there are entered and exited), `methods` (methods called on the first positional argument), `lazy` (the call returns a lazy iterator: iterating it iterates what `iterates` names, and what `calls` names runs where it is consumed) |
+| `[[entry]]` | callables passed to these are framework entry points | `kind`, `functions` |
+
+Argument slots (`calls`, `iterates`, `enters`) are positions (`0` is the first argument after
+`self`), keyword names, or `"*"` (every positional argument not in `calls`). For example, a
+library whose sorted collections consume the iterable they are given and call their `key`:
+
+```toml
+[[tool.hydroid.arguments]]
+iterates = [0, "iterable"]
+calls = [1, "key"]
+functions = ["sortedcontainers.sortedlist.SortedList", "sortedcontainers.sortedset.SortedSet"]
+```
 
 ## 8. Silence a finding
 

@@ -27,6 +27,9 @@ struct CatalogFile {
     /// Logging calls that run the attached filters and handlers on the calling thread.
     #[serde(default)]
     log_dispatch: Group,
+    /// What library functions do with their arguments during the call.
+    #[serde(default)]
+    arguments: Vec<ArgumentGroup>,
     #[serde(default)]
     entry: Vec<EntryGroup>,
 }
@@ -59,6 +62,49 @@ struct SinkGroup {
 struct Group {
     #[serde(default)]
     functions: Vec<String>,
+}
+
+/// `[[arguments]]`: functions doing the same with their arguments (see [`Arguments`]).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArgumentGroup {
+    #[serde(default)]
+    calls: Vec<ArgumentSlot>,
+    #[serde(default)]
+    iterates: Vec<ArgumentSlot>,
+    #[serde(default)]
+    enters: Vec<ArgumentSlot>,
+    #[serde(default)]
+    methods: Vec<String>,
+    #[serde(default)]
+    lazy: bool,
+    functions: Vec<String>,
+}
+
+/// What a function does with its arguments, in the thread calling it. A class stands for
+/// constructing it.
+#[derive(Clone, Debug, Default)]
+pub struct Arguments {
+    /// Callables given there are called (`sorted(xs, key=f)`, `Context.run(f)`).
+    pub calls: Vec<ArgumentSlot>,
+    /// Iterables given there are iterated (`list(xs)`; `"*"`: every positional argument not in
+    /// `calls`).
+    pub iterates: Vec<ArgumentSlot>,
+    /// Context managers given there are entered, and exited (`stack.enter_context(cm)`).
+    pub enters: Vec<ArgumentSlot>,
+    /// Methods called on the first positional argument (`len(x)`: `__len__`).
+    pub methods: Vec<String>,
+    /// The call returns a lazy iterator: what `calls` and `iterates` say happens when it is
+    /// iterated (`map(f, xs)`), not during the call.
+    pub lazy: bool,
+}
+
+/// A positional argument (from 0, not counting `self`), a keyword argument, or `"*"`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum ArgumentSlot {
+    Position(usize),
+    Keyword(String),
 }
 
 #[derive(Deserialize)]
@@ -104,7 +150,11 @@ impl<T: Clone> Patterns<T> {
     }
 
     fn all(&self) -> impl Iterator<Item = String> + '_ {
-        self.exact.keys().cloned().chain(self.globs.iter().map(|(p, _)| p.join(".")))
+        self.entries().map(|(name, _)| name)
+    }
+
+    fn entries(&self) -> impl Iterator<Item = (String, &T)> + '_ {
+        self.exact.iter().map(|(n, v)| (n.clone(), v)).chain(self.globs.iter().map(|(p, v)| (p.join("."), v)))
     }
 }
 
@@ -181,6 +231,10 @@ pub struct Catalog {
     loop_callbacks: Patterns<()>,
     inspectors: Patterns<()>,
     log_dispatch: Patterns<()>,
+    arguments: Patterns<usize>,
+    argument_effects: Vec<Arguments>,
+    /// The last segment of every `arguments` name (`None`: a pattern ends in `*`).
+    argument_names: Option<rustc_hash::FxHashSet<String>>,
     entries: Patterns<usize>,
     entry_kinds: Vec<String>,
 }
@@ -224,6 +278,21 @@ impl Catalog {
         for name in &file.log_dispatch.functions {
             self.log_dispatch.insert(name, ());
         }
+        for ArgumentGroup { calls, iterates, enters, methods, lazy, functions } in file.arguments {
+            let index = self.argument_effects.len();
+            self.argument_effects.push(Arguments { calls, iterates, enters, methods, lazy });
+            for name in &functions {
+                self.arguments.insert(name, index);
+            }
+        }
+        self.argument_names = self.arguments.all().map(|n| n.rsplit('.').next().map(str::to_string)).try_fold(
+            rustc_hash::FxHashSet::default(),
+            |mut names, last| {
+                let last = last.filter(|l| !l.contains('*'))?;
+                names.insert(last);
+                Some(names)
+            },
+        );
         for group in file.entry {
             let index = self.entry_kinds.len();
             self.entry_kinds.push(group.kind);
@@ -318,6 +387,21 @@ impl Catalog {
         self.log_dispatch.get(qualname).is_some()
     }
 
+    /// What `qualname` does with its arguments.
+    pub fn arguments(&self, qualname: &str) -> Option<&Arguments> {
+        self.arguments.get(qualname).map(|&i| &self.argument_effects[i])
+    }
+
+    /// Every `[[arguments]]` name (or pattern), with what it does with its arguments.
+    pub fn argument_entries(&self) -> impl Iterator<Item = (String, &Arguments)> + '_ {
+        self.arguments.entries().map(|(name, &i)| (name, &self.argument_effects[i]))
+    }
+
+    /// Whether a function (or class) named `name` (its last segment) may be in `[[arguments]]`.
+    pub fn may_take_arguments(&self, name: &str) -> bool {
+        self.argument_names.as_ref().is_none_or(|names| names.contains(name))
+    }
+
     /// The entry-point kind registered by passing a callable to `qualname`.
     pub fn entry_kind(&self, qualname: &str) -> Option<&str> {
         self.entries.get(qualname).map(|&i| self.entry_kinds[i].as_str())
@@ -333,6 +417,7 @@ impl Catalog {
             .chain(self.loop_callbacks.all())
             .chain(self.inspectors.all())
             .chain(self.log_dispatch.all())
+            .chain(self.arguments.all())
             .chain(self.entries.all())
             .chain(self.blocks_in.iter().flatten().cloned())
             .collect();
