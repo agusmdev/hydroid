@@ -90,7 +90,8 @@ struct Graph<'a> {
     offload: Vec<bool>,
     /// Sinks that only count when called directly from loop code, by function.
     direct: Vec<bool>,
-    /// Parameters that are called, or handed to something other than an offload API.
+    /// Parameters that are called, or handed to something other than an offload API or a
+    /// function that only inspects them.
     used_params: HashSet<ParamKey>,
     /// See [`Graph::framework_hooks`].
     hooks: Vec<(FnId, String)>,
@@ -145,7 +146,7 @@ impl<'a> Graph<'a> {
         let used_from_flows: Vec<ParamKey> = facts
             .flows
             .iter()
-            .filter(|f| !graph.is_offload(f.into))
+            .filter(|f| !graph.is_offload(f.into) && !catalog.is_inspector(&facts.function(f.into).qualname))
             .filter_map(|f| match &f.value {
                 Value::Param(owner, name) => Some((*owner, name.clone())),
                 _ => None,
@@ -608,8 +609,8 @@ impl<'a> Graph<'a> {
 
     /// Whether decorating with `decorator` keeps calling the original on the loop: one of its
     /// wrappers calls the decorated parameter, or hands it to something other than an offload API
-    /// (`asyncio.to_thread(func)` does not run it here). Undecorated library decorators count as
-    /// calling it.
+    /// (`asyncio.to_thread(func)` does not run it here) or an inspector (`functools.wraps(func)`
+    /// copies its metadata). Undecorated library decorators count as calling it.
     fn calls_original(&self, decorator: FnId, nested: &[Vec<FnId>]) -> bool {
         if !self.facts.function(decorator).analyzed {
             return true;

@@ -32,8 +32,8 @@ pub struct Config {
     pub strict: bool,
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// Catalog tables (`sink`, `blocking_decorator`, `offload`, `loop_callback`, `entry`),
-    /// re-serialized for [`hydroid_core::catalog::Catalog::extend`].
+    /// Catalog tables (`sink`, `blocking_decorator`, `offload`, `loop_callback`, `inspects`,
+    /// `entry`), re-serialized for [`hydroid_core::catalog::Catalog::extend`].
     #[serde(flatten)]
     pub catalog: toml::Table,
 }

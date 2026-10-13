@@ -183,3 +183,68 @@ async def in_context(name: str):
     ctx.run(label, name)
     await run_in_threadpool(ctx.run, blocking_helper, 1)
     return {}
+
+
+# --- Decorators whose wrapper hands the original to an offload API -----------------------------
+
+
+def offloaded(fn):
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+    return wrapper
+
+
+def inline(fn):
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+@offloaded
+def slow_lookup(key: str) -> str:
+    time.sleep(0.1)
+    return key
+
+
+@inline
+def slow_inline(key: str) -> str:
+    time.sleep(0.1)
+    return key
+
+
+@app.get("/decorated-offload")
+async def decorated_offload(key: str):
+    await slow_lookup(key)
+    await slow_inline(key)  # expect: time.sleep
+    return {}
+
+
+# --- `except RuntimeError` after `get_running_loop()` runs only without a running loop ---------
+
+
+def notify(event: str) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        requests.post("https://example.com", data=event)
+        return
+    loop.call_soon(print, event)
+
+
+def notify_checked(event: str) -> None:
+    try:
+        asyncio.get_running_loop()
+        label(event)
+    except RuntimeError:
+        requests.post("https://example.com", data=event)
+
+
+@app.get("/notify")
+async def notify_endpoint(event: str):
+    notify(event)
+    notify_checked(event)  # expect: requests.api.post
+    return {}

@@ -18,8 +18,8 @@ use ty_python_semantic::{
 
 use crate::db::HydroidDb;
 use crate::index::{
-    FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, instance_class, is_class_object, state_owner,
-    yield_values, yields,
+    FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, describe, instance_class, is_class_object,
+    state_owner, yield_values, yields,
 };
 
 pub struct RawCall {
@@ -1452,6 +1452,26 @@ impl<'db> Extractor<'_, 'db> {
         self.out.default_factories.push((class, names, factory));
     }
 
+    /// Whether a `try` body only asks for the running loop (`asyncio.get_running_loop()`, maybe
+    /// assigned): the only exception it can raise is the `RuntimeError` of "no running loop".
+    fn probes_running_loop(&self, body: &[Stmt]) -> bool {
+        let simple =
+            body.iter().all(|s| matches!(s, Stmt::Expr(_) | Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::Pass(_)));
+        let calls = body_calls(body);
+        simple
+            && !calls.is_empty()
+            && calls.iter().all(|call| {
+                called_name(call) == Some("get_running_loop")
+                    && self
+                        .resolve(&call.func, Some(call))
+                        .targets
+                        .iter()
+                        .any(|((file, _), _)| {
+                            matches!(describe(self.db, *file).0.as_str(), "_asyncio" | "asyncio.events")
+                        })
+            })
+    }
+
     fn in_scope(&mut self, key: u32, f: impl FnOnce(&mut Self)) {
         let previous = std::mem::replace(&mut self.current, key);
         f(self);
@@ -1525,6 +1545,20 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                     self.iterate(&for_stmt.iter);
                 }
                 walk_stmt(self, stmt);
+            }
+            // `try: asyncio.get_running_loop()` / `except RuntimeError:`: the handler runs only
+            // when no loop is running in this thread, so never on the loop. Its calls are left
+            // out (a sync helper shared by loop code and worker threads).
+            Stmt::Try(try_stmt) if self.recording() && self.probes_running_loop(&try_stmt.body) => {
+                self.visit_body(&try_stmt.body);
+                for handler in &try_stmt.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = handler;
+                    if !catches_runtime_error(h.type_.as_deref()) {
+                        self.visit_except_handler(handler);
+                    }
+                }
+                self.visit_body(&try_stmt.orelse);
+                self.visit_body(&try_stmt.finalbody);
             }
             _ => walk_stmt(self, stmt),
         }
@@ -1678,6 +1712,35 @@ fn awaited_calls(expr: &Expr) -> Vec<&ast::ExprCall> {
     let mut finder = Finder(Vec::new());
     finder.visit_expr(expr);
     finder.0
+}
+
+/// Every call in a block of statements, nested scopes included.
+fn body_calls(body: &[Stmt]) -> Vec<&ast::ExprCall> {
+    struct Finder<'a>(Vec<&'a ast::ExprCall>);
+    impl<'a> SourceOrderVisitor<'a> for Finder<'a> {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if let Expr::Call(call) = expr {
+                self.0.push(call);
+            }
+            walk_expr(self, expr);
+        }
+    }
+    let mut finder = Finder(Vec::new());
+    finder.visit_body(body);
+    finder.0
+}
+
+/// Whether an `except` clause catches `RuntimeError`: bare, `RuntimeError` or a base of it, or
+/// a tuple naming one of those.
+fn catches_runtime_error(type_: Option<&Expr>) -> bool {
+    let named = |e: &Expr| {
+        matches!(e, Expr::Name(n) if matches!(n.id.as_str(), "RuntimeError" | "Exception" | "BaseException"))
+    };
+    match type_ {
+        None => true,
+        Some(Expr::Tuple(tuple)) => tuple.elts.iter().any(named),
+        Some(e) => named(e),
+    }
 }
 
 /// The call expression spanning exactly `range` in a module.

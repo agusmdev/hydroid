@@ -159,7 +159,7 @@ impl FileIndex {
 }
 
 /// Module name, origin and display path of a file.
-fn describe(db: &HydroidDb, file: File) -> (String, Origin, String) {
+pub(crate) fn describe(db: &HydroidDb, file: File) -> (String, Origin, String) {
     let layout = db.layout();
     let module_of = |relative: &str| {
         let stem = relative.trim_end_matches(".pyi").trim_end_matches(".py");

@@ -21,6 +21,9 @@ struct CatalogFile {
     offload: Group,
     #[serde(default)]
     loop_callback: Group,
+    /// Functions that only inspect the callables passed to them (`functools.wraps(func)`).
+    #[serde(default)]
+    inspects: Group,
     #[serde(default)]
     entry: Vec<EntryGroup>,
 }
@@ -135,6 +138,7 @@ pub struct Catalog {
     direct: Vec<bool>,
     offload: Patterns<()>,
     loop_callbacks: Patterns<()>,
+    inspectors: Patterns<()>,
     entries: Patterns<usize>,
     entry_kinds: Vec<String>,
 }
@@ -169,6 +173,9 @@ impl Catalog {
         }
         for name in &file.loop_callback.functions {
             self.loop_callbacks.insert(name, ());
+        }
+        for name in &file.inspects.functions {
+            self.inspectors.insert(name, ());
         }
         for group in file.entry {
             let index = self.entry_kinds.len();
@@ -206,6 +213,11 @@ impl Catalog {
         self.loop_callbacks.get(qualname).is_some()
     }
 
+    /// Whether callables passed to `qualname` are only inspected, never called.
+    pub fn is_inspector(&self, qualname: &str) -> bool {
+        self.inspectors.get(qualname).is_some()
+    }
+
     /// The entry-point kind registered by passing a callable to `qualname`.
     pub fn entry_kind(&self, qualname: &str) -> Option<&str> {
         self.entries.get(qualname).map(|&i| self.entry_kinds[i].as_str())
@@ -219,6 +231,7 @@ impl Catalog {
             .chain(self.blocking_decorators.all())
             .chain(self.offload.all())
             .chain(self.loop_callbacks.all())
+            .chain(self.inspectors.all())
             .chain(self.entries.all())
             .collect();
         names.sort();

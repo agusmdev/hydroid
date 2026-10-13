@@ -147,10 +147,13 @@ drop it and the upload step to fail the build instead.
    them; overrides are found by class-hierarchy analysis (test doubles only stand in for real
    classes in test code); calling a generator function runs nothing until the generator is
    iterated; a decorated function is reached through its decorator's wrappers only when they call
-   it. Starting an event loop (`asyncio.run`) is only reported when loop code does it directly:
-   sync bridges reaching it almost always check for a running loop first.
+   it (not when they only hand it to an offload API, or to `functools.wraps`). Starting an event
+   loop (`asyncio.run`) is only reported when loop code does it directly: sync bridges reaching
+   it almost always check for a running loop first. Code in the `except RuntimeError:` of a `try`
+   that only calls `asyncio.get_running_loop()` runs only when no loop is running: it is skipped.
 3. **Catalog** (`crates/hydroid_core/catalog.toml`): blocking functions, offload APIs, loop
-   callback APIs and FastAPI entry points, by defining qualified name. A test checks every name
+   callback APIs, functions that only inspect callables (`functools.wraps`) and FastAPI entry
+   points, by defining qualified name. A test checks every name
    exists in a real environment.
 
 Sync `def` endpoints and dependencies are not reported: FastAPI runs them in a threadpool.

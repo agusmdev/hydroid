@@ -372,6 +372,19 @@ functions = [
 ]
 
 # ---------------------------------------------------------------------------------------------
+# Callables passed to these are only inspected (name, signature, docstring), never called: a
+# decorator's `@functools.wraps(func)` does not make its wrapper call `func`.
+# ---------------------------------------------------------------------------------------------
+[inspects]
+functions = [
+    "functools.wraps",
+    "functools.update_wrapper",
+    "inspect.signature",
+    "inspect.iscoroutinefunction",
+    "asyncio.coroutines.iscoroutinefunction",
+]
+
+# ---------------------------------------------------------------------------------------------
 # Sync callables passed to these run *on* the event loop.
 # ---------------------------------------------------------------------------------------------
 [loop_callback]
