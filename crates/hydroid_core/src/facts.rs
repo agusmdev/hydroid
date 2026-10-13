@@ -149,8 +149,9 @@ pub struct Call {
     /// construction, or the target of `obj.name = value`. Their ORM validators run (see
     /// [`Function::validates`]).
     pub sets: Option<(ClassId, Vec<String>)>,
-    /// The fields a construction gives explicitly (its keyword arguments): their default
-    /// factories do not run. `None` when that is not known (positional arguments).
+    /// The arguments the call gives explicitly, by keyword: a construction's default factories
+    /// for these fields do not run, and sinks skip their blocking work for some (catalog
+    /// `unless_given`). `None` when that is not known (positional arguments).
     pub given: Option<Vec<String>>,
     /// Why nothing was resolved (only set when `targets` is empty and `param` is `None`).
     pub unresolved: Option<String>,

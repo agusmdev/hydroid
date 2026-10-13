@@ -8,6 +8,10 @@
 # ---------------------------------------------------------------------------------------------
 # Blocking functions. A call to one of these on the event loop is a diagnostic.
 # A call whose result is awaited is never blocking (dual sync/async APIs share definitions).
+# Stdlib bodies are never analyzed: stdlib helpers doing I/O internally (`shutil.make_archive`,
+# `socket.getfqdn`) are listed by name. `unless_given` lists arguments that make a call skip the
+# blocking work; calls giving one, or positional arguments (not known to leave them out), don't
+# count. `blocks_in` names the function a helper blocks in, for the diagnostic.
 # ---------------------------------------------------------------------------------------------
 
 [[sink]]
@@ -59,6 +63,10 @@ functions = [
     "_socket.gethostbyname",
     "_socket.gethostbyname_ex",
     "_socket.gethostbyaddr",
+    "_socket.getnameinfo",
+    "socket.getfqdn",
+    "ssl.get_server_certificate",
+    "urllib.robotparser.RobotFileParser.read",
     "socket.socket.accept",
     "_socket.socket.connect",
     "_socket.socket.recv",
@@ -76,6 +84,10 @@ functions = [
     "smtplib.SMTP.send_message",
     "smtplib.SMTP.quit",
     "ftplib.FTP.__init__",
+    "imaplib.IMAP4.__init__",
+    "imaplib.IMAP4_SSL.__init__",
+    "poplib.POP3.__init__",
+    "poplib.POP3_SSL.__init__",
     "ftplib.FTP.connect",
     "ftplib.FTP.login",
     "imaplib.IMAP4.__init__",
@@ -173,6 +185,21 @@ functions = [
     "shutil.copytree",
     "shutil.move",
     "shutil.copyfileobj",
+    "shutil.copymode",
+    "shutil.copystat",
+    "shutil.chown",
+    "shutil.disk_usage",
+    "shutil.make_archive",
+    "shutil.unpack_archive",
+    "shutil.which",
+    "zipfile.is_zipfile",
+    "tarfile.is_tarfile",
+    "filecmp.cmp",
+    "filecmp.cmpfiles",
+    "configparser.RawConfigParser.read",
+    "netrc.netrc.__init__",
+    "shelve.open",
+    "dbm.open",
     "typing.IO.read",
     "typing.IO.readline",
     "typing.IO.readlines",
@@ -197,6 +224,15 @@ functions = [
 category = "network"
 advice = "log through a `logging.handlers.QueueHandler` and attach the handler to a `QueueListener`, which emits from its own thread"
 functions = ["logging.handlers.SocketHandler.send"]
+
+# Called without a domain, `make_msgid` names the host with `socket.getfqdn()` (a reverse DNS
+# lookup).
+[[sink]]
+category = "network"
+advice = "pass `domain=...`, or `await asyncio.to_thread(...)`"
+unless_given = ["domain"]
+blocks_in = "socket.getfqdn"
+functions = ["email.utils.make_msgid"]
 
 [[sink]]
 category = "subprocess"

@@ -42,6 +42,15 @@ struct SinkGroup {
     direct: bool,
     #[serde(default)]
     opt_in: bool,
+    /// Arguments that make a call skip the blocking work (`make_msgid(domain=...)` resolves no
+    /// host name): only calls known to give none of them block, see
+    /// [`crate::facts::Call::given`].
+    #[serde(default)]
+    unless_given: Vec<String>,
+    /// What these functions block in, internally (`make_msgid` in `socket.getfqdn`):
+    /// diagnostics name it as the blocking function.
+    #[serde(default)]
+    blocks_in: Option<String>,
     functions: Vec<String>,
 }
 
@@ -139,6 +148,10 @@ pub struct Catalog {
     groups: Vec<(String, String)>,
     /// Groups marked `direct`, by index.
     direct: Vec<bool>,
+    /// The `unless_given` arguments of each group, by index.
+    unless_given: Vec<Vec<String>>,
+    /// The `blocks_in` function of each group, by index.
+    blocks_in: Vec<Option<String>>,
     offload: Patterns<()>,
     loop_callbacks: Patterns<()>,
     inspectors: Patterns<()>,
@@ -167,6 +180,8 @@ impl Catalog {
             let index = self.groups.len();
             self.groups.push((group.category, group.advice));
             self.direct.push(group.direct);
+            self.unless_given.push(group.unless_given);
+            self.blocks_in.push(group.blocks_in);
             let patterns = if blocking_decorator { &mut self.blocking_decorators } else { &mut self.sinks };
             for name in &group.functions {
                 patterns.insert(name, index);
@@ -197,12 +212,18 @@ impl Catalog {
     pub fn sink(&self, qualname: &str) -> Option<Sink> {
         let &index = self.sinks.get(qualname)?;
         let (category, advice) = &self.groups[index];
-        Some(Sink { qualname: qualname.to_string(), category: category.clone(), advice: advice.clone() })
+        let qualname = self.blocks_in[index].as_deref().unwrap_or(qualname).to_string();
+        Some(Sink { qualname, category: category.clone(), advice: advice.clone() })
     }
 
     /// Whether `qualname` is a sink only when called directly from loop code.
     pub fn is_direct_sink(&self, qualname: &str) -> bool {
         self.sinks.get(qualname).is_some_and(|&index| self.direct[index])
+    }
+
+    /// Arguments whose presence makes a call to the sink `qualname` not block.
+    pub fn unless_given(&self, qualname: &str) -> &[String] {
+        self.sinks.get(qualname).map_or(&[], |&index| &self.unless_given[index])
     }
 
     /// The blocking behavior a decorator gives the sync functions it decorates.
@@ -246,6 +267,7 @@ impl Catalog {
             .chain(self.inspectors.all())
             .chain(self.log_dispatch.all())
             .chain(self.entries.all())
+            .chain(self.blocks_in.iter().flatten().cloned())
             .collect();
         names.sort();
         names.dedup();

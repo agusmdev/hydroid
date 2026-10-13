@@ -92,6 +92,8 @@ struct Graph<'a> {
     offload: Vec<bool>,
     /// Sinks that only count when called directly from loop code, by function.
     direct: Vec<bool>,
+    /// Arguments that make a call to a sink not block (catalog `unless_given`), by function.
+    unless_given: Vec<&'a [String]>,
     /// Parameters that are called, or handed to something other than an offload API or a
     /// function that only inspects them.
     used_params: HashSet<ParamKey>,
@@ -148,6 +150,7 @@ impl<'a> Graph<'a> {
             called: HashSet::default(),
             offload,
             direct,
+            unless_given: facts.functions.iter().map(|f| catalog.unless_given(&f.qualname)).collect(),
             used_params: HashSet::default(),
             hooks: Vec::new(),
             log_hooks: Vec::new(),
@@ -769,6 +772,22 @@ impl<'a> Graph<'a> {
                 hooks.extend(methods.into_iter().flatten().map(|h| (h, format!("{label} (response rendering)"))));
                 continue;
             }
+            // `add_middleware(cls, ...)` and `Middleware(cls, ...)` only record the factory:
+            // `build_middleware_stack` calls `cls(app, ...)` lazily, in `Starlette.__call__` on
+            // the first lifespan or request event, on the loop.
+            if kind == Some("middleware")
+                && into.starts_with("starlette.")
+                && (slot("middleware_class") || slot("cls"))
+            {
+                let factory = match flow.value {
+                    Value::Class(class) => Hierarchy::lookup(self.facts, class, "__init__"),
+                    Value::Function(f) => Some(f),
+                    Value::Param(..) => None,
+                };
+                let label = entry_label("middleware", into, flow);
+                hooks.extend(factory.map(|f| (f, format!("{label} (construction)"))));
+                continue;
+            }
             let is_route =
                 matches!(kind, Some("route" | "websocket")) && (flow.slot == Slot::Decorated || slot("endpoint"));
             let is_dependency = kind == Some("dependency") && slot("dependency");
@@ -839,6 +858,13 @@ impl<'a> Graph<'a> {
             && (!method.qualname.contains(".<locals>.") || method.location.path == caller.location.path)
     }
 
+    /// Whether the sink `target` blocks when called at `call`: calls giving one of its
+    /// `unless_given` arguments, or not known to leave them out, skip the blocking work.
+    fn blocks_here(&self, call: usize, target: FnId) -> bool {
+        let unless = self.unless_given[target.0 as usize];
+        unless.is_empty() || self.facts.calls[call].given.as_ref().is_some_and(|g| !g.iter().any(|a| unless.contains(a)))
+    }
+
     /// Whether calling `target` at `call` runs its body now: calling a generator function only
     /// creates the generator, unless the call site iterates it right away.
     fn runs_body(&self, call: usize, target: FnId) -> bool {
@@ -888,7 +914,7 @@ impl<'a> Graph<'a> {
                     continue;
                 }
                 if self.sink[t.0 as usize].is_some() {
-                    if !call.awaited && next[call.caller.0 as usize].is_none() {
+                    if !call.awaited && self.blocks_here(i, t) && next[call.caller.0 as usize].is_none() {
                         next[call.caller.0 as usize] = Some((1, i, t));
                         queue.push_back(call.caller);
                     }
@@ -916,7 +942,7 @@ impl<'a> Graph<'a> {
             .iter()
             .filter_map(|&t| {
                 if self.sink[t.0 as usize].is_some() {
-                    (!c.awaited).then_some((0, t))
+                    (!c.awaited && self.blocks_here(call, t)).then_some((0, t))
                 } else if self.facts.function(t).is_async || !self.runs_body(call, t) {
                     None
                 } else {
