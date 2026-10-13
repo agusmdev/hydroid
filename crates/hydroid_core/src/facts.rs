@@ -84,6 +84,11 @@ pub struct Function {
     /// The methods a library method calls on its own instance (`self.name(...)`): a project
     /// subclass overriding one of them runs its override there (template methods).
     pub self_calls: Vec<String>,
+    /// The methods `async def` closures defined in a library method call on its instance:
+    /// `FastAPI.setup` registers the route `async def openapi(req)`, which calls `self.openapi()`
+    /// on the loop. A project callable assigned over one of them on an instance runs there.
+    #[serde(default)]
+    pub closure_self_calls: Vec<String>,
     /// Whether the body was analyzed. Unanalyzed functions (stdlib stubs, libraries without
     /// `--follow-libs`) are leaves: only the catalog knows whether they block.
     pub analyzed: bool,

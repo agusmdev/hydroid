@@ -43,6 +43,8 @@ pub struct FnEntry {
     pub class: Option<u32>,
     /// See [`hydroid_core::facts::Function::self_calls`] (library methods only).
     pub self_calls: Vec<String>,
+    /// See [`hydroid_core::facts::Function::closure_self_calls`] (library methods only).
+    pub closure_self_calls: Vec<String>,
 }
 
 pub struct ClassEntry {
@@ -156,6 +158,7 @@ impl FileIndex {
             parent: None,
             class: None,
             self_calls: Vec::new(),
+            closure_self_calls: Vec::new(),
         };
         index.functions.insert(MODULE_KEY, module_entry);
         let mut builder = Builder { db, index: &mut index, model: &model, scopes: Vec::new(), module };
@@ -432,11 +435,16 @@ pub fn inherits_from(db: &HydroidDb, class: Key, qualname: &str) -> bool {
 
 /// The fully qualified name (`module.Class`) of a top-level class, and its bases.
 fn qualname_and_bases(db: &HydroidDb, class: Key) -> Option<(String, Vec<Key>)> {
+    Some((class_qualname(db, class)?, class_bases(db, class)))
+}
+
+/// The fully qualified name (`module.Class`) of a top-level class.
+pub fn class_qualname(db: &HydroidDb, class: Key) -> Option<String> {
     let (module, _, _) = describe(db, class.0);
     let source = source_text(db, class.0);
     let name: String =
         source.as_str().get(class.1 as usize..)?.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-    Some((format!("{module}.{name}"), class_bases(db, class)))
+    Some(format!("{module}.{name}"))
 }
 
 /// Whose state `<owner>.state` is: the application's when `owner` is an application (a
@@ -680,6 +688,60 @@ fn attribute_calls(class: &ast::StmtClassDef) -> Vec<String> {
 }
 
 fn self_calls(def: &ast::StmtFunctionDef) -> Vec<String> {
+    match receiver_name(def) {
+        Some(receiver) => calls_on(receiver, &def.body),
+        None => Vec::new(),
+    }
+}
+
+/// The methods `async def` closures defined in a method (at any depth) call on the method's
+/// instance, see [`hydroid_core::facts::Function::closure_self_calls`].
+fn closure_self_calls(def: &ast::StmtFunctionDef) -> Vec<String> {
+    struct Closures<'a> {
+        receiver: &'a str,
+        names: Vec<String>,
+    }
+    impl<'ast> SourceOrderVisitor<'ast> for Closures<'_> {
+        fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+            match stmt {
+                Stmt::ClassDef(_) => {}
+                Stmt::FunctionDef(inner) => {
+                    // A closure taking a parameter of the same name has its own receiver.
+                    let parameters = &inner.parameters;
+                    let shadows = parameters.iter().any(|p| p.name().as_str() == self.receiver);
+                    if !shadows {
+                        if inner.is_async {
+                            for name in calls_on(self.receiver, &inner.body) {
+                                if !self.names.contains(&name) {
+                                    self.names.push(name);
+                                }
+                            }
+                        }
+                        walk_stmt(self, stmt);
+                    }
+                }
+                _ => walk_stmt(self, stmt),
+            }
+        }
+    }
+    let Some(receiver) = receiver_name(def) else { return Vec::new() };
+    let mut closures = Closures { receiver, names: Vec::new() };
+    closures.visit_body(&def.body);
+    closures.names
+}
+
+/// The first parameter of an instance method (`self`).
+fn receiver_name(def: &ast::StmtFunctionDef) -> Option<&str> {
+    if def.decorator_list.iter().any(|d| matches!(decorator_name(d), Some("staticmethod" | "classmethod"))) {
+        return None;
+    }
+    let parameters = &def.parameters;
+    Some(parameters.posonlyargs.iter().chain(&parameters.args).next()?.parameter.name.as_str())
+}
+
+/// The methods `body` (not its nested functions and classes) calls on `receiver`
+/// (`receiver.name(...)`).
+fn calls_on(receiver: &str, body: &[Stmt]) -> Vec<String> {
     struct Finder<'a> {
         receiver: &'a str,
         names: Vec<String>,
@@ -703,13 +765,8 @@ fn self_calls(def: &ast::StmtFunctionDef) -> Vec<String> {
             }
         }
     }
-    if def.decorator_list.iter().any(|d| matches!(decorator_name(d), Some("staticmethod" | "classmethod"))) {
-        return Vec::new();
-    }
-    let parameters = &def.parameters;
-    let Some(receiver) = parameters.posonlyargs.iter().chain(&parameters.args).next() else { return Vec::new() };
-    let mut finder = Finder { receiver: receiver.parameter.name.as_str(), names: Vec::new() };
-    finder.visit_body(&def.body);
+    let mut finder = Finder { receiver, names: Vec::new() };
+    finder.visit_body(body);
     finder.names
 }
 
@@ -791,6 +848,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                 {
                     entry.methods.push((def.name.to_string(), key));
                 }
+                let library_method = self.index.origin != Origin::Project && class.is_some();
                 self.index.functions.insert(
                     key,
                     FnEntry {
@@ -818,11 +876,8 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                         positional,
                         parent: self.enclosing_function(),
                         class,
-                        self_calls: if self.index.origin != Origin::Project && class.is_some() {
-                            self_calls(def)
-                        } else {
-                            Vec::new()
-                        },
+                        self_calls: if library_method { self_calls(def) } else { Vec::new() },
+                        closure_self_calls: if library_method { closure_self_calls(def) } else { Vec::new() },
                     },
                 );
                 // Decorators, defaults and annotations are evaluated in the enclosing scope.
@@ -934,6 +989,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     parent: self.enclosing_function(),
                     class: None,
                     self_calls: Vec::new(),
+                    closure_self_calls: Vec::new(),
                 },
             );
             self.scopes.push((Scope::Function(key), qualname));

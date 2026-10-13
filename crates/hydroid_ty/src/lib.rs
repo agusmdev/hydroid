@@ -465,6 +465,7 @@ fn referenced(facts: &[FileFacts]) -> (FxHashSet<File>, FxHashSet<Key>) {
         files.extend(f.calls.iter().filter_map(|c| c.attribute.as_ref().map(|(key, _)| key.0)));
         for store in &f.stores {
             files.insert(store.class.0);
+            classes.insert(store.class);
             if let RawValue::Function((file, _)) | RawValue::Class((file, _)) = store.value {
                 files.insert(file);
             }
@@ -560,6 +561,7 @@ impl<'a> Merger<'a> {
             validates: entry.validates.clone(),
             params: entry.params.clone(),
             self_calls: entry.self_calls.clone(),
+            closure_self_calls: entry.closure_self_calls.clone(),
             parent: None,
             class: None,
             decorators: Vec::new(),

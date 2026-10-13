@@ -20,7 +20,8 @@ use ty_python_semantic::{
 
 use crate::db::HydroidDb;
 use crate::index::{
-    FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, describe, inherits_from, instance_class, is_class_object,
+    FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, class_qualname, describe, inherits_from, instance_class,
+    is_class_object,
     json_only, state_owner, yield_values, yields,
 };
 
@@ -234,6 +235,7 @@ pub fn extract_file(
         } else {
             FxHashSet::default()
         },
+        streamed: FxHashSet::default(),
         out: FileFacts {
             file: index.file,
             signatures: Vec::new(),
@@ -249,6 +251,9 @@ pub fn extract_file(
             stops_propagation: Vec::new(),
         },
     };
+    if index.text(parsed.syntax().range()).contains("StreamingResponse") {
+        extractor.streamed = streamed(&parsed.syntax().body, &|call| extractor.is_streaming_response(call));
+    }
     extractor.visit_body(&parsed.syntax().body);
     extractor.drop_eager_reads();
     extractor.out
@@ -372,6 +377,8 @@ struct Extractor<'a, 'db> {
     callees: FxHashSet<(u32, u32)>,
     /// Constructions (by offset) whose instance is only attached, see [`attach_only`].
     attach_only: FxHashSet<u32>,
+    /// Lazy iterables (by offset) streamed from a worker thread, see [`streamed`].
+    streamed: FxHashSet<u32>,
     out: FileFacts,
 }
 
@@ -825,6 +832,9 @@ impl<'db> Extractor<'_, 'db> {
     /// Iterating `expr` right away: its `__iter__` runs, and, for a generator created by a call,
     /// the generator's body. Lazy builtins (`map(f, xs)`) iterate their own arguments.
     fn iterate(&mut self, expr: &Expr) {
+        if self.streamed.contains(&expr.start().to_u32()) {
+            return;
+        }
         if let Expr::Call(call) = expr {
             if let Expr::Name(name) = &*call.func
                 && LAZY.contains(&name.id.as_str())
@@ -1112,11 +1122,16 @@ impl<'db> Extractor<'_, 'db> {
         (entry.params.first()? == name.id.as_str()).then_some((self.index.file, entry.class?))
     }
 
-    /// `self.name = value` in a method: records callables stored on instances of the class.
+    /// `self.name = value` in a method, or `obj.name = value` in project code (`app.openapi =
+    /// custom_openapi`): records callables stored on instances of the class.
     fn store(&mut self, target: &Expr, value: &Expr) {
         let Expr::Attribute(attr) = target else { return };
-        let Some(class) = self.self_class(&attr.value) else { return };
-        if let Some(value) = self.value_of(value) {
+        let class = self.self_class(&attr.value);
+        if class.is_none() && self.index.origin != Origin::Project {
+            return;
+        }
+        let Some(value) = self.value_of(value) else { return };
+        if let Some(class) = class.or_else(|| self.receiver_class(&attr.value)) {
             self.out.stores.push(RawStore { class, name: attr.attr.to_string(), value });
         }
     }
@@ -1179,7 +1194,7 @@ impl<'db> Extractor<'_, 'db> {
         let args = &call.arguments.args;
         match name {
             "map" | "filter" | "reduce" => {
-                if let Some(f) = args.first() {
+                if let Some(f) = args.first().filter(|_| !self.streamed.contains(&call.start().to_u32())) {
                     self.call_value(call, f);
                 }
                 if name == "reduce"
@@ -1813,6 +1828,15 @@ impl<'db> Extractor<'_, 'db> {
         }
     }
 
+    /// Whether `call` constructs Starlette's `StreamingResponse` itself (subclasses may iterate
+    /// their content differently).
+    fn is_streaming_response(&self, call: &ast::ExprCall) -> bool {
+        let Some(ty @ Type::ClassLiteral(_)) = call.func.inferred_type(self.model) else { return false };
+        self.class_key(&ty)
+            .and_then(|class| class_qualname(self.db, class))
+            .is_some_and(|name| name == "starlette.responses.StreamingResponse")
+    }
+
     /// Whether a function body always returns a Starlette `Response` (every `return` gives an
     /// instance of one, and the body cannot end without returning).
     fn returns_response(&self, body: &[Stmt]) -> bool {
@@ -2398,6 +2422,14 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                 }
                 self.in_scope(lambda.start().to_u32(), |this| this.visit_expr(&lambda.body));
             }
+            // A streamed generator expression only evaluates its first iterable here.
+            Expr::Generator(ast::ExprGenerator { generators, .. })
+                if self.streamed.contains(&expr.start().to_u32()) =>
+            {
+                if let Some(first) = generators.first() {
+                    self.visit_expr(&first.iter);
+                }
+            }
             Expr::ListComp(ast::ExprListComp { generators, .. })
             | Expr::SetComp(ast::ExprSetComp { generators, .. })
             | Expr::Generator(ast::ExprGenerator { generators, .. })
@@ -2550,6 +2582,127 @@ fn body_calls(body: &[Stmt]) -> Vec<&ast::ExprCall> {
     }
     let mut finder = Finder(Vec::new());
     finder.visit_body(body);
+    finder.0
+}
+
+/// Lazy iterables given to a `StreamingResponse` (`is_streaming` says which calls construct
+/// one) as its content, directly or through a variable only used there: generator expressions
+/// and `map(f, xs)` / `filter(f, xs)`, also inside `zip`, `enumerate` or `iter` (by offset).
+/// Starlette advances a sync iterable in a worker thread (`iterate_in_threadpool`), so their
+/// elements are computed there; only `iter(content)` runs on the loop, which for these does
+/// nothing. A generator expression that awaits is an async generator, iterated on the loop.
+fn streamed(body: &[Stmt], is_streaming: &dyn Fn(&ast::ExprCall) -> bool) -> FxHashSet<u32> {
+    #[derive(Default)]
+    struct Scope<'a> {
+        functions: Vec<&'a ast::StmtFunctionDef>,
+        /// `name = value`, by name.
+        assigned: Vec<(&'a str, &'a Expr)>,
+        stores: Vec<&'a str>,
+        loads: Vec<&'a str>,
+        /// Calls (`StreamingResponse(content)`), with their first argument.
+        contents: Vec<(&'a ast::ExprCall, &'a Expr)>,
+    }
+    impl<'a> SourceOrderVisitor<'a> for Scope<'a> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            match stmt {
+                Stmt::FunctionDef(def) => {
+                    self.functions.push(def);
+                    return;
+                }
+                Stmt::ClassDef(_) => return,
+                Stmt::Assign(assign) => {
+                    if let [Expr::Name(name)] = &assign.targets[..] {
+                        self.assigned.push((name.id.as_str(), &assign.value));
+                    }
+                }
+                _ => {}
+            }
+            walk_stmt(self, stmt);
+        }
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            match expr {
+                // Any call: `StreamingResponse` may be imported under another name.
+                Expr::Call(call) => {
+                    let content = call.arguments.args.first().or(call.arguments.find_keyword("content").map(|k| &k.value));
+                    self.contents.extend(content.map(|content| (call, content)));
+                }
+                Expr::Name(name) if name.ctx == ExprContext::Store => self.stores.push(name.id.as_str()),
+                Expr::Name(name) if name.ctx == ExprContext::Load => self.loads.push(name.id.as_str()),
+                _ => {}
+            }
+            walk_expr(self, expr);
+        }
+    }
+    fn lazy(expr: &Expr, out: &mut FxHashSet<u32>) {
+        match expr {
+            Expr::Generator(generator)
+                if generator.generators.iter().all(|g| !g.is_async) && !contains_await(expr) =>
+            {
+                out.insert(expr.start().to_u32());
+                if let Some(first) = generator.generators.first() {
+                    lazy(&first.iter, out);
+                }
+            }
+            Expr::Call(call) => match called_name(call) {
+                Some("map" | "filter") if matches!(&*call.func, Expr::Name(_)) && call.arguments.keywords.is_empty() => {
+                    out.insert(expr.start().to_u32());
+                    for argument in call.arguments.args.iter().skip(1) {
+                        lazy(argument, out);
+                    }
+                }
+                Some("zip" | "enumerate" | "iter") if matches!(&*call.func, Expr::Name(_)) => {
+                    for argument in &call.arguments.args {
+                        lazy(argument, out);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    let mut found = FxHashSet::default();
+    let mut bodies = vec![body];
+    while let Some(body) = bodies.pop() {
+        let mut scope = Scope::default();
+        scope.visit_body(body);
+        bodies.extend(scope.functions.iter().map(|def| &def.body[..]));
+        for &(call, content) in &scope.contents {
+            let content = match content {
+                Expr::Name(name) => {
+                    let name = name.id.as_str();
+                    let once = |uses: &[&str]| uses.iter().filter(|n| **n == name).count() == 1;
+                    let assigned = scope.assigned.iter().find(|(n, _)| *n == name);
+                    match assigned {
+                        Some((_, value)) if once(&scope.stores) && once(&scope.loads) => *value,
+                        _ => continue,
+                    }
+                }
+                content => content,
+            };
+            let mut parts = FxHashSet::default();
+            lazy(content, &mut parts);
+            // The callee last: checking it runs type inference.
+            if !parts.is_empty() && is_streaming(call) {
+                found.extend(parts);
+            }
+        }
+    }
+    found
+}
+
+/// Whether an expression awaits (outside nested lambdas, which cannot).
+fn contains_await(expr: &Expr) -> bool {
+    struct Finder(bool);
+    impl<'a> SourceOrderVisitor<'a> for Finder {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if matches!(expr, Expr::Await(_)) {
+                self.0 = true;
+            }
+            walk_expr(self, expr);
+        }
+    }
+    let mut finder = Finder(false);
+    finder.visit_expr(expr);
     finder.0
 }
 

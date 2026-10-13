@@ -1137,8 +1137,64 @@ impl<'a> Graph<'a> {
             let label = format!("{} ({name})", entry_label(kind, into, flow));
             hooks.extend(found.iter().map(|&h| (h, label.clone())));
         }
+        // A project callable assigned over a library method on an instance (`app.openapi =
+        // custom_openapi`) runs wherever the library calls that method on the instance.
+        let mut loop_calls: HashMap<ClassId, HashMap<String, FnId>> = HashMap::default();
+        for store in &self.facts.stores {
+            let Value::Function(f) = store.value else { continue };
+            let replaced = Hierarchy::lookup(self.facts, store.class, &store.name);
+            if self.facts.function(f).origin != Origin::Project
+                || replaced.is_none_or(|m| self.facts.function(m).origin == Origin::Project)
+            {
+                continue;
+            }
+            let calls = loop_calls.entry(store.class).or_insert_with(|| self.loop_self_calls(store.class));
+            if let Some(&caller) = calls.get(&store.name) {
+                let caller = &self.facts.function(caller).qualname;
+                hooks.push((f, format!("`{}` replaced on an instance, called by {caller}", store.name)));
+            }
+        }
         hooks.retain(|(h, _)| self.facts.function(*h).analyzed);
         hooks
+    }
+
+    /// The methods library code calls on the loop on an instance of `class`, each with the
+    /// library function calling it: what its `async def` methods (and the `async def` closures
+    /// its methods define, such as the routes `FastAPI.setup` registers) call on `self`,
+    /// directly or through other library methods.
+    fn loop_self_calls(&self, class: ClassId) -> HashMap<String, FnId> {
+        let mut found: HashMap<String, FnId> = HashMap::default();
+        let mut queue = VecDeque::new();
+        for c in self.ancestors(class) {
+            for &(_, m) in &self.facts.class(c).methods {
+                let f = self.facts.function(m);
+                if f.origin == Origin::Project {
+                    continue;
+                }
+                let direct = if f.is_async { &f.self_calls[..] } else { &[] };
+                for name in direct.iter().chain(&f.closure_self_calls) {
+                    if !found.contains_key(name) {
+                        found.insert(name.clone(), m);
+                        queue.push_back(name.clone());
+                    }
+                }
+            }
+        }
+        while let Some(name) = queue.pop_front() {
+            let Some(m) = Hierarchy::lookup(self.facts, class, &name) else { continue };
+            let f = self.facts.function(m);
+            if f.origin == Origin::Project {
+                continue;
+            }
+            let caller = found[&name];
+            for next in &f.self_calls {
+                if !found.contains_key(next) {
+                    found.insert(next.clone(), caller);
+                    queue.push_back(next.clone());
+                }
+            }
+        }
+        found
     }
 
     /// What a library `async def` method runs of the project when it runs on an instance of
