@@ -125,7 +125,8 @@ Launch a fixer subagent (Agent tool, `general-purpose`) with
 false-positive leads (`{LEADS}`, "none" when there are none) filled in.
 List the holdout case names in its prompt as forbidden to read. Run fixers one after another, not
 in parallel: they edit the same analysis code. Each fixer ends when
-`python3 scripts/hillclimb/gate.py --base {BASE}` passes, or it reports that it is stuck.
+`python3 scripts/hillclimb/gate.py --base {BASE}` passes, or it reports that it is stuck. A fixer never
+passes `--lock-base`: reject any fixer result whose gate run used it.
 
 After each fixer returns, review its diff yourself (`git diff $BASE`): reject special-casing of
 test names, file names or line numbers, catalog entries that only exist to match one case, and

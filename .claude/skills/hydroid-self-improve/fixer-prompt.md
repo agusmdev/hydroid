@@ -34,6 +34,8 @@ Each case's `RATIONALE.md` says what runs on the loop and why.
 - You must NOT read these held-out cases: {HOLDOUT}. You must NOT edit `scripts/hillclimb/`,
   `tests/adversarial/`, `tests/fixtures/pyproject.toml`, `tests/fixtures/uv.lock`,
   `.claude/hillclimb/`, `.claude/skills/`. The gate rejects such diffs.
+- Never pass `--lock-base` to `gate.py`: it moves the harness lock off `{BASE}` and exists only for
+  human-approved harness sessions. A gate run with it does not count.
 - No false positives anywhere: precision matters more than recall. Performance matters: hydroid
   runs on large codebases (Polar: ~1,900 files); avoid whole-program passes that scale badly. Watch
   the analysis phase, not only extraction: the warm (cached) Polar run must stay under 500 ms.

@@ -25,9 +25,11 @@ Calls that cannot block are not recorded:
 - a socket operation on a non-blocking socket (timeout 0, as asyncio's transports use) returns or
   fails at once;
 - a call giving an argument the catalog lists in `unless_given` skips the blocking work;
-- blocking that happens wholly inside library code, below a library coroutine the case awaits,
-  with no case frame under that coroutine, is the library's own (FastAPI reading the endpoint's
-  source on the first request): the case made no call that leads to it.
+- a call whose stack runs through a function in IGNORED_FRAMES (framework introspection that no
+  case call causes; each entry says why).
+Blocking inside library code under a library coroutine the case awaits (`await sdk.fetch()`
+calling `requests.get`) is recorded at the case's `await` line.
+
 Off the loop, sleeps return at once, and network connections and process starts fail at once: no
 case reaches the network or runs a command (multiprocessing pools still start Python workers).
 
@@ -62,6 +64,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CATALOG = ROOT / "crates/hydroid_core/catalog.toml"
 ASYNC_FLAGS = inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR | inspect.CO_ITERABLE_COROUTINE
+
+# Library functions whose blocking calls are not recorded, as (module, qualname). Keep this list
+# minimal: an entry is only for work the framework does on its own, which no case call causes.
+IGNORED_FRAMES = {
+    # FastAPI >= 0.13x reads the endpoint's source file once per endpoint (inspect.getsourcelines,
+    # for error messages) on its first request, below the case's `await call_next(...)` /
+    # `await self.app(...)`: one-time introspection of the case's own code, not a case call.
+    ("fastapi.routing", "_extract_endpoint_context"),
+}
 
 # Libraries the cases may use: imported before any patch, so locks they create at import time stay
 # real (only locks the case creates are watched).
@@ -102,6 +113,8 @@ class Recorder:
             stack.append(frame)
             frame = frame.f_back
         stack.reverse()  # outermost first
+        if any((f.f_globals.get("__name__"), f.f_code.co_qualname) in IGNORED_FRAMES for f in stack):
+            return None
         inner_async = max((i for i, f in enumerate(stack) if f.f_code.co_flags & ASYNC_FLAGS), default=-1)
         case_after = [f for f in stack[inner_async + 1:] if self.in_case(f.f_code)]
         if inner_async >= 0 and self.in_case(stack[inner_async].f_code):
@@ -109,9 +122,11 @@ class Recorder:
         elif case_after:
             at = case_after[0]  # a sync callback the loop (or a library coroutine) calls
         else:
-            # No case code under the innermost coroutine: the call is the library's own work (case
-            # frames above it only await the library), or no case code is on the stack at all.
-            return None
+            # Library code under a library coroutine: at the innermost case frame awaiting it.
+            before = [f for f in stack[:inner_async] if self.in_case(f.f_code)]
+            if not before:
+                return None
+            at = before[-1]
         innermost_case = next(f for f in reversed(stack) if self.in_case(f.f_code))
         return self.rel(at.f_code), at.f_lineno, innermost_case is at
 

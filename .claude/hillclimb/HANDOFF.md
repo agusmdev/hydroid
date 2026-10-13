@@ -231,7 +231,7 @@ No hydroid code (`crates/`, `catalog.toml`), case labels or `split.json` changed
 - `bbbcc19` oracle: calls that cannot block are not recorded. General rules, no library names:
   - A catalog method on an object whose class has `async def` methods is probed first, with every catalog call under it refused. If it only builds an awaitable, it is not recorded (awaited `redis.asyncio`).
   - A socket operation on a non-blocking socket (timeout 0) is not recorded (`httpx.AsyncClient`). Connections stay disabled except `AF_UNIX`.
-  - Blocking wholly inside library code, under a library coroutine with no case frame below it, is no longer attributed to the case frame that awaits it (FastAPI's `inspect.getsourcelines`). No suite case used that attribution branch.
+  - ~~Blocking wholly inside library code under a library coroutine is not attributed to the case~~: too broad, it hid `await sdk.fetch()` blocking inside. Reverted in the follow-up commit below.
   - Catalog `unless_given` is honoured (`make_msgid(domain=...)`). This fixes the suite's only INVALID case.
   - Tests: `scripts/hillclimb/test_oracle.py`, cases in `scripts/hillclimb/tests/oracle/`. All 4 fail with the old oracle and pass now.
 - `1884894` gate: the holdout ratchet is keyed by the holdout case set.
@@ -239,6 +239,12 @@ No hydroid code (`crates/`, `catalog.toml`), case labels or `split.json` changed
   - When the set has no recorded round, the gate builds `--base` (cached in `target/gate-base/`) and scores the current set with it as the baseline.
   - New flags: `--require-holdout-gain`, and `--lock-base` (harness sessions only).
 - `67def39` gate: `literals.py` fails on added Rust string literals that look like qualified names and prints the others. On `f02284a..7bd0d27` it fails with the 27 qualified names of section 3 and prints 160 other literals.
+- Follow-up (commit after `eb4dd7b`): oracle attribution restored.
+  - Blocking inside library code under a library coroutine the case awaits is again recorded at the case's `await` line (`before[-1]`).
+  - Only FastAPI's own source read is ignored. `IGNORED_FRAMES` in `oracle_runtime.py` has one entry, `fastapi.routing._extract_endpoint_context`: one-time introspection of the endpoint that no case call causes. A general rule (no case frame below the library coroutine) could not tell it apart from an async SDK that blocks.
+  - New oracle test `library_coroutine`: it awaits `fake_sdk.fetch()` (in `scripts/hillclimb/tests/oracle_lib/`, put on `PYTHONPATH` as library code), which calls `requests.get`; it must be recorded at the `await` line. It fails with the `bbbcc19` oracle. `framework_own_io` still passes, and fails without the ignore entry.
+  - `check.py --suite`: no verdict or recorded-line change against `bbbcc19` (28 BREAKS, 71 PASSES). `test_oracle.py` 5/5, `test_gate.py` OK.
+  - SKILL.md and fixer-prompt.md: a fixer never passes `--lock-base`; a gate run with it does not count.
 - `b1ba25f` skill: the new policy (holdout FPs become fixer leads, no library rules in Rust, triage by analysis gap, no protocol rounds, `--polar` every round, branch rule).
   - `gate.py --polar` records the cold and warm medians.
 

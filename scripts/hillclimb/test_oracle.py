@@ -2,11 +2,13 @@
 """Tests for the runtime oracle (oracle_runtime.py). Each case in scripts/hillclimb/tests/oracle/
 labels exactly what must block on the loop (`# expect: NAME`, the outermost catalog function the
 oracle records): an unlabeled recorded call is a false report, a label not recorded is a miss.
+Modules in tests/oracle_lib/ are importable as library code (outside every case dir).
 
 Usage: test_oracle.py [CASE...] [--oracle PATH]   (--oracle: test another oracle, e.g. an old one)
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -17,6 +19,7 @@ from score import expectations  # noqa: E402
 import check  # noqa: E402
 
 TESTS = Path(__file__).resolve().parent / "tests/oracle"
+LIBRARY = Path(__file__).resolve().parent / "tests/oracle_lib"
 
 
 def main() -> int:
@@ -25,6 +28,7 @@ def main() -> int:
     parser.add_argument("--oracle", type=Path, default=ORACLE)
     args = parser.parse_args()
     check.ORACLE = args.oracle.resolve()
+    os.environ["PYTHONPATH"] = os.pathsep.join(filter(None, [str(LIBRARY), os.environ.get("PYTHONPATH")]))
     cases = [c.resolve() for c in args.cases] or sorted(p for p in TESTS.iterdir() if p.is_dir())
     failed = 0
     for case in cases:
