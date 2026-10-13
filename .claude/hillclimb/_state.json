@@ -311,6 +311,13 @@
         "fp4_pyd_json_only_serializer",
         "route_openapi_override"
       ]
+    },
+    {
+      "round": 15,
+      "lever": "protocol",
+      "protocol": "holdout baseline after promoting this round's cases (incl. 12 backlog holdout misses from earlier rounds), before any fix (same protocol as round 6).",
+      "holdout_recall": "4/34",
+      "holdout_fp": 0
     }
   ],
   "ground_truth": "scripts/hillclimb/oracle_runtime.py via check.py: a case is promoted only when the runtime proves every line where hydroid disagrees (verdict BREAKS), or with a reviewer's note"
