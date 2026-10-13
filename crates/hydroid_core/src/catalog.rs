@@ -30,6 +30,9 @@ struct CatalogFile {
     /// What library functions do with their arguments during the call.
     #[serde(default)]
     arguments: Vec<ArgumentGroup>,
+    /// Functions raising when no event loop runs in the calling thread.
+    #[serde(default)]
+    loop_probe: Vec<LoopProbeGroup>,
     #[serde(default)]
     entry: Vec<EntryGroup>,
 }
@@ -99,6 +102,16 @@ pub struct Arguments {
     pub lazy: bool,
 }
 
+/// `[[loop_probe]]`: functions raising `raises` (a class) when no event loop is running in the
+/// calling thread. The handlers catching it of a `try` that only makes such calls never run on
+/// the loop.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoopProbeGroup {
+    raises: String,
+    functions: Vec<String>,
+}
+
 /// A positional argument (from 0, not counting `self`), a keyword argument, or `"*"`.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(untagged)]
@@ -156,6 +169,14 @@ impl<T: Clone> Patterns<T> {
     fn entries(&self) -> impl Iterator<Item = (String, &T)> + '_ {
         self.exact.iter().map(|(n, v)| (n.clone(), v)).chain(self.globs.iter().map(|(p, v)| (p.join("."), v)))
     }
+}
+
+/// The last segment of every name, `None` when one ends in a pattern (`*`).
+fn last_segments(names: impl Iterator<Item = String>) -> Option<rustc_hash::FxHashSet<String>> {
+    names.map(|n| n.rsplit('.').next().map(str::to_string)).try_fold(rustc_hash::FxHashSet::default(), |mut set, last| {
+        set.insert(last.filter(|l| !l.contains('*'))?);
+        Some(set)
+    })
 }
 
 /// Whether `qualname` matches a catalog name (`*` matches within one dotted segment).
@@ -235,6 +256,8 @@ pub struct Catalog {
     argument_effects: Vec<Arguments>,
     /// The last segment of every `arguments` name (`None`: a pattern ends in `*`).
     argument_names: Option<rustc_hash::FxHashSet<String>>,
+    /// `[[loop_probe]]` names (or patterns), with the class they raise.
+    loop_probes: Vec<(String, String)>,
     entries: Patterns<usize>,
     entry_kinds: Vec<String>,
 }
@@ -285,14 +308,10 @@ impl Catalog {
                 self.arguments.insert(name, index);
             }
         }
-        self.argument_names = self.arguments.all().map(|n| n.rsplit('.').next().map(str::to_string)).try_fold(
-            rustc_hash::FxHashSet::default(),
-            |mut names, last| {
-                let last = last.filter(|l| !l.contains('*'))?;
-                names.insert(last);
-                Some(names)
-            },
-        );
+        self.argument_names = last_segments(self.arguments.all());
+        for group in file.loop_probe {
+            self.loop_probes.extend(group.functions.into_iter().map(|f| (f, group.raises.clone())));
+        }
         for group in file.entry {
             let index = self.entry_kinds.len();
             self.entry_kinds.push(group.kind);
@@ -402,6 +421,11 @@ impl Catalog {
         self.argument_names.as_ref().is_none_or(|names| names.contains(name))
     }
 
+    /// Every `[[loop_probe]]` name (or pattern), with the class it raises.
+    pub fn loop_probes(&self) -> &[(String, String)] {
+        &self.loop_probes
+    }
+
     /// The entry-point kind registered by passing a callable to `qualname`.
     pub fn entry_kind(&self, qualname: &str) -> Option<&str> {
         self.entries.get(qualname).map(|&i| self.entry_kinds[i].as_str())
@@ -418,6 +442,7 @@ impl Catalog {
             .chain(self.inspectors.all())
             .chain(self.log_dispatch.all())
             .chain(self.arguments.all())
+            .chain(self.loop_probes.iter().flat_map(|(f, raises)| [f.clone(), raises.clone()]))
             .chain(self.entries.all())
             .chain(self.blocks_in.iter().flatten().cloned())
             .collect();

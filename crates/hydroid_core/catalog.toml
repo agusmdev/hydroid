@@ -566,6 +566,20 @@ functions = [
 ]
 
 # ---------------------------------------------------------------------------------------------
+# Functions raising `raises` when no event loop runs in the calling thread. The handlers that
+# catch it (or one of its bases) of a `try` doing nothing but call these never run on the loop:
+# sync helpers shared by loop code and worker threads fall back to blocking work there.
+# ---------------------------------------------------------------------------------------------
+[[loop_probe]]
+raises = "builtins.RuntimeError"
+functions = ["_asyncio.get_running_loop"]
+
+# The same for a third-party library, sniffio:
+# [[loop_probe]]
+# raises = "sniffio._impl.AsyncLibraryNotFoundError"
+# functions = ["sniffio._impl.current_async_library"]
+
+# ---------------------------------------------------------------------------------------------
 # Sync callables passed to these run *on* the event loop.
 # ---------------------------------------------------------------------------------------------
 [loop_callback]

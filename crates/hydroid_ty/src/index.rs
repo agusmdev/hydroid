@@ -444,6 +444,20 @@ pub fn instance_class(model: &SemanticModel<'_>, expr: &Expr) -> Option<Key> {
     class
 }
 
+/// Whether `class` inherits from `base` (through indexed bases).
+pub fn inherits(db: &HydroidDb, class: Key, base: Key) -> bool {
+    let (mut queue, mut seen) = (vec![class], rustc_hash::FxHashSet::default());
+    while let Some(class) = queue.pop() {
+        if class == base {
+            return true;
+        }
+        if seen.insert(class) && seen.len() <= 32 {
+            queue.extend(class_bases(db, class));
+        }
+    }
+    false
+}
+
 /// Whether `class` is the top-level class `qualname` or inherits from it.
 pub fn inherits_from(db: &HydroidDb, class: Key, qualname: &str) -> bool {
     let (mut queue, mut seen) = (vec![class], rustc_hash::FxHashSet::default());

@@ -21,8 +21,8 @@ use ty_python_semantic::{
 
 use crate::db::HydroidDb;
 use crate::index::{
-    FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, class_method, class_qualname, describe, inherits_from, instance_class,
-    is_class_object,
+    FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, class_method, class_qualname, describe, inherits, inherits_from,
+    instance_class, is_class_object,
     json_only, state_owner, yield_values, yields,
 };
 
@@ -212,8 +212,16 @@ pub struct Shared<'a> {
     pub orm: &'a Orm,
     pub instances: &'a Instances,
     pub catalog: &'a Catalog,
-    /// The definitions the catalog says what they do with their arguments (`[[arguments]]`).
-    pub arguments: &'a FxHashMap<Key, &'a Arguments>,
+    pub keys: &'a CatalogKeys<'a>,
+}
+
+/// What the catalog says about definitions, by definition (catalog names resolved once).
+#[derive(Default)]
+pub struct CatalogKeys<'c> {
+    /// `[[arguments]]`: what they do with their arguments.
+    pub arguments: FxHashMap<Key, &'c Arguments>,
+    /// `[[loop_probe]]`: functions raising when no event loop runs, with the classes raised.
+    pub loop_probes: FxHashMap<Key, Vec<Key>>,
 }
 
 /// Extracts the bodies of `wanted` functions (every function and the module body when `None`).
@@ -224,7 +232,7 @@ pub fn extract_file(
     implicit: Option<&Implicit>,
     shared: &Shared,
 ) -> FileFacts {
-    let Shared { state, orm, instances, catalog, arguments } = *shared;
+    let Shared { state, orm, instances, catalog, keys } = *shared;
     let program_file = ty_python_semantic::Db::program_file(db, index.file);
     let model = SemanticModel::new(db, program_file);
     let parsed = parsed_module(db, model.python_file()).load(db);
@@ -234,7 +242,7 @@ pub fn extract_file(
         orm,
         instances,
         catalog,
-        arguments,
+        keys,
         call_arguments: RefCell::default(),
         lazy_reads: Vec::new(),
         model: &model,
@@ -373,8 +381,7 @@ struct Extractor<'a, 'db> {
     orm: &'a Orm,
     instances: &'a Instances,
     catalog: &'a Catalog,
-    /// See [`Shared::arguments`].
-    arguments: &'a FxHashMap<Key, &'a Arguments>,
+    keys: &'a CatalogKeys<'a>,
     /// Memoized [`Extractor::call_arguments`], by call offset.
     call_arguments: RefCell<FxHashMap<u32, Option<&'a Arguments>>>,
     /// Lazy relationship reads recorded: `(function, location, relationship)`.
@@ -827,7 +834,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
     /// or the function called.
     fn arguments_of(&self, resolution: &Resolution) -> Option<&'a Arguments> {
         let mut keys = resolution.constructs.into_iter().chain(resolution.targets.iter().map(|(k, _)| *k));
-        keys.find_map(|key| self.arguments.get(&key).copied())
+        keys.find_map(|key| self.keys.arguments.get(&key).copied())
     }
 
     /// [`Extractor::arguments_of`] for a call met outside [`Extractor::handle_call`]: calls to a
@@ -2412,24 +2419,44 @@ impl<'a, 'db> Extractor<'a, 'db> {
         }
     }
 
-    /// Whether a `try` body only asks for the running loop (`asyncio.get_running_loop()`, maybe
-    /// assigned): the only exception it can raise is the `RuntimeError` of "no running loop".
-    fn probes_running_loop(&self, body: &[Stmt]) -> bool {
+    /// The classes a `try` body may raise when no event loop is running in this thread, if that
+    /// is all it does: it only calls catalog `[[loop_probe]]` functions (maybe assigning what
+    /// they return), like `asyncio.get_running_loop()`.
+    fn probes_running_loop(&self, body: &[Stmt]) -> Option<Vec<Key>> {
         let simple =
             body.iter().all(|s| matches!(s, Stmt::Expr(_) | Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::Pass(_)));
         let calls = body_calls(body);
-        simple
-            && !calls.is_empty()
-            && calls.iter().all(|call| {
-                called_name(call) == Some("get_running_loop")
-                    && self
-                        .resolve(&call.func, Some(call))
-                        .targets
-                        .iter()
-                        .any(|((file, _), _)| {
-                            matches!(describe(self.db, *file).0.as_str(), "_asyncio" | "asyncio.events")
-                        })
-            })
+        if !simple || calls.is_empty() || self.keys.loop_probes.is_empty() {
+            return None;
+        }
+        let mut raised = Vec::new();
+        for call in calls {
+            let resolution = self.resolve(&call.func, Some(call));
+            let found: Vec<&Vec<Key>> =
+                resolution.targets.iter().filter_map(|(key, _)| self.keys.loop_probes.get(key)).collect();
+            if found.is_empty() || found.len() < resolution.targets.len() {
+                return None;
+            }
+            raised.extend(found.into_iter().flatten().copied());
+        }
+        Some(raised)
+    }
+
+    /// Whether an `except` clause catches every class in `raised`: bare, or naming one of their
+    /// classes or bases (or a tuple of such).
+    fn catches(&self, type_: Option<&Expr>, raised: &[Key]) -> bool {
+        let Some(type_) = type_ else { return true };
+        let caught: Vec<Key> = match type_ {
+            Expr::Tuple(tuple) => tuple.elts.iter().filter_map(|e| self.class_value(e)).collect(),
+            e => self.class_value(e).into_iter().collect(),
+        };
+        !raised.is_empty() && raised.iter().all(|&r| caught.iter().any(|&c| r == c || inherits(self.db, r, c)))
+    }
+
+    /// The class an expression evaluates to (a class object).
+    fn class_value(&self, expr: &Expr) -> Option<Key> {
+        let ty = expr.inferred_type(self.model)?;
+        is_class_object(&ty).then(|| self.class_key(&ty))?
     }
 
     fn in_scope(&mut self, key: u32, f: impl FnOnce(&mut Self)) {
@@ -2516,11 +2543,12 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
             // `try: asyncio.get_running_loop()` / `except RuntimeError:`: the handler runs only
             // when no loop is running in this thread, so never on the loop. Its calls are left
             // out (a sync helper shared by loop code and worker threads).
-            Stmt::Try(try_stmt) if self.recording() && self.probes_running_loop(&try_stmt.body) => {
+            Stmt::Try(try_stmt) if self.recording() && self.probes_running_loop(&try_stmt.body).is_some() => {
+                let raised = self.probes_running_loop(&try_stmt.body).unwrap_or_default();
                 self.visit_body(&try_stmt.body);
                 for handler in &try_stmt.handlers {
                     let ast::ExceptHandler::ExceptHandler(h) = handler;
-                    if !catches_runtime_error(h.type_.as_deref()) {
+                    if !self.catches(h.type_.as_deref(), &raised) {
                         self.visit_except_handler(handler);
                     }
                 }
@@ -3086,19 +3114,6 @@ fn expires(call: &ast::ExprCall, var: &str) -> bool {
 
 fn first_argument_is(call: &ast::ExprCall, var: &str) -> bool {
     matches!(call.arguments.args.first(), Some(Expr::Name(n)) if n.id.as_str() == var)
-}
-
-/// Whether an `except` clause catches `RuntimeError`: bare, `RuntimeError` or a base of it, or
-/// a tuple naming one of those.
-fn catches_runtime_error(type_: Option<&Expr>) -> bool {
-    let named = |e: &Expr| {
-        matches!(e, Expr::Name(n) if matches!(n.id.as_str(), "RuntimeError" | "Exception" | "BaseException"))
-    };
-    match type_ {
-        None => true,
-        Some(Expr::Tuple(tuple)) => tuple.elts.iter().any(named),
-        Some(e) => named(e),
-    }
 }
 
 /// The call expression spanning exactly `range` in a module.

@@ -165,6 +165,7 @@ a class name stands for constructing the class.
 | `[loop_callback]` | callables passed to these run on the event loop later | `functions` |
 | `[inspects]` | callables passed to these are only inspected, never called | `functions` |
 | `[[arguments]]` | what these functions do with their arguments, in the calling thread | `functions`, and any of: `calls` (callables given there are called), `iterates` (iterables given there are iterated), `enters` (context managers given there are entered and exited), `methods` (methods called on the first positional argument), `lazy` (the call returns a lazy iterator: iterating it iterates what `iterates` names, and what `calls` names runs where it is consumed) |
+| `[[loop_probe]]` | these functions raise `raises` (a class) when no event loop runs in the calling thread: the handlers catching it (or a base) of a `try` doing nothing but call them never run on the loop | `raises`, `functions` |
 | `[[entry]]` | callables passed to these are framework entry points | `kind`, `functions` |
 
 Argument slots (`calls`, `iterates`, `enters`) are positions (`0` is the first argument after

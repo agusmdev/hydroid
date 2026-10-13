@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use hydroid_core::catalog::{Arguments, Catalog, qualname_matches};
+use hydroid_core::catalog::{Catalog, qualname_matches};
 use hydroid_core::facts::{
     Call, Class, ClassId, Facts, FnId, Flow, Function, Instance, Level, LogUse, ModelField, Origin, ResponseOptions, Signature, Slot,
     Store, Value,
@@ -25,7 +25,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use ty_module_resolver::{ModuleName, resolve_module_confident};
 
 use crate::db::HydroidDb;
-use crate::extract::{AppState, FileFacts, Implicit, Instances, Orm, RawInstance, RawSlot, RawValue, Shared, extract_file};
+use crate::extract::{
+    AppState, CatalogKeys, FileFacts, Implicit, Instances, Orm, RawInstance, RawSlot, RawValue, Shared, extract_file,
+};
 use crate::index::{FileIndex, Key, class_bases};
 
 pub struct Extraction {
@@ -89,15 +91,21 @@ fn catalog_definitions(db: &HydroidDb, indexes: &Indexes, name: &str) -> Vec<Key
     Vec::new()
 }
 
-/// The definitions the catalog's `[[arguments]]` name, with what each does with its arguments.
-fn argument_definitions<'c>(db: &HydroidDb, indexes: &Indexes, catalog: &'c Catalog) -> FxHashMap<Key, &'c Arguments> {
-    let mut found = FxHashMap::default();
+/// What the catalog says about the definitions extraction meets, resolved to them once.
+fn catalog_keys<'c>(db: &HydroidDb, indexes: &Indexes, catalog: &'c Catalog) -> CatalogKeys<'c> {
+    let mut keys = CatalogKeys::default();
     for (name, arguments) in catalog.argument_entries() {
         for key in catalog_definitions(db, indexes, &name) {
-            found.insert(key, arguments);
+            keys.arguments.insert(key, arguments);
         }
     }
-    found
+    for (name, raises) in catalog.loop_probes() {
+        let raised = catalog_definitions(db, indexes, raises);
+        for key in catalog_definitions(db, indexes, name) {
+            keys.loop_probes.entry(key).or_default().extend(raised.iter().copied());
+        }
+    }
+    keys
 }
 
 /// Phase timings on stderr when `HYDROID_TIMINGS` is set (for profiling large projects).
@@ -142,12 +150,12 @@ pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
     timings.phase("environment and project files");
 
     let indexes = Indexes::default();
-    let arguments = argument_definitions(&db, &indexes, options.catalog);
+    let keys = catalog_keys(&db, &indexes, options.catalog);
     let mut merger = Merger::new(&db, &indexes);
     let units: Vec<(File, Option<FxHashSet<u32>>)> = files.iter().map(|&f| (f, None)).collect();
     indexes.prebuild(&db, files.iter().copied().collect(), FxHashSet::default());
     timings.phase("project indexes");
-    let mut round = run(&db, &indexes, &units, options.follow_libs, options.catalog, &arguments);
+    let mut round = run(&db, &indexes, &units, options.follow_libs, options.catalog, &keys);
     timings.phase("bodies");
     let mut first = true;
     loop {
@@ -176,7 +184,7 @@ pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
         if next.is_empty() {
             break;
         }
-        round = run(&db, &indexes, &next, true, options.catalog, &arguments);
+        round = run(&db, &indexes, &next, true, options.catalog, &keys);
     }
     let entry = cache::Entry { files: files.len(), facts: merger.finish() };
     timings.phase("merged");
@@ -531,7 +539,7 @@ fn run(
     units: &[(File, Option<FxHashSet<u32>>)],
     all_implicit: bool,
     catalog: &Catalog,
-    arguments: &FxHashMap<Key, &Arguments>,
+    keys: &CatalogKeys,
 ) -> Vec<FileFacts> {
     let implicit = (!all_implicit).then(|| indexes.implicit());
     let state = indexes.app_state();
@@ -544,7 +552,7 @@ fn run(
             || shared.lock().clone(),
             |db, (file, wanted)| {
                 let index = indexes.get(db, *file);
-                let shared = Shared { state: &state, orm: &orm, instances: &instances, catalog, arguments };
+                let shared = Shared { state: &state, orm: &orm, instances: &instances, catalog, keys };
                 extract_file(db, &index, wanted.as_ref(), implicit.as_ref(), &shared)
             },
         )
