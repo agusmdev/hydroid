@@ -201,6 +201,25 @@
       "protocol": "holdout batch 3 sealed: new holdout cases promoted by the self-improve loop from round 6 on (batches 1-2 were unsealed into train in rounds 3-4). Baseline scored at bff7a46, before any round-6 fix; gate.py ratchets holdout recall against this entry, not round 2's batch-1 score.",
       "holdout_recall": "0/1",
       "holdout_fp": 0
+    },
+    {
+      "round": 7,
+      "lever": "recall: FastAPI framework hooks, DI typing, dispatch tables",
+      "change": "round 6: FastAPI-run pydantic hooks (request validation, response validation/serialization incl. computed_field/field_serializer/model_serializer); unannotated Depends/Security params typed from their provider; response_class/default_response_class __init__/render/init_headers as loop roots; callables in dict/list/tuple literals called by subscript or alias",
+      "train_recall": "130/130",
+      "train_fp": 0,
+      "holdout_recall": "0/1",
+      "holdout_fp": 0,
+      "results": ".claude/hillclimb/recall/v10",
+      "ratcheted_to_train": [
+        "computed_field_io",
+        "di_sync_dep_param_validation",
+        "http_depends_untyped_client",
+        "http_method_registry",
+        "ser_field_serializer",
+        "ser_response_model_validate",
+        "ser_response_render"
+      ]
     }
   ],
   "ground_truth": "scripts/hillclimb/oracle_runtime.py via check.py: a case is promoted only when the runtime proves every line where hydroid disagrees (verdict BREAKS), or with a reviewer's note"
