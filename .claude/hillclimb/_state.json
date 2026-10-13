@@ -289,6 +289,13 @@
         "pyd_nested_model_validator",
         "pyd_plain_serializer_dump"
       ]
+    },
+    {
+      "round": 13,
+      "lever": "protocol",
+      "protocol": "holdout baseline after promoting this round's cases, before any fix (same protocol as round 6). Proven false positives that hash to holdout are not promoted (they would block every fix); from this round they are handed to fixers as review leads (fixers write their own fixtures) and then deleted, so they never enter the holdout.",
+      "holdout_recall": "4/18",
+      "holdout_fp": 0
     }
   ],
   "ground_truth": "scripts/hillclimb/oracle_runtime.py via check.py: a case is promoted only when the runtime proves every line where hydroid disagrees (verdict BREAKS), or with a reviewer's note"
