@@ -221,3 +221,35 @@ From what was known at promotion time; no holdout file was read for this. 26 of 
 - Warm runtime doubled (0.3 s to 0.68 s). Watch analysis-phase cost per fix, not only cold extraction; fixers measured cold time and called it noise.
 - Fixer runs of 20-50 minutes each made 6 rounds the practical limit for this session. Smaller rounds (2-3 mechanisms) kept reviews manageable.
 - Next time: run a performance round and a "move names to catalog" refactor before more recall work, and fix the harness limits listed in section 2.
+
+## 6. Harness changes (after `7bd0d27`, harness only)
+
+No hydroid code (`crates/`, `catalog.toml`), case labels or `split.json` changed.
+
+**Commits:**
+
+- `bbbcc19` oracle: calls that cannot block are not recorded. General rules, no library names:
+  - A catalog method on an object whose class has `async def` methods is probed first, with every catalog call under it refused. If it only builds an awaitable, it is not recorded (awaited `redis.asyncio`).
+  - A socket operation on a non-blocking socket (timeout 0) is not recorded (`httpx.AsyncClient`). Connections stay disabled except `AF_UNIX`.
+  - Blocking wholly inside library code, under a library coroutine with no case frame below it, is no longer attributed to the case frame that awaits it (FastAPI's `inspect.getsourcelines`). No suite case used that attribution branch.
+  - Catalog `unless_given` is honoured (`make_msgid(domain=...)`). This fixes the suite's only INVALID case.
+  - Tests: `scripts/hillclimb/test_oracle.py`, cases in `scripts/hillclimb/tests/oracle/`. All 4 fail with the old oracle and pass now.
+- `1884894` gate: the holdout ratchet is keyed by the holdout case set.
+  - Each round records `holdout_set` (hash of the sorted names); `_state.json` `holdout_sets` lists the names.
+  - When the set has no recorded round, the gate builds `--base` (cached in `target/gate-base/`) and scores the current set with it as the baseline.
+  - New flags: `--require-holdout-gain`, and `--lock-base` (harness sessions only).
+- `67def39` gate: `literals.py` fails on added Rust string literals that look like qualified names and prints the others. On `f02284a..7bd0d27` it fails with the 27 qualified names of section 3 and prints 160 other literals.
+- `b1ba25f` skill: the new policy (holdout FPs become fixer leads, no library rules in Rust, triage by analysis gap, no protocol rounds, `--polar` every round, branch rule).
+  - `gate.py --polar` records the cold and warm medians.
+
+**Numbers at the head (same as `7bd0d27`):**
+
+- train 160/161, 1 FP, 68/70 clean
+- holdout 4/34, 0 FP, 3/29 clean. The gate's baseline: 4/34 with the `7bd0d27` binary on set `48ec61bf2a43`.
+- Polar: cold 10.8 s, warm 717 ms (medians of 3). Warm is above the 500 ms goal.
+
+**Gate result:** `gate.py --base 7bd0d27 --lock-base HEAD --polar` passes the lock, literals (none added), build, clippy and tests. It fails at score only on the 2 known cases (`rc_route_hook_queue_override` FP, `mw_route_handler_per_request` miss). Polar was timed by hand, since the gate stops before that step.
+
+**Verdict changes in `check.py --suite`:** only `std_email_make_msgid_fqdn`, INVALID → PASSES (line 37 `make_msgid(domain=...)` is no longer recorded). There are no candidates, so `check.py --candidates` had nothing to run.
+
+**Labels to review:** none found wrong.
