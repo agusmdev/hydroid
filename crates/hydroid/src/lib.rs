@@ -44,7 +44,7 @@ pub fn check(options: &Options) -> anyhow::Result<Report> {
         cache_salt: &format!("{} {:?}", options.cpu, options.catalogs),
     })?;
     let extracted = Instant::now();
-    let mut report = analyze(&extraction.facts, &catalog);
+    let mut report = analyze(extraction.facts, &catalog);
     report.stats.files = extraction.files;
     report.stats.extract_ms = (extracted - started).as_millis();
     report.stats.analyze_ms = extracted.elapsed().as_millis();

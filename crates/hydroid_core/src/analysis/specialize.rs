@@ -32,68 +32,70 @@ struct SelfKind {
     binds: Vec<(String, ClassId)>,
 }
 
-/// The facts with call targets narrowed by what is known about the instances methods are called
-/// on, and the method copies that takes. `None` when nothing is known beyond declared classes.
-pub(super) fn specialize(facts: &Facts) -> Option<Facts> {
+/// Narrows call targets by what is known about the instances methods are called on, and adds
+/// the method copies that takes (after the original functions, calls and flows). Nothing changes
+/// when nothing is known beyond declared classes.
+pub(super) fn specialize(facts: &mut Facts) {
     // Only attributes some method calls through a type variable matter.
-    let generic: HashSet<&str> =
-        facts.calls.iter().filter_map(|c| c.instance.as_ref()?.generic.as_deref()).collect();
-    let narrows = |i: &Instance| !i.exact.is_empty() || i.binds.iter().any(|(a, _)| generic.contains(a.as_str()));
+    let generic: HashSet<String> =
+        facts.calls.iter().filter_map(|c| c.instance.as_ref()?.generic.clone()).collect();
+    let narrows = |i: &Instance| !i.exact.is_empty() || i.binds.iter().any(|(a, _)| generic.contains(a));
     if !facts.calls.iter().any(|c| c.instance.as_ref().is_some_and(narrows)) {
-        return None;
+        return;
     }
     let n = facts.functions.len();
     let mut calls_of = vec![Vec::new(); n];
     // Methods whose calls depend on the kind of `self`.
     let mut sensitive = vec![false; n];
+    // The calls made on instances, as extracted: copies rewrite them again for their `self`.
+    let mut originals: HashMap<usize, Call> = HashMap::default();
     for (i, call) in facts.calls.iter().enumerate() {
         calls_of[call.caller.0 as usize].push(i);
-        if call.instance.as_ref().is_some_and(|i| i.is_self || i.generic.is_some()) {
-            sensitive[call.caller.0 as usize] = true;
+        if let Some(instance) = &call.instance {
+            if instance.is_self || instance.generic.is_some() {
+                sensitive[call.caller.0 as usize] = true;
+            }
+            originals.insert(i, call.clone());
         }
     }
     let mut flows_of = vec![Vec::new(); n];
     for (i, flow) in facts.flows.iter().enumerate() {
         flows_of[flow.caller.0 as usize].push(i);
     }
-    let mut specializer = Specializer {
-        facts,
-        generic,
-        hierarchy: Hierarchy::new(facts),
-        sensitive,
-        copies: HashMap::default(),
-        queue: VecDeque::new(),
-        out: facts.clone(),
-    };
-    for (i, call) in facts.calls.iter().enumerate() {
-        if call.instance.is_some() {
-            specializer.out.calls[i] = specializer.rewrite(call, None);
-        }
+    let hierarchy = Hierarchy::new(facts);
+    let mut specializer =
+        Specializer { facts, generic, hierarchy, sensitive, copies: HashMap::default(), queue: VecDeque::new() };
+    // In call order: copies are numbered as they are first needed.
+    let mut on_instances: Vec<usize> = originals.keys().copied().collect();
+    on_instances.sort_unstable();
+    for i in on_instances {
+        specializer.facts.calls[i] = specializer.rewrite(&originals[&i], None);
     }
     while let Some((original, copy, kind)) = specializer.queue.pop_front() {
         for &i in &calls_of[original.0 as usize] {
-            let mut call = specializer.rewrite(&facts.calls[i], Some(&kind));
+            let mut call = match originals.get(&i) {
+                Some(call) => specializer.rewrite(call, Some(&kind)),
+                None => specializer.facts.calls[i].clone(),
+            };
             call.caller = copy;
-            specializer.out.calls.push(call);
+            specializer.facts.calls.push(call);
         }
         for &i in &flows_of[original.0 as usize] {
-            let mut flow = facts.flows[i].clone();
+            let mut flow = specializer.facts.flows[i].clone();
             flow.caller = copy;
-            specializer.out.flows.push(flow);
+            specializer.facts.flows.push(flow);
         }
     }
-    Some(specializer.out)
 }
 
 struct Specializer<'a> {
-    facts: &'a Facts,
-    generic: HashSet<&'a str>,
+    facts: &'a mut Facts,
+    generic: HashSet<String>,
     hierarchy: Hierarchy,
     sensitive: Vec<bool>,
     copies: HashMap<(FnId, SelfKind), FnId>,
     /// Copies whose calls are still to be made: `(original, copy, kind of self)`.
     queue: VecDeque<(FnId, FnId, SelfKind)>,
-    out: Facts,
 }
 
 impl Specializer<'_> {
@@ -134,7 +136,7 @@ impl Specializer<'_> {
             _ => {}
         }
         let mut binds: Vec<(String, ClassId)> =
-            instance.binds.iter().filter(|(a, _)| self.generic.contains(a.as_str())).cloned().collect();
+            instance.binds.iter().filter(|(a, _)| self.generic.contains(a)).cloned().collect();
         binds.sort();
         if !instance.exact.is_empty() {
             let mut targets = Vec::new();
@@ -161,7 +163,7 @@ impl Specializer<'_> {
 
     /// The methods `class.name` finds: those of the first class in its MRO defining `name`.
     fn lookup(&self, class: ClassId, name: &str) -> Option<Vec<FnId>> {
-        for &c in self.hierarchy.mro(self.facts, class).iter() {
+        for &c in self.hierarchy.mro(&*self.facts, class).iter() {
             let found: Vec<FnId> =
                 self.facts.class(c).methods.iter().filter(|(n, _)| n == name).map(|(_, m)| *m).collect();
             if found.is_empty() {
@@ -185,10 +187,10 @@ impl Specializer<'_> {
         if self.copies.len() >= MAX_COPIES {
             return method;
         }
-        let copy = FnId(self.out.functions.len() as u32);
+        let copy = FnId(self.facts.functions.len() as u32);
         let mut function = self.facts.function(method).clone();
         function.specializes = Some(method);
-        self.out.functions.push(function);
+        self.facts.functions.push(function);
         self.copies.insert(key, copy);
         self.queue.push_back((method, copy, kind.clone()));
         copy

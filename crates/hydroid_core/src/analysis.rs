@@ -30,10 +30,12 @@ const DUMPS: &[&str] = &[
     "pydantic.main.BaseModel.json",
 ];
 
-pub fn analyze(facts: &Facts, catalog: &Catalog) -> Report {
-    let original = facts;
-    let specialized = specialize::specialize(facts);
-    let facts = specialized.as_ref().unwrap_or(facts);
+pub fn analyze(mut facts: Facts, catalog: &Catalog) -> Report {
+    // Copies (see `specialize`) come after the extracted functions and calls.
+    let functions_analyzed = facts.functions.iter().filter(|f| f.analyzed).count();
+    let call_sites = facts.calls.len();
+    specialize::specialize(&mut facts);
+    let facts = &facts;
     let graph = Graph::new(facts, catalog);
     let blocking = graph.blocking_distances();
     let roots = graph.roots();
@@ -83,9 +85,9 @@ pub fn analyze(facts: &Facts, catalog: &Catalog) -> Report {
 
     let mut report = Report { diagnostics, unresolved: graph.unresolved(&roots), ..Report::default() };
     report.stats.entry_points = context.entries;
-    report.stats.functions_analyzed = original.functions.iter().filter(|f| f.analyzed).count();
-    report.stats.call_sites = original.calls.len();
-    report.stats.call_sites_resolved = (0..original.calls.len())
+    report.stats.functions_analyzed = functions_analyzed;
+    report.stats.call_sites = call_sites;
+    report.stats.call_sites_resolved = (0..call_sites)
         .filter(|&i| !graph.targets[i].is_empty() || facts.calls[i].param.is_some() || graph.offloaded[i])
         .count();
     report
