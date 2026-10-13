@@ -189,6 +189,36 @@ fn called_name(call: &ast::ExprCall) -> Option<&str> {
     }
 }
 
+/// The elements of a dict (values), list or tuple literal that `container[key]` may be: the one
+/// under `key` when both it and the container's keys are literals, else all of them.
+fn selected_elements<'e>(container: &'e Expr, key: &Expr) -> Vec<&'e Expr> {
+    match container {
+        Expr::Dict(dict) => {
+            let Expr::StringLiteral(key) = key else { return dict.items.iter().map(|i| &i.value).collect() };
+            let mut selected = Vec::new();
+            for item in &dict.items {
+                match &item.key {
+                    Some(Expr::StringLiteral(k)) if k.value.to_str() != key.value.to_str() => {}
+                    // A matching key, or one (or a `**` spread) that might be equal.
+                    _ => selected.push(&item.value),
+                }
+            }
+            selected
+        }
+        Expr::List(ast::ExprList { elts, .. }) | Expr::Tuple(ast::ExprTuple { elts, .. }) => {
+            let index = match key {
+                Expr::NumberLiteral(ast::ExprNumberLiteral { value: ast::Number::Int(i), .. }) => i.as_usize(),
+                _ => None,
+            };
+            match index {
+                Some(i) if !elts.iter().any(Expr::is_starred_expr) => elts.get(i).into_iter().collect(),
+                _ => elts.iter().filter(|e| !e.is_starred_expr()).collect(),
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn first_string_literal(call: &ast::ExprCall) -> Option<String> {
     match call.arguments.args.first()? {
         Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
@@ -355,7 +385,99 @@ impl<'db> Extractor<'_, 'db> {
                 }
             }
         }
+        // Dispatch tables: ty widens the values of a dict (list, tuple) literal, the literal
+        // itself still says which callable sits under which key.
+        if resolution.targets.is_empty() || matches!(callee, Expr::Subscript(_)) {
+            let stored = self.container_targets(self.model, callee, 0);
+            if !stored.is_empty() {
+                resolution.targets = stored;
+                resolution.virtual_dispatch = false;
+            }
+        }
         resolution
+    }
+
+    /// `TABLE[key]`, or a variable assigned it (`send = TABLE[key]`), where `TABLE` is assigned a
+    /// dict, list or tuple literal: the functions stored in it (`(function, receiver bound)`),
+    /// only the entry under `key` when the key is a literal the container spells out.
+    fn container_targets(&self, model: &SemanticModel<'db>, expr: &Expr, depth: u8) -> Vec<(Key, bool)> {
+        let mut targets = Vec::new();
+        if depth > 2 {
+            return targets;
+        }
+        match expr {
+            Expr::Subscript(subscript) => self.assigned_values(model, &subscript.value, &mut |model, container| {
+                for element in selected_elements(container, &subscript.slice) {
+                    if let Some(target) = self.stored_function(model, element)
+                        && !targets.contains(&target)
+                    {
+                        targets.push(target);
+                    }
+                }
+            }),
+            Expr::Name(_) => self.assigned_values(model, expr, &mut |model, value| {
+                if matches!(value, Expr::Subscript(_)) {
+                    for target in self.container_targets(model, value, depth + 1) {
+                        if !targets.contains(&target) {
+                            targets.push(target);
+                        }
+                    }
+                }
+            }),
+            _ => {}
+        }
+        targets
+    }
+
+    /// Calls `f` with the value of each plain assignment (`x = value`, `x: T = value`) defining
+    /// the name or attribute `expr`, and the semantic model of the file the value is in.
+    fn assigned_values(
+        &self,
+        model: &SemanticModel<'db>,
+        expr: &Expr,
+        f: &mut dyn FnMut(&SemanticModel<'db>, &Expr),
+    ) {
+        let db = model.db();
+        let definitions = match expr {
+            Expr::Name(name) => {
+                definitions_for_name(model, &name.id, expr.into(), ImportAliasResolution::ResolveAliases)
+            }
+            Expr::Attribute(attr) => definitions_for_attribute(model, attr),
+            _ => return,
+        };
+        for definition in definitions {
+            let ResolvedDefinition::Definition(def) = definition else { continue };
+            let module = parsed_module(db, def.python_file(db)).load(db);
+            let value = match def.kind(db) {
+                DefinitionKind::Assignment(a) if a.unpack().is_none() => Some(a.value(&module)),
+                DefinitionKind::AnnotatedAssignment(a) => a.value(&module),
+                _ => None,
+            };
+            if let Some(value) = value {
+                let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, def.file(db)));
+                f(&model, value);
+            }
+        }
+    }
+
+    /// The function a container element is (`handler`, `session.get`, a lambda).
+    fn stored_function(&self, model: &SemanticModel<'db>, element: &Expr) -> Option<(Key, bool)> {
+        let db = model.db();
+        if let Expr::Lambda(lambda) = element {
+            return Some(((model.file(), lambda.start().to_u32()), false));
+        }
+        let ty = element.inferred_type(model)?;
+        match ty {
+            Type::FunctionLiteral(_) | Type::BoundMethod(_) => {
+                match ty.definition(db, &model.program_environment())? {
+                    TypeDefinition::Function(def) => {
+                        self.function_key(def).map(|key| (key, matches!(ty, Type::BoundMethod(_))))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     fn class_key(&self, ty: &Type<'db>) -> Option<Key> {
