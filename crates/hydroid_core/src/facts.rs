@@ -87,6 +87,10 @@ pub struct Function {
     /// Whether the body was analyzed. Unanalyzed functions (stdlib stubs, libraries without
     /// `--follow-libs`) are leaves: only the catalog knows whether they block.
     pub analyzed: bool,
+    /// A copy of this method made by the analysis for one kind of `self` (see
+    /// [`Instance`]): the method it copies.
+    #[serde(default)]
+    pub specializes: Option<FnId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -211,6 +215,31 @@ pub struct Call {
     /// See [`LogUse`]: set on logging calls, on calls attaching handlers, filters and formatters,
     /// and on constructions whose instance only gets attached.
     pub logging: Option<LogUse>,
+    /// See [`Instance`]: set on `obj.name(...)` calls whose dispatch depends on more than the
+    /// declared class of `obj`.
+    pub instance: Option<Instance>,
+}
+
+/// What is known about the instance a method is called on (`obj.name(...)`), beyond the
+/// declared class of `obj`, that narrows which `name` runs.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Instance {
+    pub name: String,
+    /// `obj` is the calling method's `self` (or `cls`): which `name` runs depends on the instance
+    /// the method itself was called on.
+    pub is_self: bool,
+    /// `obj` is `self.<attribute>`, typed by a type variable of the class (`self.repo: RepoT` in
+    /// `class Service(Generic[RepoT])`): the class an instance specializes it to (see `binds`)
+    /// says which `name` runs.
+    pub generic: Option<String>,
+    /// `obj` is exactly an instance of one of these classes (`Model()`, or a variable only ever
+    /// assigned constructions): `name` is the one their MROs find, never an override in a
+    /// subclass.
+    pub exact: Vec<ClassId>,
+    /// `(attribute, class)`: attributes of `obj` typed by a type variable, and the class `obj`'s
+    /// type specializes each to (`TagService(BaseService[TagRepository])`: `repo`,
+    /// `TagRepository`).
+    pub binds: Vec<(String, ClassId)>,
 }
 
 /// The arguments of a pydantic dump that decide which serializers run.

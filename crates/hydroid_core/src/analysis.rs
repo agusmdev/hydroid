@@ -7,6 +7,8 @@
 //! recursion, any depth). Diagnostics are the call sites inside loop code (`async def` bodies and
 //! callbacks scheduled on the loop) whose callee blocks.
 
+mod specialize;
+
 use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
@@ -29,6 +31,9 @@ const DUMPS: &[&str] = &[
 ];
 
 pub fn analyze(facts: &Facts, catalog: &Catalog) -> Report {
+    let original = facts;
+    let specialized = specialize::specialize(facts);
+    let facts = specialized.as_ref().unwrap_or(facts);
     let graph = Graph::new(facts, catalog);
     let blocking = graph.blocking_distances();
     let roots = graph.roots();
@@ -78,9 +83,9 @@ pub fn analyze(facts: &Facts, catalog: &Catalog) -> Report {
 
     let mut report = Report { diagnostics, unresolved: graph.unresolved(&roots), ..Report::default() };
     report.stats.entry_points = context.entries;
-    report.stats.functions_analyzed = facts.functions.iter().filter(|f| f.analyzed).count();
-    report.stats.call_sites = facts.calls.len();
-    report.stats.call_sites_resolved = (0..facts.calls.len())
+    report.stats.functions_analyzed = original.functions.iter().filter(|f| f.analyzed).count();
+    report.stats.call_sites = original.calls.len();
+    report.stats.call_sites_resolved = (0..original.calls.len())
         .filter(|&i| !graph.targets[i].is_empty() || facts.calls[i].param.is_some())
         .count();
     report
@@ -363,6 +368,8 @@ impl<'a> Graph<'a> {
         let Context { nested, params, called, hierarchy, stored, returned, dispatches } = *cx;
         let mut out = Vec::new();
         for &t in &call.targets {
+            // A copy for one kind of `self` (see `specialize`) has the original's overrides.
+            let original = self.facts.function(t).specializes.unwrap_or(t);
             let (body, overrides) = runs.entry(t).or_insert_with(|| {
                 // Calling a function decorated by project code runs the decorator's wrapper, and
                 // the wrapper calls the original. Decorators wrapping both kinds define an async
@@ -381,16 +388,16 @@ impl<'a> Graph<'a> {
                 if body.is_empty() {
                     body.push(t);
                 }
-                (body, hierarchy.overrides(self.facts, t))
+                (body, hierarchy.overrides(self.facts, original))
             });
             out.extend(body.iter().copied());
-            out.extend(dispatches.get(&t).into_iter().flatten());
+            out.extend(dispatches.get(&original).into_iter().flatten());
             // Awaiting a library coroutine method runs, on the loop, the project overrides of
             // the hooks it calls on the instance.
             if let Some(receiver) = call.receiver
                 && self.facts.function(call.caller).is_async
             {
-                out.extend(self.template_hooks(t, receiver).iter().copied());
+                out.extend(self.template_hooks(original, receiver).iter().copied());
             }
             if call.virtual_dispatch {
                 // An instance of a known class runs only the overrides of its subclasses.
@@ -401,7 +408,7 @@ impl<'a> Graph<'a> {
                 out.extend(overrides.iter().copied().filter(|&o| below(o) && self.dispatches_into(call.caller, o)));
             }
             if let Some(receiver) = call.receiver {
-                out.extend(hierarchy.super_chain(self.facts, receiver, t));
+                out.extend(hierarchy.super_chain(self.facts, receiver, original));
             }
         }
         // A logging call runs the attached filters and handlers.
@@ -1287,7 +1294,8 @@ impl<'a> Graph<'a> {
                     next[t.0 as usize].map(|(d, _, _)| (d, t))
                 }
             })
-            .min()?;
+            // Copies (see `specialize`) rank as their original.
+            .min_by_key(|&(d, t)| (d, self.facts.function(t).specializes.unwrap_or(t), t))?;
         let mut chain = vec![self.frame(call, best.1)];
         let mut current = best.1;
         loop {
@@ -1319,7 +1327,8 @@ impl<'a> Graph<'a> {
     /// to every function they reach.
     fn entry_paths(&self) -> EntryPaths<'_> {
         let mut entries: Vec<(FnId, String)> = Vec::new();
-        for flow in &self.facts.flows {
+        // Copies (see `specialize`) register what their original does.
+        for flow in self.facts.flows.iter().filter(|f| self.facts.function(f.caller).specializes.is_none()) {
             let into = &self.facts.function(flow.into).qualname;
             let Some(kind) = self.catalog.entry_kind(into) else { continue };
             let label = entry_label(kind, into, flow);
@@ -1364,6 +1373,12 @@ impl<'a> Graph<'a> {
                     if reach[t.0 as usize].is_none() && self.runs_inline(f, t) && self.runs_body(call, t) {
                         reach[t.0 as usize] = Some(Reach::Via(f, call));
                         queue.push_back(t);
+                        // Reaching a copy (see `specialize`) reaches the code of its original.
+                        if let Some(original) = self.facts.function(t).specializes
+                            && reach[original.0 as usize].is_none()
+                        {
+                            reach[original.0 as usize] = Some(Reach::Via(f, call));
+                        }
                     }
                 }
             }
@@ -1389,6 +1404,10 @@ impl<'a> Graph<'a> {
                     {
                         on_loop[t.0 as usize] = true;
                         queue.push_back(t);
+                        // Copies (see `specialize`) report as their original.
+                        if let Some(original) = target.specializes {
+                            on_loop[original.0 as usize] = true;
+                        }
                     }
                 }
             }
@@ -1396,7 +1415,11 @@ impl<'a> Graph<'a> {
         let mut out = Vec::new();
         for (i, call) in self.facts.calls.iter().enumerate() {
             let caller = self.facts.function(call.caller);
-            if !on_loop[call.caller.0 as usize] || caller.origin != Origin::Project || !self.targets[i].is_empty() {
+            if !on_loop[call.caller.0 as usize]
+                || caller.origin != Origin::Project
+                || caller.specializes.is_some()
+                || !self.targets[i].is_empty()
+            {
                 continue;
             }
             // Resolved at the call sites passing the callable.

@@ -161,7 +161,12 @@ drop it and the upload step to fail the build instead.
    of an f-string, and `logging.info(...)` logs on the root logger. Records of a logger whose
    name is not known may reach any hook. Offload APIs cut the graph; callbacks are attributed to the call site passing
    them; overrides are found by class-hierarchy analysis (test doubles only stand in for real
-   classes in test code); a library `async def` method running on an instance of a project
+   classes in test code), narrowed by what is known about the instance: a construction
+   (`Model().refresh()`, or a variable only ever assigned constructions) runs the methods its
+   class's MRO finds, and the type arguments of a generic class (`TagService(BaseService[TagRepo])`,
+   `service: BaseService[TagRepo]`) pick the implementation behind its type-variable attributes
+   (`self.repo.list_ids()`), also for the `self.name(...)` calls of the methods it runs (methods
+   are analyzed once per such instance); a library `async def` method running on an instance of a project
    subclass (`Security(scheme)`, `await scheme(request)`) runs the project's overrides of the
    library methods it calls on `self` (`APIKeyHeader.__call__` calling `self.check_api_key(...)`),
    without `--follow-libs`; calling a generator function runs nothing until the generator is

@@ -10,7 +10,9 @@ use std::cell::RefCell;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind};
-use ty_python_semantic::types::ide_support::{ResolvedDefinition, call_signature_details};
+use ty_python_semantic::types::ide_support::{
+    ResolvedDefinition, call_signature_details, static_member_type_for_attribute,
+};
 use ty_python_semantic::types::{Type, TypeDefinition};
 use ty_python_semantic::{
     HasType, ImportAliasResolution, SemanticModel, definitions_for_attribute, definitions_for_name,
@@ -60,6 +62,17 @@ pub struct RawCall {
     pub super_name: Option<String>,
     /// See [`hydroid_core::facts::Call::logging`]: classes as keys.
     pub logging: Option<(Option<LoggerName>, Option<Key>, bool)>,
+    /// See [`hydroid_core::facts::Call::instance`].
+    pub instance: Option<RawInstance>,
+}
+
+/// See [`hydroid_core::facts::Instance`]: classes as keys.
+pub struct RawInstance {
+    pub name: String,
+    pub is_self: bool,
+    pub generic: Option<String>,
+    pub exact: Vec<Key>,
+    pub binds: Vec<(String, Key)>,
 }
 
 /// What code can run implicitly, from the definitions indexed so far.
@@ -81,6 +94,15 @@ pub struct AppState {
     pub stored: FxHashMap<(StateOwner, String), Option<Key>>,
     /// The class of `request.app`: the one `Starlette` subclass the project defines, if any.
     pub app: Option<Key>,
+}
+
+/// What the indexed project files say about the instances methods are called on.
+#[derive(Default)]
+pub struct Instances {
+    /// See [`crate::index::FileIndex::generic_attributes`].
+    pub generic_attributes: FxHashSet<String>,
+    /// See [`crate::index::FileIndex::rebound`].
+    pub rebound: FxHashSet<String>,
 }
 
 /// What the project's SQLAlchemy models run implicitly on attribute access.
@@ -187,6 +209,7 @@ pub fn extract_file(
     implicit: Option<&Implicit>,
     state: &AppState,
     orm: &Orm,
+    instances: &Instances,
 ) -> FileFacts {
     let program_file = ty_python_semantic::Db::program_file(db, index.file);
     let model = SemanticModel::new(db, program_file);
@@ -195,6 +218,7 @@ pub fn extract_file(
         db,
         state,
         orm,
+        instances,
         lazy_reads: Vec::new(),
         model: &model,
         index,
@@ -330,6 +354,7 @@ struct Extractor<'a, 'db> {
     db: &'a HydroidDb,
     state: &'a AppState,
     orm: &'a Orm,
+    instances: &'a Instances,
     /// Lazy relationship reads recorded: `(function, location, relationship)`.
     lazy_reads: Vec<(u32, Location, String)>,
     model: &'a SemanticModel<'db>,
@@ -489,6 +514,100 @@ impl<'db> Extractor<'_, 'db> {
             return (None, None);
         }
         (self.self_class(&attr.value).or_else(|| instance_class(self.model, &attr.value)), None)
+    }
+
+    /// See [`hydroid_core::facts::Instance`]: for `obj.name(...)` calling a method.
+    fn instance(&self, callee: &Expr, resolution: &Resolution) -> Option<RawInstance> {
+        let Expr::Attribute(attr) = callee else { return None };
+        if Self::is_super_call(&attr.value) || !resolution.targets.iter().any(|(_, bound)| *bound) {
+            return None;
+        }
+        let receiver = &*attr.value;
+        let is_self = matches!(receiver, Expr::Name(n) if matches!(n.id.as_str(), "self" | "cls"))
+            && self.self_class(receiver).is_some();
+        let generic = match receiver {
+            Expr::Attribute(inner)
+                if self.self_class(&inner.value).is_some()
+                    && matches!(receiver.inferred_type(self.model), Some(Type::TypeVar(_))) =>
+            {
+                Some(inner.attr.to_string())
+            }
+            _ => None,
+        };
+        let exact = if is_self { Vec::new() } else { self.exact_classes(self.model, receiver, 0) };
+        let mut binds = Vec::new();
+        if matches!(receiver.inferred_type(self.model), Some(Type::NominalInstance(_))) {
+            for name in &self.instances.generic_attributes {
+                let member = self.synthesized_member(receiver, name);
+                if let Some(ty @ Type::NominalInstance(_)) = static_member_type_for_attribute(self.model, &member)
+                    && let Some(class) = self.class_key(&ty)
+                {
+                    binds.push((name.clone(), class));
+                }
+            }
+        }
+        Some(RawInstance { name: attr.attr.to_string(), is_self, generic, exact, binds })
+    }
+
+    /// The classes `expr` is exactly an instance of: a construction (`Model()`), or a variable
+    /// only ever assigned constructions (`weather: WeatherClient = AsyncWeatherClient()`). Empty
+    /// when not known.
+    fn exact_classes(&self, model: &SemanticModel<'db>, expr: &Expr, depth: u8) -> Vec<Key> {
+        let db = model.db();
+        match expr {
+            Expr::Call(call) => {
+                let Some(class) = call.func.inferred_type(model) else { return Vec::new() };
+                let Some(instance) = expr.inferred_type(model) else { return Vec::new() };
+                if !matches!(class, Type::ClassLiteral(_) | Type::GenericAlias(_))
+                    || !matches!(instance, Type::NominalInstance(_))
+                {
+                    return Vec::new();
+                }
+                let key = |ty: &Type<'db>| match ty.definition(db, &model.program_environment()) {
+                    Some(TypeDefinition::StaticClass(def)) => self.def_key(def).map(|(k, _)| k),
+                    _ => None,
+                };
+                match (key(&class), key(&instance)) {
+                    (Some(class), Some(instance)) if class == instance => vec![class],
+                    _ => Vec::new(),
+                }
+            }
+            Expr::Name(name) if depth < 2 && !self.instances.rebound.contains(name.id.as_str()) => {
+                let mut classes = Vec::new();
+                for definition in
+                    definitions_for_name(model, &name.id, expr.into(), ImportAliasResolution::ResolveAliases)
+                {
+                    let ResolvedDefinition::Definition(def) = definition else { return Vec::new() };
+                    let module = parsed_module(db, def.python_file(db)).load(db);
+                    let value = match def.kind(db) {
+                        DefinitionKind::Assignment(assignment) if assignment.unpack().is_none() => {
+                            assignment.value(&module)
+                        }
+                        DefinitionKind::AnnotatedAssignment(assignment) => match assignment.value(&module) {
+                            Some(value) => value,
+                            None => return Vec::new(),
+                        },
+                        _ => return Vec::new(),
+                    };
+                    let found = if def.file(db) == model.file() {
+                        self.exact_classes(model, value, depth + 1)
+                    } else {
+                        let other = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, def.file(db)));
+                        self.exact_classes(&other, value, depth + 1)
+                    };
+                    if found.is_empty() {
+                        return Vec::new();
+                    }
+                    for class in found {
+                        if !classes.contains(&class) {
+                            classes.push(class);
+                        }
+                    }
+                }
+                classes
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// Whether `callee` passes its receiver implicitly (`obj.method`, but not `module.function`
@@ -757,6 +876,7 @@ impl<'db> Extractor<'_, 'db> {
             receiver: None,
             super_name: None,
             logging: None,
+            instance: None,
         });
     }
 
@@ -1049,6 +1169,7 @@ impl<'db> Extractor<'_, 'db> {
                 receiver: None,
                 super_name: None,
                 logging: None,
+                instance: None,
             });
         }
     }
@@ -1219,6 +1340,7 @@ impl<'db> Extractor<'_, 'db> {
             receiver: None,
             super_name: None,
             logging: None,
+            instance: None,
         });
     }
 
@@ -1278,6 +1400,7 @@ impl<'db> Extractor<'_, 'db> {
         let returned_by =
             if resolution.targets.is_empty() && param.is_none() { self.returned_by(&call.func) } else { Vec::new() };
         let (receiver, super_name) = self.mro_receiver(&call.func, &resolution);
+        let instance = self.instance(&call.func, &resolution);
         let unresolved =
             (resolution.targets.is_empty() && param.is_none()).then_some(resolution.reason);
         // The declarative constructor sets each keyword argument on the new instance.
@@ -1336,6 +1459,7 @@ impl<'db> Extractor<'_, 'db> {
             receiver,
             super_name,
             logging,
+            instance,
         });
     }
 
@@ -1757,6 +1881,7 @@ impl<'db> Extractor<'_, 'db> {
             receiver: None,
             super_name: None,
             logging: None,
+            instance: None,
         });
     }
 
@@ -2380,6 +2505,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                         receiver: None,
                         super_name: None,
                         logging: None,
+                        instance: None,
                     });
                 }
                 walk_expr(self, expr);

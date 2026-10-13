@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use hydroid_core::catalog::qualname_matches;
 use hydroid_core::facts::{
-    Call, Class, ClassId, Facts, FnId, Flow, Function, Level, LogUse, ModelField, Origin, ResponseOptions, Signature, Slot,
+    Call, Class, ClassId, Facts, FnId, Flow, Function, Instance, Level, LogUse, ModelField, Origin, ResponseOptions, Signature, Slot,
     Store, Value,
 };
 use parking_lot::Mutex;
@@ -25,7 +25,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use ty_module_resolver::{ModuleName, resolve_module_confident};
 
 use crate::db::HydroidDb;
-use crate::extract::{AppState, FileFacts, Implicit, Orm, RawSlot, RawValue, extract_file};
+use crate::extract::{AppState, FileFacts, Implicit, Instances, Orm, RawInstance, RawSlot, RawValue, extract_file};
 use crate::index::{FileIndex, Key, class_bases};
 
 pub struct Extraction {
@@ -372,6 +372,15 @@ impl Indexes {
         orm
     }
 
+    /// What the indexed files say about instances: see [`Instances`].
+    fn instances(&self) -> Instances {
+        let map = self.0.lock();
+        Instances {
+            generic_attributes: map.values().flat_map(|i| i.generic_attributes.iter().cloned()).collect(),
+            rebound: map.values().flat_map(|i| i.rebound.iter().cloned()).collect(),
+        }
+    }
+
     /// What can run implicitly, from the indexed files: see [`Implicit`].
     fn implicit(&self) -> Implicit {
         let map = self.0.lock();
@@ -425,6 +434,9 @@ fn referenced(facts: &[FileFacts]) -> (FxHashSet<File>, FxHashSet<Key>) {
         classes.extend(f.calls.iter().filter_map(|c| c.attribute.as_ref().map(|(key, _)| *key)));
         classes.extend(f.calls.iter().filter_map(|c| c.constructs));
         classes.extend(f.calls.iter().filter_map(|c| c.sets.as_ref().map(|(key, _)| *key)));
+        for instance in f.calls.iter().filter_map(|c| c.instance.as_ref()) {
+            classes.extend(instance.exact.iter().chain(instance.binds.iter().map(|(_, key)| key)));
+        }
         files.extend(classes.iter().map(|key| key.0));
         files.extend(f.calls.iter().flat_map(|c| c.targets.iter().map(|(key, _)| key.0)));
         files.extend(f.decorators.iter().flat_map(|(_, d)| d.iter().map(|key| key.0)));
@@ -479,6 +491,7 @@ fn run(
     let implicit = (!all_implicit).then(|| indexes.implicit());
     let state = indexes.app_state();
     let orm = indexes.orm(db);
+    let instances = indexes.instances();
     let shared = Mutex::new(db.clone());
     units
         .par_iter()
@@ -486,7 +499,7 @@ fn run(
             || shared.lock().clone(),
             |db, (file, wanted)| {
                 let index = indexes.get(db, *file);
-                extract_file(db, &index, wanted.as_ref(), implicit.as_ref(), &state, &orm)
+                extract_file(db, &index, wanted.as_ref(), implicit.as_ref(), &state, &orm, &instances)
             },
         )
         .collect()
@@ -551,6 +564,7 @@ impl<'a> Merger<'a> {
             class: None,
             decorators: Vec::new(),
             analyzed: false,
+            specializes: None,
         });
         let parent = entry.parent.and_then(|p| self.fn_id((key.0, p)));
         let class = entry.class.and_then(|c| self.class_id((key.0, c)));
@@ -591,6 +605,16 @@ impl<'a> Merger<'a> {
         Some(id)
     }
 
+    /// See [`Instance`]: `None` when nothing beyond the declared class is known (an exact class
+    /// that is not indexed makes the instance's class unknown).
+    fn instance(&mut self, raw: RawInstance) -> Option<Instance> {
+        let exact: Option<Vec<ClassId>> = raw.exact.iter().map(|&k| self.class_id(k)).collect();
+        let binds = raw.binds.into_iter().filter_map(|(name, k)| Some((name, self.class_id(k)?))).collect();
+        let instance = Instance { name: raw.name, is_self: raw.is_self, generic: raw.generic, exact: exact.unwrap_or_default(), binds };
+        (instance.is_self || instance.generic.is_some() || !instance.exact.is_empty() || !instance.binds.is_empty())
+            .then_some(instance)
+    }
+
     fn merge(&mut self, file_facts: FileFacts) {
         let file = file_facts.file;
         for (key, decorators) in file_facts.decorators {
@@ -614,6 +638,7 @@ impl<'a> Merger<'a> {
             let returned_by = raw.returned_by.into_iter().filter_map(|k| self.fn_id(k)).collect();
             let level = raw.level.map(|(value, receiver)| Level { value, receiver: receiver.and_then(|k| self.class_id(k)) });
             let receiver = raw.receiver.and_then(|k| self.class_id(k));
+            let instance = raw.instance.and_then(|i| self.instance(i));
             let logging = raw.logging.map(|(logger, attaches, attach_only)| LogUse {
                 logger,
                 attaches: attaches.and_then(|k| self.class_id(k)),
@@ -645,6 +670,7 @@ impl<'a> Merger<'a> {
                 receiver,
                 super_name: raw.super_name,
                 logging,
+                instance,
             });
         }
         self.facts.stops_propagation.extend(file_facts.stops_propagation);

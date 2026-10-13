@@ -92,6 +92,14 @@ pub struct FileIndex {
     /// (`selectinload(Author.books)`, `joinedload("books")`; `*` for wildcards), project files
     /// only: what it loads is not loaded lazily later.
     pub eager_loads: FxHashMap<u32, Vec<String>>,
+    /// Attributes whose methods the methods of a generic class call (`self.repo.list_ids()` in
+    /// `class Service(Generic[RepoT])`), project files only: an instance's type may specialize
+    /// them (see [`hydroid_core::facts::Instance::binds`]).
+    pub generic_attributes: Vec<String>,
+    /// Names rebound where a variable's own definitions do not show it (project files only):
+    /// declared `global` or `nonlocal`, or assigned as an attribute of something other than
+    /// `self` (`module.client = ...`).
+    pub rebound: Vec<String>,
     display_path: String,
     lines: LineIndex,
     source: ruff_db::source::SourceText,
@@ -125,6 +133,8 @@ impl FileIndex {
             class_attributes: Vec::new(),
             state_stores: Vec::new(),
             eager_loads: FxHashMap::default(),
+            generic_attributes: Vec::new(),
+            rebound: Vec::new(),
             display_path,
             lines,
             source,
@@ -646,6 +656,29 @@ pub fn yield_values(body: &[Stmt]) -> Vec<&Expr> {
 
 /// The methods an instance method calls on its own instance (`self.name(...)`), in its own
 /// scope: not in nested functions, lambdas or classes, which may run elsewhere.
+/// `X` of the `self.X.name(...)` calls in the methods of a class.
+fn attribute_calls(class: &ast::StmtClassDef) -> Vec<String> {
+    struct Finder {
+        names: Vec<String>,
+    }
+    impl<'ast> SourceOrderVisitor<'ast> for Finder {
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            if let Expr::Call(call) = expr
+                && let Expr::Attribute(method) = &*call.func
+                && let Expr::Attribute(attr) = &*method.value
+                && matches!(&*attr.value, Expr::Name(n) if n.id.as_str() == "self")
+                && !self.names.iter().any(|n| n == attr.attr.as_str())
+            {
+                self.names.push(attr.attr.to_string());
+            }
+            walk_expr(self, expr);
+        }
+    }
+    let mut finder = Finder { names: Vec::new() };
+    finder.visit_body(&class.body);
+    finder.names
+}
+
 fn self_calls(def: &ast::StmtFunctionDef) -> Vec<String> {
     struct Finder<'a> {
         receiver: &'a str,
@@ -718,6 +751,22 @@ fn is_protocol_base(base: &Expr) -> bool {
 impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
     fn visit_stmt(&mut self, stmt: &'ast Stmt) {
         if self.index.origin == Origin::Project {
+            let rebound = |target: &Expr| match target {
+                Expr::Attribute(attr) if !matches!(&*attr.value, Expr::Name(n) if matches!(n.id.as_str(), "self" | "cls")) => {
+                    Some(attr.attr.to_string())
+                }
+                _ => None,
+            };
+            match stmt {
+                Stmt::Global(ast::StmtGlobal { names, .. }) | Stmt::Nonlocal(ast::StmtNonlocal { names, .. }) => {
+                    self.index.rebound.extend(names.iter().map(|n| n.to_string()));
+                }
+                Stmt::Assign(assign) => self.index.rebound.extend(assign.targets.iter().filter_map(rebound)),
+                Stmt::AnnAssign(ast::StmtAnnAssign { target, .. }) | Stmt::AugAssign(ast::StmtAugAssign { target, .. }) => {
+                    self.index.rebound.extend(rebound(target));
+                }
+                _ => {}
+            }
             match stmt {
                 Stmt::Assign(assign) => {
                     for target in &assign.targets {
@@ -797,6 +846,14 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     Vec::new()
                 };
                 let is_protocol = def.bases().iter().any(is_protocol_base);
+                let generic = def.type_params.is_some() || def.bases().iter().any(Expr::is_subscript_expr);
+                if self.index.origin == Origin::Project && generic {
+                    for name in attribute_calls(def) {
+                        if !self.index.generic_attributes.contains(&name) {
+                            self.index.generic_attributes.push(name);
+                        }
+                    }
+                }
                 self.index.classes.insert(
                     key,
                     ClassEntry {
