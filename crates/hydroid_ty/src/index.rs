@@ -28,12 +28,6 @@ pub struct FnEntry {
     pub is_async: bool,
     pub property: Option<Accessor>,
     pub is_generator: bool,
-    pub is_validator: bool,
-    pub is_serializer: bool,
-    /// See [`hydroid_core::facts::Function::serializes`].
-    pub serializes: Vec<String>,
-    /// See [`hydroid_core::facts::Function::json_only`].
-    pub json_only: bool,
     /// See [`hydroid_core::facts::Function::validates`] (project files only).
     pub validates: Vec<String>,
     pub params: Vec<String>,
@@ -148,10 +142,6 @@ impl FileIndex {
             is_async: false,
             property: None,
             is_generator: false,
-            is_validator: false,
-            is_serializer: false,
-            serializes: Vec::new(),
-            json_only: false,
             validates: Vec::new(),
             params: Vec::new(),
             positional: 0,
@@ -595,47 +585,6 @@ fn accessor(def: &ast::StmtFunctionDef) -> Option<Accessor> {
     })
 }
 
-fn is_validator(def: &ast::StmtFunctionDef) -> bool {
-    def.decorator_list.iter().any(|d| {
-        matches!(decorator_name(d), Some("field_validator" | "model_validator" | "validator" | "root_validator"))
-    })
-}
-
-fn is_serializer(def: &ast::StmtFunctionDef) -> bool {
-    def.decorator_list
-        .iter()
-        .any(|d| matches!(decorator_name(d), Some("computed_field" | "field_serializer" | "model_serializer")))
-}
-
-/// Whether pydantic serializer metadata or a serializer decorator call is only used when dumping
-/// to JSON: `when_used="json"` or `"json-unless-none"`.
-pub fn json_only(call: &ast::ExprCall) -> bool {
-    call.arguments.find_keyword("when_used").is_some_and(|k| {
-        matches!(&k.value, Expr::StringLiteral(s) if matches!(s.value.to_str(), "json" | "json-unless-none"))
-    })
-}
-
-/// The fields a serialization hook is for: the names a `@field_serializer` lists (none for
-/// `"*"`), the property of a `@computed_field`.
-fn serialized_fields(def: &ast::StmtFunctionDef) -> Vec<String> {
-    let mut names = Vec::new();
-    for decorator in &def.decorator_list {
-        match (decorator_name(decorator), &decorator.expression) {
-            (Some("field_serializer"), Expr::Call(call)) => {
-                for argument in &call.arguments.args {
-                    match argument {
-                        Expr::StringLiteral(s) if s.value.to_str() != "*" => names.push(s.value.to_str().to_string()),
-                        _ => return Vec::new(),
-                    }
-                }
-            }
-            (Some("computed_field"), _) => names.push(def.name.to_string()),
-            _ => {}
-        }
-    }
-    names
-}
-
 /// The classes an annotation names (`Item`, `list[Item] | None`, `Annotated[Item, Body()]`),
 /// outside the standard library. Calls in the annotation (`Annotated` metadata) are handed to
 /// `call` instead.
@@ -908,13 +857,6 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                         // A decorated generator is called through its decorator, which decides
                         // when the body runs (see `Call::deferred_body`).
                         is_generator: !def.is_async && def.decorator_list.is_empty() && yields(&def.body),
-                        is_validator: is_validator(def),
-                        is_serializer: is_serializer(def),
-                        serializes: serialized_fields(def),
-                        json_only: def.decorator_list.iter().any(|d| {
-                            matches!(decorator_name(d), Some("field_serializer" | "model_serializer"))
-                                && matches!(&d.expression, Expr::Call(call) if json_only(call))
-                        }),
                         validates: if self.index.origin == Origin::Project && class.is_some() {
                             orm_validates(self.model, def)
                         } else {
@@ -1026,10 +968,6 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     is_async: false,
                     property: None,
                     is_generator: false,
-                    is_validator: false,
-                    is_serializer: false,
-                    serializes: Vec::new(),
-                    json_only: false,
                     validates: Vec::new(),
                     params,
                     positional,

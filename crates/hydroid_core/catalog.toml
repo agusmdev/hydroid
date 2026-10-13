@@ -565,6 +565,151 @@ functions = [
     "asyncio.coroutines.iscoroutinefunction",
 ]
 
+# Field declarations in a class body: constructing the class without giving the field calls the
+# callable given at `factory` (constructs the class given there), and the field can also be given
+# by the string literals given at `names`.
+[[arguments]]
+factory = ["default_factory"]
+names = ["alias", "validation_alias"]
+functions = ["pydantic.fields.Field", "sqlmodel.main.Field"]
+
+[[arguments]]
+factory = ["default_factory"]
+functions = ["dataclasses.field"]
+
+# The same for other libraries: attrs (`attrs.field(factory=f, alias="x")`, its stubs define it in
+# `attrs`) and msgspec (`msgspec.field(default_factory=f, name="x")`).
+# [[arguments]]
+# factory = ["factory"]
+# names = ["alias"]
+# functions = ["attrs.field", "attr.attrib"]
+#
+# [[arguments]]
+# factory = ["default_factory"]
+# names = ["name"]
+# functions = ["msgspec.field"]
+
+# ---------------------------------------------------------------------------------------------
+# Model hooks: methods, and callables attached to fields, that validating or dumping a model runs
+# (inside pydantic-core, which no analysis can follow).
+#   [[hook]]        what makes a function a hook of its class: a decorator; or (with `callable`)
+#                   a class or function whose call in the `Annotated[...]` metadata of a field
+#                   attaches the callable given at that slot to the field
+#     runs          "validation" (constructing an instance or validating data into the class) or
+#                   "dump"
+#     fields        "arguments" (the fields the decorator's call names; "*": every field) or
+#                   "name" (the field named like the decorated function); default: every field
+#     json_only     { keyword, values }: a dump hook only runs for JSON dumps when its call gives
+#                   the keyword one of these literal values
+#   [[runs_hooks]]  operations running the hooks of the class they are called on (a class
+#                   object, or an instance)
+#     runs          "validation" (like constructing it, from any data) or "dump"
+#     json          a dump to JSON
+#     json_unless   { keyword, values }: when the call gives the keyword, the dump is to JSON
+#                   unless its literal value is one of these
+#     exclude       keyword naming (in a literal set or dict) the top-level fields left out
+#     include       keyword naming the only top-level fields dumped
+# ---------------------------------------------------------------------------------------------
+[[hook]]
+runs = "validation"
+functions = [
+    "pydantic.functional_validators.field_validator",
+    "pydantic.functional_validators.model_validator",
+    "pydantic.deprecated.class_validators.validator",
+    "pydantic.deprecated.class_validators.root_validator",
+]
+
+[[hook]]
+runs = "dump"
+fields = "arguments"
+json_only = { keyword = "when_used", values = ["json", "json-unless-none"] }
+functions = ["pydantic.functional_serializers.field_serializer"]
+
+[[hook]]
+runs = "dump"
+json_only = { keyword = "when_used", values = ["json", "json-unless-none"] }
+functions = ["pydantic.functional_serializers.model_serializer"]
+
+[[hook]]
+runs = "dump"
+fields = "name"
+functions = ["pydantic.fields.computed_field"]
+
+# `Annotated[T, AfterValidator(f)]`; annotated-types' `Predicate(f)` and `Not(f)`, which pydantic
+# runs as validators too.
+[[hook]]
+runs = "validation"
+callable = [0, "func"]
+functions = [
+    "pydantic.functional_validators.AfterValidator",
+    "pydantic.functional_validators.BeforeValidator",
+    "pydantic.functional_validators.PlainValidator",
+    "pydantic.functional_validators.WrapValidator",
+    "annotated_types.Predicate",
+    "annotated_types.Not",
+]
+
+[[hook]]
+runs = "dump"
+callable = [0, "func"]
+json_only = { keyword = "when_used", values = ["json", "json-unless-none"] }
+functions = ["pydantic.functional_serializers.PlainSerializer", "pydantic.functional_serializers.WrapSerializer"]
+
+[[runs_hooks]]
+runs = "validation"
+functions = [
+    "pydantic.main.BaseModel.model_validate",
+    "pydantic.main.BaseModel.model_validate_json",
+    "pydantic.main.BaseModel.model_validate_strings",
+    "pydantic.main.BaseModel.parse_obj",
+    "pydantic.main.BaseModel.parse_raw",
+    "sqlmodel.main.SQLModel.model_validate",
+    "sqlmodel.main.SQLModel.parse_obj",
+]
+
+[[runs_hooks]]
+runs = "dump"
+json = true
+exclude = "exclude"
+include = "include"
+functions = ["pydantic.main.BaseModel.model_dump_json", "pydantic.main.BaseModel.json"]
+
+[[runs_hooks]]
+runs = "dump"
+json_unless = { keyword = "mode", values = ["python"] }
+exclude = "exclude"
+include = "include"
+functions = ["pydantic.main.BaseModel.model_dump"]
+
+[[runs_hooks]]
+runs = "dump"
+exclude = "exclude"
+include = "include"
+functions = ["pydantic.main.BaseModel.dict"]
+
+# The same for another library, marshmallow: schemas run their `@pre_dump` / `@post_dump` hooks
+# when dumping and their `@pre_load` / `@post_load` / `@validates` hooks when loading.
+# [[hook]]
+# runs = "dump"
+# functions = ["marshmallow.decorators.pre_dump", "marshmallow.decorators.post_dump"]
+#
+# [[hook]]
+# runs = "validation"
+# functions = [
+#     "marshmallow.decorators.pre_load",
+#     "marshmallow.decorators.post_load",
+#     "marshmallow.decorators.validates",
+#     "marshmallow.decorators.validates_schema",
+# ]
+#
+# [[runs_hooks]]
+# runs = "dump"
+# functions = ["marshmallow.schema.Schema.dump", "marshmallow.schema.Schema.dumps"]
+#
+# [[runs_hooks]]
+# runs = "validation"
+# functions = ["marshmallow.schema.Schema.load", "marshmallow.schema.Schema.loads"]
+
 # ---------------------------------------------------------------------------------------------
 # Functions raising `raises` when no event loop runs in the calling thread. The handlers that
 # catch it (or one of its bases) of a `try` doing nothing but call these never run on the loop:

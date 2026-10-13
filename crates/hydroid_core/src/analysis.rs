@@ -22,14 +22,6 @@ use crate::facts::{
 };
 use crate::report::{Diagnostic, Frame, ReachedFrom, Report, Sink, Unresolved};
 
-/// Pydantic methods dumping a model.
-const DUMPS: &[&str] = &[
-    "pydantic.main.BaseModel.model_dump",
-    "pydantic.main.BaseModel.model_dump_json",
-    "pydantic.main.BaseModel.dict",
-    "pydantic.main.BaseModel.json",
-];
-
 pub fn analyze(mut facts: Facts, catalog: &Catalog) -> Report {
     // Copies (see `specialize`) come after the extracted functions and calls.
     let functions_analyzed = facts.functions.iter().filter(|f| f.analyzed).count();
@@ -144,8 +136,6 @@ struct Graph<'a> {
     ancestry: RefCell<HashMap<ClassId, Rc<[ClassId]>>>,
     /// Memoized [`Graph::construction_hooks`].
     constructed: RefCell<HashMap<ClassId, Rc<[FnId]>>>,
-    /// Pydantic dump methods, by function.
-    dumps: Vec<bool>,
     /// What the catalog says about each function.
     roles: Vec<Roles>,
     /// Functions defined in test code (see [`is_test_path`]).
@@ -222,7 +212,6 @@ impl<'a> Graph<'a> {
             validated: RefCell::default(),
             ancestry: RefCell::default(),
             constructed: RefCell::default(),
-            dumps: facts.functions.iter().map(|f| DUMPS.contains(&f.qualname.as_str())).collect(),
             roles,
             in_tests: facts.functions.iter().map(|f| is_test_path(&f.location.path)).collect(),
             templates: RefCell::default(),
@@ -497,13 +486,12 @@ impl<'a> Graph<'a> {
             let given = if call.unpacks { None } else { call.given.as_deref() };
             out.extend(self.field_hooks(class, given, &call.instances));
         }
-        // `model.model_dump()` runs the serialization hooks of the model.
+        // A dump operation (`model.model_dump()`) runs the serialization hooks of the model.
         if let Some(class) = call.receiver
             && call.super_name.is_none()
-            && call.targets.iter().any(|t| self.dumps[t.0 as usize])
+            && let Some(dump) = &call.dump
         {
-            let all = Dump { json: true, ..Dump::default() };
-            out.extend(self.serialization_hooks(class, call.dump.as_deref().unwrap_or(&all)));
+            out.extend(self.serialization_hooks(class, dump));
         }
         if let Some((class, names)) = &call.sets {
             out.extend(self.attribute_hooks(*class, names));

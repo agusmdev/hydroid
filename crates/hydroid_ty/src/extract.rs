@@ -1,6 +1,6 @@
 //! Walks function bodies and records calls (with their resolved callees) and callable flows.
 
-use hydroid_core::catalog::{ArgumentSlot, Arguments, Catalog};
+use hydroid_core::catalog::{ArgumentSlot, Arguments, Catalog, Hook, HookFields, HookPhase, KeywordValues, RunsHooks};
 use hydroid_core::facts::{Accessor, Dump, Location, LoggerName, Origin};
 use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
@@ -22,8 +22,7 @@ use ty_python_semantic::{
 use crate::db::HydroidDb;
 use crate::index::{
     FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, class_method, class_of, class_qualname, describe, inherits,
-    inherits_from, instance_class, is_class_object, is_class_variable,
-    json_only, state_owner, yield_values, yields,
+    inherits_from, instance_class, is_class_object, is_class_variable, state_owner, yield_values, yields,
 };
 
 pub struct RawCall {
@@ -204,6 +203,17 @@ pub struct FileFacts {
     pub response_options: Vec<RawResponseOptions>,
     /// See [`hydroid_core::facts::Facts::stops_propagation`].
     pub stops_propagation: Vec<(String, bool)>,
+    /// Functions of this file a `[[hook]]` decorator makes model hooks.
+    pub hooks: Vec<RawHook>,
+}
+
+/// A function a `[[hook]]` decorator makes a hook of its class.
+pub struct RawHook {
+    pub function: u32,
+    pub runs: HookPhase,
+    /// The fields it is for (empty: every field).
+    pub fields: Vec<String>,
+    pub json_only: bool,
 }
 
 /// What every file's extraction reads besides its own index: what the project's indexes say,
@@ -223,6 +233,10 @@ pub struct CatalogKeys<'c> {
     pub arguments: FxHashMap<Key, &'c Arguments>,
     /// `[[loop_probe]]`: functions raising when no event loop runs, with the classes raised.
     pub loop_probes: FxHashMap<Key, Vec<Key>>,
+    /// `[[hook]]`: decorators and `Annotated` metadata making functions model hooks.
+    pub hooks: FxHashMap<Key, &'c Hook>,
+    /// `[[runs_hooks]]`: operations running the hooks of the class they are called on.
+    pub operations: FxHashMap<Key, &'c RunsHooks>,
 }
 
 /// Extracts the bodies of `wanted` functions (every function and the module body when `None`).
@@ -275,6 +289,7 @@ pub fn extract_file(
             model_fields: Vec::new(),
             response_options: Vec::new(),
             stops_propagation: Vec::new(),
+            hooks: Vec::new(),
         },
     };
     let streaming = index.text(parsed.syntax().range()).contains("StreamingResponse");
@@ -378,18 +393,8 @@ fn excluded_fields(call: &ast::ExprCall, keyword: &str) -> Vec<String> {
     exclude
 }
 
-/// `Annotated` metadata attaching a validator callable to a field or parameter (pydantic).
-const VALIDATOR_METADATA: &[&str] = &["AfterValidator", "BeforeValidator", "PlainValidator", "WrapValidator"];
-
-/// `Annotated` metadata attaching a serializer callable to a field (pydantic).
-const SERIALIZER_METADATA: &[&str] = &["PlainSerializer", "WrapSerializer"];
-
 /// Parameter markers whose value FastAPI gets by calling a dependency, not from the request.
 const DEPENDENCY_MARKERS: &[&str] = &["Depends", "Security"];
-
-/// Pydantic classmethods that validate input into the model (running its validators).
-const VALIDATES: &[&str] =
-    &["model_validate", "model_validate_json", "model_validate_strings", "parse_obj", "parse_raw"];
 
 /// Logger methods logging a record.
 const LOGS: &[&str] = &["debug", "info", "warning", "warn", "error", "exception", "critical", "fatal", "log"];
@@ -723,12 +728,15 @@ impl<'a, 'db> Extractor<'a, 'db> {
             }
             None => resolution.reason = "the callee has no inferred type".to_string(),
         }
+        // A validation operation (catalog `[[runs_hooks]]`) validates into the class it is
+        // called on, like constructing it.
         if let Expr::Attribute(attr) = callee
-            && VALIDATES.contains(&attr.attr.as_str())
-            && let Some(receiver) = attr.value.inferred_type(self.model)
-            && is_class_object(&receiver)
+            && self.operation(&resolution).is_some_and(|o| o.runs == HookPhase::Validation)
         {
-            resolution.constructs = self.class_key(&receiver);
+            resolution.constructs = match attr.value.inferred_type(self.model) {
+                Some(receiver) if is_class_object(&receiver) => self.class_key(&receiver),
+                _ => instance_class(self.model, &attr.value),
+            };
         }
         // Decorated functions often lose their identity in the type (or become callable objects,
         // like `functools.lru_cache` wrappers); go-to-definition keeps it.
@@ -1595,6 +1603,9 @@ impl<'a, 'db> Extractor<'a, 'db> {
         let (receiver, super_name) = self.mro_receiver(&call.func, &resolution);
         let instance = self.instance(&call.func, &resolution);
         let deferred_body = self.defers_body(call, &resolution);
+        let operation = self.operation(&resolution);
+        let dump = operation.filter(|o| o.runs == HookPhase::Dump).map(|o| dump(o, call));
+        let validates = operation.is_some_and(|o| o.runs == HookPhase::Validation);
         let unresolved =
             (resolution.targets.is_empty() && param.is_none()).then_some(resolution.reason);
         // The declarative constructor sets each keyword argument on the new instance.
@@ -1610,7 +1621,6 @@ impl<'a, 'db> Extractor<'a, 'db> {
         });
         // A class called with keyword arguments only gives those fields. Positional arguments
         // (dataclasses) and `Model.model_validate(data)` may give any.
-        let validates = matches!(&*call.func, Expr::Attribute(a) if VALIDATES.contains(&a.attr.as_str()));
         let given = (!validates && call.arguments.args.is_empty()).then(|| {
             call.arguments.keywords.iter().filter_map(|k| k.arg.as_ref().map(|a| a.to_string())).collect()
         });
@@ -1625,7 +1635,6 @@ impl<'a, 'db> Extractor<'a, 'db> {
         } else {
             Vec::new()
         };
-        let dump = self.dump(call);
         self.response_options(call, &location);
         let level = self.level_argument(call);
         let logging = self.log_use(call, resolution.constructs.is_some());
@@ -1716,38 +1725,41 @@ impl<'a, 'db> Extractor<'a, 'db> {
         }
     }
 
-    /// See [`Dump`]: `obj.model_dump(...)` and the other pydantic dump methods by name (the
-    /// analysis keeps it only for calls resolving to them).
-    fn dump(&self, call: &ast::ExprCall) -> Option<Dump> {
-        let Expr::Attribute(attr) = &*call.func else { return None };
-        let json = match attr.attr.as_str() {
-            "model_dump_json" | "json" => true,
-            "dict" => false,
-            "model_dump" => match call.arguments.find_keyword("mode").map(|k| &k.value) {
-                None => false,
-                Some(Expr::StringLiteral(mode)) => mode.value.to_str() != "python",
-                Some(_) => true,
+    /// The operation (catalog `[[runs_hooks]]`) a call resolves to.
+    fn operation(&self, resolution: &Resolution) -> Option<&'a RunsHooks> {
+        resolution.targets.iter().find_map(|(key, _)| self.keys.operations.get(key).copied())
+    }
+
+    /// A function a `[[hook]]` decorator (called with `call`, if called) makes a hook.
+    fn decorator_hook(&mut self, def: &ast::StmtFunctionDef, hook: &Hook, call: Option<&ast::ExprCall>) {
+        let fields = match (hook.fields, call) {
+            (Some(HookFields::Name), _) => vec![def.name.to_string()],
+            // Any field when one is not a literal, or is `"*"`.
+            (Some(HookFields::Arguments), Some(call)) => call
+                .arguments
+                .args
+                .iter()
+                .map(|a| a.as_string_literal_expr().map(|s| s.value.to_str().to_string()).filter(|s| s != "*"))
+                .collect::<Option<Vec<String>>>()
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let json_only = call.is_some_and(|call| gives_one_of(call, hook.json_only.as_ref()));
+        self.out.hooks.push(RawHook { function: def.name.start().to_u32(), runs: hook.runs, fields, json_only });
+    }
+
+    /// The `[[hook]]` with a `callable` a call in `Annotated` metadata constructs or calls
+    /// (`AfterValidator(f)`), in the file of `model`.
+    fn metadata_hook(&self, model: &SemanticModel<'db>, call: &ast::ExprCall) -> Option<&'a Hook> {
+        let key = match call.func.inferred_type(model)? {
+            ty @ Type::ClassLiteral(_) => class_of(model, ty)?,
+            ty @ Type::FunctionLiteral(_) => match ty.definition(self.db, &model.program_environment())? {
+                TypeDefinition::Function(def) => self.function_key(def)?,
+                _ => return None,
             },
             _ => return None,
         };
-        let exclude = excluded_fields(call, "exclude");
-        // Any key of a literal `include` is dumped (a nested set or dict dumps part of it).
-        let include = match call.arguments.find_keyword("include").map(|k| &k.value) {
-            None => None,
-            Some(Expr::Set(set)) => {
-                set.elts.iter().map(|e| Some(e.as_string_literal_expr()?.value.to_str().to_string())).collect()
-            }
-            Some(Expr::Dict(dict)) => dict
-                .items
-                .iter()
-                .map(|item| match &item.key {
-                    Some(Expr::StringLiteral(key)) => Some(key.value.to_str().to_string()),
-                    _ => None,
-                })
-                .collect(),
-            Some(_) => None,
-        };
-        Some(Dump { json, exclude, include })
+        self.keys.hooks.get(&key).copied().filter(|h| !h.callable.is_empty())
     }
 
     fn log_use(&self, call: &ast::ExprCall, constructs: bool) -> Option<(Option<LoggerName>, Option<Key>, bool)> {
@@ -1941,6 +1953,11 @@ impl<'a, 'db> Extractor<'a, 'db> {
                     self.out.dispatches.push((dispatcher, key));
                 }
             }
+            if let Some(hook) = resolution.targets.iter().find_map(|(k, _)| self.keys.hooks.get(k))
+                && hook.callable.is_empty()
+            {
+                self.decorator_hook(def, hook, call);
+            }
             let literal = call.and_then(first_string_literal);
             for &(into, bound) in &resolution.targets {
                 decorators.push(into);
@@ -1980,8 +1997,11 @@ impl<'a, 'db> Extractor<'a, 'db> {
                 continue;
             }
             params.extend(classes.into_iter().map(RawValue::Class));
-            for call in calls.into_iter().filter(|c| called_name(c).is_some_and(|n| VALIDATOR_METADATA.contains(&n))) {
-                let func = call.arguments.args.first().or_else(|| call.arguments.find_keyword("func").map(|k| &k.value));
+            for call in calls {
+                let Some(hook) = self.metadata_hook(self.model, call).filter(|h| h.runs == HookPhase::Validation) else {
+                    continue;
+                };
+                let func = slot_arguments(call, &hook.callable, &[]).into_iter().next();
                 if let Some(value @ RawValue::Function(_)) = func.and_then(|f| self.value_of(f)) {
                     params.push(value);
                 }
@@ -2339,14 +2359,11 @@ impl<'a, 'db> Extractor<'a, 'db> {
             _ => return,
         };
         let (Expr::Name(name), Expr::Call(call)) = (target, value) else { return };
-        let keyword = |arg: &str| call.arguments.find_keyword(arg).map(|k| &k.value);
-        let Some(factory) = keyword("default_factory").and_then(|f| self.value_of(f)) else { return };
+        let Some(declares) = self.call_arguments(call) else { return };
+        let factory = slot_arguments(call, &declares.factory, &[]).into_iter().find_map(|f| self.value_of(f));
+        let Some(factory) = factory else { return };
         let mut names = vec![name.id.to_string()];
-        for alias in ["alias", "validation_alias"].into_iter().filter_map(keyword) {
-            if let Expr::StringLiteral(alias) = alias {
-                names.push(alias.value.to_str().to_string());
-            }
-        }
+        names.extend(field_aliases(call, declares));
         self.out.default_factories.push((class, names, factory));
     }
 
@@ -2359,12 +2376,10 @@ impl<'a, 'db> Extractor<'a, 'db> {
             return;
         }
         let mut field = RawField { names: vec![name.id.to_string()], ..RawField::default() };
-        if let Some(Expr::Call(call)) = value.as_deref() {
-            for alias in ["alias", "validation_alias"] {
-                if let Some(Expr::StringLiteral(alias)) = call.arguments.find_keyword(alias).map(|k| &k.value) {
-                    field.names.push(alias.value.to_str().to_string());
-                }
-            }
+        if let Some(Expr::Call(call)) = value.as_deref()
+            && let Some(declares) = self.call_arguments(call)
+        {
+            field.names.extend(field_aliases(call, declares));
         }
         self.field_types(self.model, annotation, 3, &mut field);
         field.classes.retain(|&c| c != (self.index.file, class));
@@ -2425,16 +2440,12 @@ impl<'a, 'db> Extractor<'a, 'db> {
                 self.field_types(model, &binop.right, depth, out);
             }
             Expr::Call(call) => {
-                let serializer = match called_name(call) {
-                    Some(name) if VALIDATOR_METADATA.contains(&name) => false,
-                    Some(name) if SERIALIZER_METADATA.contains(&name) => true,
-                    _ => return,
-                };
-                let func = call.arguments.args.first().or_else(|| call.arguments.find_keyword("func").map(|k| &k.value));
+                let Some(hook) = self.metadata_hook(model, call) else { return };
+                let func = slot_arguments(call, &hook.callable, &[]).into_iter().next();
                 if let Some(value @ RawValue::Function(_)) = func.and_then(|f| self.function_value(model, f)) {
-                    if !serializer {
+                    if hook.runs == HookPhase::Validation {
                         out.validators.push(value);
-                    } else if json_only(call) {
+                    } else if gives_one_of(call, hook.json_only.as_ref()) {
                         out.json_serializers.push(value.clone());
                         out.serializers.push(value);
                     } else {
@@ -2955,6 +2966,52 @@ fn slot_arguments<'c>(call: &'c ast::ExprCall, slots: &[ArgumentSlot], except: &
         }
     }
     found
+}
+
+/// Whether `call` gives the keyword of `given` one of its literal values.
+fn gives_one_of(call: &ast::ExprCall, given: Option<&KeywordValues>) -> bool {
+    given.is_some_and(|given| {
+        matches!(call.arguments.find_keyword(&given.keyword).map(|k| &k.value),
+            Some(Expr::StringLiteral(s)) if given.values.iter().any(|v| v == s.value.to_str()))
+    })
+}
+
+/// The other names a field declaration gives the field (catalog `[[arguments]]` `names`).
+fn field_aliases(call: &ast::ExprCall, declares: &Arguments) -> Vec<String> {
+    slot_arguments(call, &declares.names, &[])
+        .into_iter()
+        .filter_map(|a| Some(a.as_string_literal_expr()?.value.to_str().to_string()))
+        .collect()
+}
+
+/// What a dump operation (catalog `[[runs_hooks]]`) called at `call` dumps: see [`Dump`].
+fn dump(operation: &RunsHooks, call: &ast::ExprCall) -> Dump {
+    let mode = operation.json_unless.as_ref().and_then(|m| Some((m, call.arguments.find_keyword(&m.keyword)?)));
+    let json = match mode {
+        None => operation.json,
+        Some((mode, keyword)) => match &keyword.value {
+            Expr::StringLiteral(value) => !mode.values.iter().any(|v| v == value.value.to_str()),
+            _ => true,
+        },
+    };
+    let exclude = operation.exclude.as_deref().map(|k| excluded_fields(call, k)).unwrap_or_default();
+    // Any key of a literal `include` is dumped (a nested set or dict dumps part of it).
+    let include = match operation.include.as_deref().and_then(|k| call.arguments.find_keyword(k)).map(|k| &k.value) {
+        None => None,
+        Some(Expr::Set(set)) => {
+            set.elts.iter().map(|e| Some(e.as_string_literal_expr()?.value.to_str().to_string())).collect()
+        }
+        Some(Expr::Dict(dict)) => dict
+            .items
+            .iter()
+            .map(|item| match &item.key {
+                Some(Expr::StringLiteral(key)) => Some(key.value.to_str().to_string()),
+                _ => None,
+            })
+            .collect(),
+        Some(_) => None,
+    };
+    Dump { json, exclude, include }
 }
 
 /// Whether an expression awaits (outside nested lambdas, which cannot).

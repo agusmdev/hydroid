@@ -33,6 +33,12 @@ struct CatalogFile {
     /// Functions raising when no event loop runs in the calling thread.
     #[serde(default)]
     loop_probe: Vec<LoopProbeGroup>,
+    /// What makes a function a hook that validating or dumping a model runs.
+    #[serde(default)]
+    hook: Vec<HookGroup>,
+    /// Operations running the hooks of the class they are called on.
+    #[serde(default)]
+    runs_hooks: Vec<RunsHooksGroup>,
     #[serde(default)]
     entry: Vec<EntryGroup>,
 }
@@ -81,6 +87,10 @@ struct ArgumentGroup {
     methods: Vec<String>,
     #[serde(default)]
     lazy: bool,
+    #[serde(default)]
+    factory: Vec<ArgumentSlot>,
+    #[serde(default)]
+    names: Vec<ArgumentSlot>,
     functions: Vec<String>,
 }
 
@@ -100,6 +110,98 @@ pub struct Arguments {
     /// The call returns a lazy iterator: what `calls` and `iterates` say happens when it is
     /// iterated (`map(f, xs)`), not during the call.
     pub lazy: bool,
+    /// The call declares a field in a class body (`x: list = Field(default_factory=list)`):
+    /// constructing the class without giving the field calls the callable (or constructs the
+    /// class) given there.
+    pub factory: Vec<ArgumentSlot>,
+    /// The string literals given there are other names the declared field can be given by
+    /// (aliases).
+    pub names: Vec<ArgumentSlot>,
+}
+
+/// When a hook runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HookPhase {
+    /// Constructing or validating an instance of the class (from data).
+    Validation,
+    /// Dumping an instance of the class.
+    Dump,
+}
+
+/// Which fields a decorator hook is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HookFields {
+    /// Those its decorator's call names as string arguments (`"*"`: every field).
+    Arguments,
+    /// The one named like the decorated function.
+    Name,
+}
+
+/// A keyword argument whose literal values make a dump hook JSON-only.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeywordValues {
+    pub keyword: String,
+    pub values: Vec<String>,
+}
+
+/// `[[hook]]`: decorators marking the method they decorate as a hook of its class, or (with
+/// `callable`) classes or functions which, in the `Annotated[...]` metadata of a field, attach
+/// the callable given at that slot to the field.
+#[derive(Clone, Debug)]
+pub struct Hook {
+    pub runs: HookPhase,
+    pub callable: Vec<ArgumentSlot>,
+    /// Without it, a decorator hook is for every field.
+    pub fields: Option<HookFields>,
+    /// Dump hooks only used when dumping to JSON.
+    pub json_only: Option<KeywordValues>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookGroup {
+    runs: HookPhase,
+    #[serde(default)]
+    callable: Vec<ArgumentSlot>,
+    #[serde(default)]
+    fields: Option<HookFields>,
+    #[serde(default)]
+    json_only: Option<KeywordValues>,
+    functions: Vec<String>,
+}
+
+/// `[[runs_hooks]]`: an operation running the hooks of the class it is called on (a class
+/// object, or an instance).
+#[derive(Clone, Debug)]
+pub struct RunsHooks {
+    pub runs: HookPhase,
+    /// A dump to JSON (JSON-only hooks run too).
+    pub json: bool,
+    /// A keyword choosing the dump mode: when it is given, the dump is to JSON unless its literal
+    /// value is one of `values`.
+    pub json_unless: Option<KeywordValues>,
+    /// Keyword arguments naming the top-level fields left out of the dump, and the only ones
+    /// dumped.
+    pub exclude: Option<String>,
+    pub include: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunsHooksGroup {
+    runs: HookPhase,
+    #[serde(default)]
+    json: bool,
+    #[serde(default)]
+    json_unless: Option<KeywordValues>,
+    #[serde(default)]
+    exclude: Option<String>,
+    #[serde(default)]
+    include: Option<String>,
+    functions: Vec<String>,
 }
 
 /// `[[loop_probe]]`: functions raising `raises` (a class) when no event loop is running in the
@@ -258,6 +360,10 @@ pub struct Catalog {
     argument_names: Option<rustc_hash::FxHashSet<String>>,
     /// `[[loop_probe]]` names (or patterns), with the class they raise.
     loop_probes: Vec<(String, String)>,
+    /// `[[hook]]` names (or patterns).
+    hooks: Vec<(String, Hook)>,
+    /// `[[runs_hooks]]` names (or patterns).
+    operations: Vec<(String, RunsHooks)>,
     entries: Patterns<usize>,
     entry_kinds: Vec<String>,
 }
@@ -301,14 +407,22 @@ impl Catalog {
         for name in &file.log_dispatch.functions {
             self.log_dispatch.insert(name, ());
         }
-        for ArgumentGroup { calls, iterates, enters, methods, lazy, functions } in file.arguments {
+        for ArgumentGroup { calls, iterates, enters, methods, lazy, factory, names, functions } in file.arguments {
             let index = self.argument_effects.len();
-            self.argument_effects.push(Arguments { calls, iterates, enters, methods, lazy });
+            self.argument_effects.push(Arguments { calls, iterates, enters, methods, lazy, factory, names });
             for name in &functions {
                 self.arguments.insert(name, index);
             }
         }
         self.argument_names = last_segments(self.arguments.all());
+        for HookGroup { runs, callable, fields, json_only, functions } in file.hook {
+            let hook = Hook { runs, callable, fields, json_only };
+            self.hooks.extend(functions.into_iter().map(|f| (f, hook.clone())));
+        }
+        for RunsHooksGroup { runs, json, json_unless, exclude, include, functions } in file.runs_hooks {
+            let operation = RunsHooks { runs, json, json_unless, exclude, include };
+            self.operations.extend(functions.into_iter().map(|f| (f, operation.clone())));
+        }
         for group in file.loop_probe {
             self.loop_probes.extend(group.functions.into_iter().map(|f| (f, group.raises.clone())));
         }
@@ -421,6 +535,16 @@ impl Catalog {
         self.argument_names.as_ref().is_none_or(|names| names.contains(name))
     }
 
+    /// Every `[[hook]]` name (or pattern).
+    pub fn hooks(&self) -> &[(String, Hook)] {
+        &self.hooks
+    }
+
+    /// Every `[[runs_hooks]]` name (or pattern).
+    pub fn operations(&self) -> &[(String, RunsHooks)] {
+        &self.operations
+    }
+
     /// Every `[[loop_probe]]` name (or pattern), with the class it raises.
     pub fn loop_probes(&self) -> &[(String, String)] {
         &self.loop_probes
@@ -443,6 +567,8 @@ impl Catalog {
             .chain(self.log_dispatch.all())
             .chain(self.arguments.all())
             .chain(self.loop_probes.iter().flat_map(|(f, raises)| [f.clone(), raises.clone()]))
+            .chain(self.hooks.iter().map(|(f, _)| f.clone()))
+            .chain(self.operations.iter().map(|(f, _)| f.clone()))
             .chain(self.entries.all())
             .chain(self.blocks_in.iter().flatten().cloned())
             .collect();

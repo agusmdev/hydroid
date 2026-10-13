@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use hydroid_core::catalog::{Catalog, qualname_matches};
+use hydroid_core::catalog::{Catalog, HookPhase, qualname_matches};
 use hydroid_core::facts::{
     Call, Class, ClassId, Facts, FnId, Flow, Function, Instance, Level, LogUse, ModelField, Origin, ResponseOptions, Signature, Slot,
     Store, Value,
@@ -97,6 +97,16 @@ fn catalog_keys<'c>(db: &HydroidDb, indexes: &Indexes, catalog: &'c Catalog) -> 
     for (name, arguments) in catalog.argument_entries() {
         for key in catalog_definitions(db, indexes, &name) {
             keys.arguments.insert(key, arguments);
+        }
+    }
+    for (name, hook) in catalog.hooks() {
+        for key in catalog_definitions(db, indexes, name) {
+            keys.hooks.insert(key, hook);
+        }
+    }
+    for (name, operation) in catalog.operations() {
+        for key in catalog_definitions(db, indexes, name) {
+            keys.operations.insert(key, operation);
         }
     }
     for (name, raises) in catalog.loop_probes() {
@@ -607,10 +617,10 @@ impl<'a> Merger<'a> {
             is_async: entry.is_async,
             property: entry.property,
             is_generator: entry.is_generator,
-            is_validator: entry.is_validator,
-            is_serializer: entry.is_serializer,
-            serializes: entry.serializes.clone(),
-            json_only: entry.json_only,
+            is_validator: false,
+            is_serializer: false,
+            serializes: Vec::new(),
+            json_only: false,
             validates: entry.validates.clone(),
             params: entry.params.clone(),
             self_calls: entry.self_calls.clone(),
@@ -731,6 +741,18 @@ impl<'a> Merger<'a> {
             });
         }
         self.facts.stops_propagation.extend(file_facts.stops_propagation);
+        for hook in file_facts.hooks {
+            let Some(id) = self.fn_id((file, hook.function)) else { continue };
+            let function = &mut self.facts.functions[id.0 as usize];
+            match hook.runs {
+                HookPhase::Validation => function.is_validator = true,
+                HookPhase::Dump => {
+                    function.is_serializer = true;
+                    function.serializes = hook.fields;
+                    function.json_only = hook.json_only;
+                }
+            }
+        }
         for (dispatcher, implementation) in file_facts.dispatches {
             let (Some(dispatcher), Some(implementation)) = (self.fn_id(dispatcher), self.fn_id((file, implementation)))
             else {

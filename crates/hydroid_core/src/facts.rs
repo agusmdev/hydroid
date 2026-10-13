@@ -212,7 +212,8 @@ pub struct Call {
     /// Keyword arguments given model instances (or nothing to validate, like `[]`): pydantic
     /// does not validate them into nested models again.
     pub instances: Vec<String>,
-    /// A pydantic dump (`model.model_dump(...)`, see [`Dump`]), when the callee may be one.
+    /// A dump (`model.model_dump(...)`: a catalog `[[runs_hooks]]` operation with `runs = "dump"`):
+    /// what it dumps.
     pub dump: Option<Box<Dump>>,
     /// Why nothing was resolved (only set when `targets` is empty and `param` is `None`).
     pub unresolved: Option<String>,
