@@ -17,8 +17,6 @@
   "executor_with": "train",
   "exitstack_enter": "train",
   "file_ops": "train",
-  "fp_streaming_genexp": "holdout",
-  "fp_streaming_map_lambda": "holdout",
   "generator_not_iterated": "train",
   "getattr_proxy": "train",
   "http_depends_untyped_client": "train",
