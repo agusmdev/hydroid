@@ -271,6 +271,24 @@
       "protocol": "holdout baseline after promoting this round's cases, before any fix (same protocol as round 6). Note: candidate cache_configparser_read (would-be holdout, never shown to a fixer) started passing after round 10's stdlib catalog work and was dropped.",
       "holdout_recall": "3/7",
       "holdout_fp": 0
+    },
+    {
+      "round": 12,
+      "lever": "precision + recall: logging scope, ORM, pydantic nesting, library template methods",
+      "change": "round 12: logging hooks scoped to the logger hierarchy and propagate; relationships loaded off the loop are not lazy loads; nested and Annotated pydantic validators/serializers, explicit model_dump; response_model=None, Response-only endpoints and response_model_exclude skip response hooks; project overrides of self-called hooks in library async methods",
+      "train_recall": "151/151",
+      "train_fp": 0,
+      "holdout_recall": "4/7",
+      "holdout_fp": 0,
+      "results": ".claude/hillclimb/recall/v13",
+      "ratcheted_to_train": [
+        "auth_apikey_check_override",
+        "fp3_log_handler_other_logger",
+        "fp3_orm_collection_touched_in_helper",
+        "fp3_orm_refresh_attribute_names",
+        "pyd_nested_model_validator",
+        "pyd_plain_serializer_dump"
+      ]
     }
   ],
   "ground_truth": "scripts/hillclimb/oracle_runtime.py via check.py: a case is promoted only when the runtime proves every line where hydroid disagrees (verdict BREAKS), or with a reviewer's note"
