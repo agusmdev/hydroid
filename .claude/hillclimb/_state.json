@@ -220,6 +220,25 @@
         "ser_response_model_validate",
         "ser_response_render"
       ]
+    },
+    {
+      "round": 8,
+      "lever": "recall: app state flow, ORM attribute hooks, library-invoked callables",
+      "change": "round 8: request.state/app.state/request.app typed from project stores; SQLAlchemy lazy relationship loads (skipped for eager options, async ORM, awaited origins) and @validates hooks; pydantic/dataclass default factories on construction and request validation; contextvars Context.run",
+      "train_recall": "139/139",
+      "train_fp": 0,
+      "holdout_recall": "0/2",
+      "holdout_fp": 0,
+      "results": ".claude/hillclimb/recall/v11",
+      "ratcheted_to_train": [
+        "cache_default_factory_secret",
+        "life_app_state_store",
+        "life_app_subclass_attr",
+        "life_state_dict_client",
+        "orm_lazy_relationship_access",
+        "orm_validates_on_construct",
+        "py_copy_context_run"
+      ]
     }
   ],
   "ground_truth": "scripts/hillclimb/oracle_runtime.py via check.py: a case is promoted only when the runtime proves every line where hydroid disagrees (verdict BREAKS), or with a reviewer's note"
