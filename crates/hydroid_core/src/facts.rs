@@ -124,6 +124,12 @@ pub struct Call {
     pub targets: Vec<FnId>,
     /// `obj.method(...)` on an instance: overrides in subclasses may run instead.
     pub virtual_dispatch: bool,
+    /// The class of the instance a method is called on (`super().name(...)`: the class of the
+    /// calling method). A target's `super().name(...)` runs the next `name` in this class's MRO,
+    /// which, through cooperative mixins, is not the one the target's own bases define.
+    pub receiver: Option<ClassId>,
+    /// `super().name(...)`: the name.
+    pub super_name: Option<String>,
     /// The callee is a parameter of this or an enclosing function: `(owner, name)`.
     pub param: Option<(FnId, String)>,
     pub awaited: bool,

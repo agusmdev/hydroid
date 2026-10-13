@@ -48,6 +48,10 @@ pub struct RawCall {
     pub given: Option<Vec<String>>,
     /// See [`hydroid_core::facts::Call::level`]: `(value, receiver class of a `setLevel`)`.
     pub level: Option<(Option<u32>, Option<Key>)>,
+    /// See [`hydroid_core::facts::Call::receiver`].
+    pub receiver: Option<Key>,
+    /// See [`hydroid_core::facts::Call::super_name`].
+    pub super_name: Option<String>,
 }
 
 /// What code can run implicitly, from the definitions indexed so far.
@@ -352,6 +356,21 @@ impl<'db> Extractor<'_, 'db> {
         matches!(expr, Expr::Call(c) if matches!(&*c.func, Expr::Name(n) if n.id == "super"))
     }
 
+    /// The class whose MRO the method lookup of `obj.name(...)` follows (see
+    /// [`hydroid_core::facts::Call::receiver`]): `obj`'s class, or for `super().name(...)` the
+    /// class of the calling method (with the name).
+    fn mro_receiver(&self, callee: &Expr, resolution: &Resolution) -> (Option<Key>, Option<String>) {
+        let Expr::Attribute(attr) = callee else { return (None, None) };
+        if Self::is_super_call(&attr.value) {
+            let class = self.index.functions.get(&self.current).and_then(|f| f.class);
+            return (class.map(|c| (self.index.file, c)), Some(attr.attr.to_string()));
+        }
+        if !resolution.targets.iter().any(|(_, bound)| *bound) {
+            return (None, None);
+        }
+        (self.self_class(&attr.value).or_else(|| instance_class(self.model, &attr.value)), None)
+    }
+
     /// Whether `callee` passes its receiver implicitly (`obj.method`, but not `module.function`
     /// or `Class.function`).
     fn receiver_bound(&self, callee: &Expr) -> bool {
@@ -612,6 +631,8 @@ impl<'db> Extractor<'_, 'db> {
             sets: None,
             given: None,
             level: None,
+            receiver: None,
+            super_name: None,
         });
     }
 
@@ -898,6 +919,8 @@ impl<'db> Extractor<'_, 'db> {
                 sets: None,
                 given: None,
                 level: None,
+                receiver: None,
+                super_name: None,
             });
         }
     }
@@ -1053,6 +1076,8 @@ impl<'db> Extractor<'_, 'db> {
             sets: None,
             given: None,
             level: None,
+            receiver: None,
+            super_name: None,
         });
     }
 
@@ -1110,6 +1135,7 @@ impl<'db> Extractor<'_, 'db> {
         let attribute = if resolution.targets.is_empty() { self.attribute_slot(&call.func) } else { None };
         let returned_by =
             if resolution.targets.is_empty() && param.is_none() { self.returned_by(&call.func) } else { Vec::new() };
+        let (receiver, super_name) = self.mro_receiver(&call.func, &resolution);
         let unresolved =
             (resolution.targets.is_empty() && param.is_none()).then_some(resolution.reason);
         // The declarative constructor sets each keyword argument on the new instance.
@@ -1148,6 +1174,8 @@ impl<'db> Extractor<'_, 'db> {
             sets,
             given,
             level,
+            receiver,
+            super_name,
         });
     }
 
@@ -1320,6 +1348,8 @@ impl<'db> Extractor<'_, 'db> {
             sets,
             given: None,
             level: None,
+            receiver: None,
+            super_name: None,
         });
     }
 
@@ -1734,6 +1764,8 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                         sets: None,
                         given: None,
                         level: None,
+                        receiver: None,
+                        super_name: None,
                     });
                 }
                 walk_expr(self, expr);

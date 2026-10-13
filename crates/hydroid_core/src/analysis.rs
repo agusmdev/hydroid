@@ -7,7 +7,9 @@
 //! recursion, any depth). Diagnostics are the call sites inside loop code (`async def` bodies and
 //! callbacks scheduled on the loop) whose callee blocks.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
+use std::rc::Rc;
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -357,7 +359,15 @@ impl<'a> Graph<'a> {
             out.extend(body.iter().copied());
             out.extend(dispatches.get(&t).into_iter().flatten());
             if call.virtual_dispatch {
-                out.extend(overrides.iter().copied().filter(|&o| self.dispatches_into(call.caller, o)));
+                // An instance of a known class runs only the overrides of its subclasses.
+                let receiver = call.receiver.filter(|r| !self.facts.class(*r).is_protocol);
+                let below = |o: FnId| {
+                    receiver.is_none_or(|r| self.facts.function(o).class.is_some_and(|c| self.inherits(c, r)))
+                };
+                out.extend(overrides.iter().copied().filter(|&o| below(o) && self.dispatches_into(call.caller, o)));
+            }
+            if let Some(receiver) = call.receiver {
+                out.extend(hierarchy.super_chain(self.facts, receiver, t));
             }
         }
         // A logging call runs the attached filters and handlers.
@@ -1165,6 +1175,13 @@ impl EntryPaths<'_> {
 /// Class hierarchy analysis: which methods may run for `obj.method()`.
 struct Hierarchy {
     subclasses: Vec<Vec<ClassId>>,
+    /// Classes with more than one base somewhere in their ancestry: the only ones whose MRO can
+    /// send a `super()` call somewhere the calling class's own bases do not lead.
+    cooperative: Vec<bool>,
+    /// The names each function calls through `super().name(...)`.
+    supers: HashMap<FnId, Vec<String>>,
+    /// Memoized [`Hierarchy::mro`].
+    mros: RefCell<HashMap<ClassId, Rc<[ClassId]>>>,
 }
 
 impl Hierarchy {
@@ -1175,7 +1192,87 @@ impl Hierarchy {
                 subclasses[base.0 as usize].push(ClassId(i as u32));
             }
         }
-        Self { subclasses }
+        // Propagated down from the classes with several bases.
+        let mut cooperative: Vec<bool> = facts.classes.iter().map(|c| c.bases.len() > 1).collect();
+        let mut queue: VecDeque<ClassId> =
+            (0..facts.classes.len()).filter(|&i| cooperative[i]).map(|i| ClassId(i as u32)).collect();
+        while let Some(c) = queue.pop_front() {
+            for &sub in &subclasses[c.0 as usize] {
+                if !cooperative[sub.0 as usize] {
+                    cooperative[sub.0 as usize] = true;
+                    queue.push_back(sub);
+                }
+            }
+        }
+        let mut supers: HashMap<FnId, Vec<String>> = HashMap::default();
+        for call in &facts.calls {
+            if let Some(name) = &call.super_name {
+                supers.entry(call.caller).or_default().push(name.clone());
+            }
+        }
+        Self { subclasses, cooperative, supers, mros: RefCell::default() }
+    }
+
+    /// What else calling `method` on an instance of `receiver` runs through cooperative
+    /// `super()` calls: while the method running calls `super().name(...)` (its own name), the
+    /// next `name` in the MRO of `receiver`. `class ItemRepository(AuditMixin, Repository)`:
+    /// `AuditMixin.save` calling `super().save(...)` runs `Repository.save`, though `AuditMixin`
+    /// itself has no base defining `save`.
+    fn super_chain(&self, facts: &Facts, receiver: ClassId, method: FnId) -> Vec<FnId> {
+        let calls_super = |m: FnId, name: &str| self.supers.get(&m).is_some_and(|n| n.iter().any(|n| n == name));
+        let Some(class) = facts.function(method).class else { return Vec::new() };
+        let Some((name, _)) = facts.class(class).methods.iter().find(|(_, m)| *m == method) else {
+            return Vec::new();
+        };
+        if !self.cooperative[receiver.0 as usize] || !calls_super(method, name) {
+            return Vec::new();
+        }
+        let mro = self.mro(facts, receiver);
+        let Some(start) = mro.iter().position(|&c| c == class) else { return Vec::new() };
+        let mut chain = Vec::new();
+        for &c in &mro[start + 1..] {
+            if let Some((_, next)) = facts.class(c).methods.iter().find(|(n, _)| n == name) {
+                chain.push(*next);
+                if !calls_super(*next, name) {
+                    break;
+                }
+            }
+        }
+        chain
+    }
+
+    /// The C3 linearization of `class` over the indexed bases (a depth-first order when the
+    /// bases admit none).
+    fn mro(&self, facts: &Facts, class: ClassId) -> Rc<[ClassId]> {
+        if let Some(mro) = self.mros.borrow().get(&class) {
+            return mro.clone();
+        }
+        // Cycles cannot happen in valid code; this keeps a broken hierarchy finite.
+        self.mros.borrow_mut().insert(class, Rc::from([class]));
+        let bases = &facts.class(class).bases;
+        let mut sequences: Vec<Vec<ClassId>> = bases.iter().map(|&b| self.mro(facts, b).to_vec()).collect();
+        sequences.push(bases.clone());
+        let mut mro = vec![class];
+        loop {
+            sequences.retain(|s| !s.is_empty());
+            if sequences.is_empty() {
+                break;
+            }
+            let head = sequences
+                .iter()
+                .map(|s| s[0])
+                .find(|h| !sequences.iter().any(|s| s[1..].contains(h)))
+                .unwrap_or(sequences[0][0]);
+            if !mro.contains(&head) {
+                mro.push(head);
+            }
+            for s in &mut sequences {
+                s.retain(|c| *c != head);
+            }
+        }
+        let mro: Rc<[ClassId]> = mro.into();
+        self.mros.borrow_mut().insert(class, mro.clone());
+        mro
     }
 
     /// Methods overriding `method` in subclasses of its class; for protocols defined in the

@@ -608,6 +608,7 @@ impl<'a> Merger<'a> {
             let attribute = raw.attribute.and_then(|(k, name)| Some((self.class_id(k)?, name)));
             let returned_by = raw.returned_by.into_iter().filter_map(|k| self.fn_id(k)).collect();
             let level = raw.level.map(|(value, receiver)| Level { value, receiver: receiver.and_then(|k| self.class_id(k)) });
+            let receiver = raw.receiver.and_then(|k| self.class_id(k));
             self.facts.calls.push(Call {
                 caller,
                 location: raw.location,
@@ -628,6 +629,8 @@ impl<'a> Merger<'a> {
                 sets,
                 given: raw.given,
                 level,
+                receiver,
+                super_name: raw.super_name,
             });
         }
         for (dispatcher, implementation) in file_facts.dispatches {
