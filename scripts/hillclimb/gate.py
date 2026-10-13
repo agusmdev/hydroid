@@ -12,7 +12,9 @@
 6. score          train + open: 0 false positives, no errors;
                   holdout (aggregate only): 0 false positives, recall not below the baseline
                   (with --require-holdout-gain: above it)
-7. polar          optional (--polar): Polar's wall time, against the goal in _state.json
+7. polar          optional (--polar): Polar's wall time, cold (--no-cache) and warm (cache hit),
+                  3 runs each; the warm median is reported against the goal in _state.json
+                  (reported, not a failure)
 
 The holdout baseline is keyed by the set of holdout case names (`holdout_set`, a hash of the sorted
 names; `holdout_sets` in _state.json lists them): the last recorded round with the same set, or,
@@ -222,15 +224,23 @@ def main() -> int:
                 return fail("score", f"holdout recall did not go up: {h['hits']}/{h['total']} vs "
                             f"{baseline_note} (--require-holdout-gain)")
 
-    polar = None
+    polar = {}
     if args.polar:
-        polar_dir = ROOT / "target/corpus/polar/server"
+        polar_dir = Path(os.environ.get("POLAR_DIR", ROOT / "target/corpus/polar/server"))
         if not polar_dir.exists():
             return fail("polar", "no Polar checkout: run scripts/corpus.sh target/corpus polar first")
-        p = run(["bash", str(HERE / "polar_time.sh"), str(ROOT / "target/release/hydroid"), "3"], capture_output=True)
-        print(p.stdout, end="")
-        m = re.search(r"median (\d+) ms", p.stdout)
-        polar = int(m.group(1)) if m else None
+        binary = str(ROOT / "target/release/hydroid")
+        timer = ["bash", str(HERE / "polar_time.sh"), binary]
+        for kind, extra in (("cold", ["3", "/dev/null", "--no-cache"]), ("warm", ["1"]), ("warm", ["3"])):
+            p = run(timer + extra, capture_output=True)  # the single warm run fills the cache
+            m = re.search(r"median (\d+) ms", p.stdout)
+            if extra != ["1"]:
+                print(f"polar {kind}: {p.stdout}", end="")
+                polar[kind] = int(m.group(1)) if m else None
+        goal = state.get("goal", {}).get("speed", {}).get("goal_ms")
+        if goal and polar.get("warm") is not None:
+            print(f"polar warm median {polar['warm']} ms, goal < {goal} ms: "
+                  + ("met" if polar["warm"] < goal else "NOT met"))
 
     print("\nGATE PASSED")
     if not args.record:
@@ -258,8 +268,10 @@ def main() -> int:
     }
     if lock_base != args.base:
         entry["harness_lock_base"] = lock_base
-    if polar is not None:
-        entry["polar_ms_median"] = polar
+    if polar.get("cold") is not None:
+        entry["polar_cold_ms_median"] = polar["cold"]
+    if polar.get("warm") is not None:
+        entry["polar_warm_ms_median"] = polar["warm"]
     if h:
         state.setdefault("holdout_sets", {})[key] = names
     state.setdefault("rounds", []).append(entry)

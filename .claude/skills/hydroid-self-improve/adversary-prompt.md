@@ -49,7 +49,11 @@ The oracle imports `app.py`, runs the lifespan, calls every route and websocket 
 inputs from the OpenAPI schema (strings `"1"`, ints `1`, files `b"data"`), and records each catalog
 function called on the loop thread. On the loop, blocking calls return a stand-in value (the text
 `"{}"` that accepts any use), so later lines still run. Off the loop, network and process starts
-fail at once; no server is reachable.
+fail at once; no server is reachable except a Unix socket the app serves itself.
+Calls that cannot block are not recorded: a call returning an awaitable (an async client sharing
+a sync client's methods), an operation on a non-blocking socket (asyncio's transports), a call
+whose arguments skip the blocking work (`make_msgid(domain=...)`), and I/O done wholly inside library code
+below a library coroutine the app awaits (FastAPI's own work).
 
 - `BREAKS` - done: hydroid disagrees and the runtime proves the labels.
 - `PASSES` - hydroid already gets it right. Try a different angle on the mechanism, or drop it.
