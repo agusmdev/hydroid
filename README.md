@@ -171,9 +171,12 @@ drop it and the upload step to fail the build instead.
    library methods it calls on `self` (`APIKeyHeader.__call__` calling `self.check_api_key(...)`),
    without `--follow-libs`, and so does a project callable assigned over a library method on an
    instance (`app.openapi = custom_openapi`, which FastAPI's `/openapi.json` route calls); calling
-   a generator function runs nothing until the generator is iterated, and the elements of a
-   generator expression or `map`/`filter` given to a `StreamingResponse` are computed in
-   Starlette's threadpool; a decorated function is reached through its decorator's wrappers only when they call
+   a generator function (or a generator `__iter__` through `iter(obj)`, or a `@contextmanager`
+   function) runs nothing until the generator is iterated (or the context manager entered),
+   also through a variable (`rows = iter(export)` ... `for row in rows`), and the elements of a
+   generator expression or `map`/`filter` given to a `StreamingResponse`, or to an offload API
+   with the consumer pulling them (`to_thread(list, map(f, xs))`), are computed in the
+   threadpool; a decorated function is reached through its decorator's wrappers only when they call
    it (not when they only hand it to an offload API, or to `functools.wraps`), and calling what
    a blocking decorator returns when applied by hand (`safe = retrying.wraps(fetch); safe()`)
    blocks like a decorated function. A sync library method overriding a catalog function of a

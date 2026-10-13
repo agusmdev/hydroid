@@ -225,6 +225,12 @@ pub struct Call {
     /// See [`Instance`]: set on `obj.name(...)` calls whose dispatch depends on more than the
     /// declared class of `obj`.
     pub instance: Option<Instance>,
+    /// `(line, column)` of a call in the same caller this call is deferred to: it computes an
+    /// element of a lazy iterable passed to that call (`to_thread(list, map(f, xs))`,
+    /// `run_in_threadpool(sum, (f(x) for x in xs))`), so it runs wherever that call pulls the
+    /// elements. Not run here when that call is an offload API.
+    #[serde(default)]
+    pub lazy_in: Option<(u32, u32)>,
 }
 
 /// What is known about the instance a method is called on (`obj.name(...)`), beyond the

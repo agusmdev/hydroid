@@ -697,6 +697,7 @@ impl<'a> Merger<'a> {
                 super_name: raw.super_name,
                 logging,
                 instance,
+                lazy_in: raw.lazy_in,
             });
         }
         self.facts.stops_propagation.extend(file_facts.stops_propagation);

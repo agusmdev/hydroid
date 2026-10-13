@@ -65,6 +65,8 @@ pub struct RawCall {
     pub logging: Option<(Option<LoggerName>, Option<Key>, bool)>,
     /// See [`hydroid_core::facts::Call::instance`].
     pub instance: Option<RawInstance>,
+    /// See [`hydroid_core::facts::Call::lazy_in`].
+    pub lazy_in: Option<(u32, u32)>,
 }
 
 /// See [`hydroid_core::facts::Instance`]: classes as keys.
@@ -236,6 +238,7 @@ pub fn extract_file(
             FxHashSet::default()
         },
         streamed: FxHashSet::default(),
+        deferred: FxHashMap::default(),
         out: FileFacts {
             file: index.file,
             signatures: Vec::new(),
@@ -251,9 +254,10 @@ pub fn extract_file(
             stops_propagation: Vec::new(),
         },
     };
-    if index.text(parsed.syntax().range()).contains("StreamingResponse") {
-        extractor.streamed = streamed(&parsed.syntax().body, &|call| extractor.is_streaming_response(call));
-    }
+    let streaming = index.text(parsed.syntax().range()).contains("StreamingResponse");
+    let (streamed, deferred) =
+        lazy_arguments(&parsed.syntax().body, &|call| streaming && extractor.is_streaming_response(call));
+    (extractor.streamed, extractor.deferred) = (streamed, deferred);
     extractor.visit_body(&parsed.syntax().body);
     extractor.drop_eager_reads();
     extractor.out
@@ -329,7 +333,7 @@ fn excluded_fields(call: &ast::ExprCall, keyword: &str) -> Vec<String> {
 
 /// Builtins that iterate their positional arguments during the call.
 const CONSUMERS: &[&str] = &[
-    "list", "tuple", "set", "frozenset", "dict", "sorted", "sum", "min", "max", "any", "all", "next", "iter", "join",
+    "list", "tuple", "set", "frozenset", "dict", "sorted", "sum", "min", "max", "any", "all", "next", "join",
     "extend", "update", "reduce",
 ];
 
@@ -377,8 +381,11 @@ struct Extractor<'a, 'db> {
     callees: FxHashSet<(u32, u32)>,
     /// Constructions (by offset) whose instance is only attached, see [`attach_only`].
     attach_only: FxHashSet<u32>,
-    /// Lazy iterables (by offset) streamed from a worker thread, see [`streamed`].
+    /// Lazy iterables (by offset) streamed from a worker thread, see [`lazy_arguments`].
     streamed: FxHashSet<u32>,
+    /// Other lazy iterables given to calls (by offset), with the offset of that call, see
+    /// [`lazy_arguments`].
+    deferred: FxHashMap<u32, u32>,
     out: FileFacts,
 }
 
@@ -835,6 +842,7 @@ impl<'db> Extractor<'_, 'db> {
         if self.streamed.contains(&expr.start().to_u32()) {
             return;
         }
+        self.iterate_later(expr);
         if let Expr::Call(call) = expr {
             if let Expr::Name(name) = &*call.func
                 && LAZY.contains(&name.id.as_str())
@@ -852,6 +860,61 @@ impl<'db> Extractor<'_, 'db> {
         // Iterators returning themselves from `__iter__` do the work in `__next__`.
         if self.operator_may_run(expr, "__next__") {
             self.implicit_call(expr, "__next__", text, false, true);
+        }
+    }
+
+    /// Iterating (or entering) a variable of this function only ever assigned a call: the call
+    /// recorded there now creates what is advanced here, `gen()` or what a `@contextmanager`
+    /// function returns (`rows = gen()` ... `for row in rows`), or the generator a generator
+    /// `__iter__` returns (`rows = iter(export)`), whose body runs here.
+    fn iterate_later(&mut self, var: &Expr) {
+        let Expr::Name(name) = var else { return };
+        let db = self.model.db();
+        let mut assigned = Vec::new();
+        let definitions = definitions_for_name(self.model, &name.id, var.into(), ImportAliasResolution::ResolveAliases);
+        for definition in definitions {
+            let ResolvedDefinition::Definition(def) = definition else { return };
+            if def.file(db) != self.index.file {
+                return;
+            }
+            let module = parsed_module(db, def.python_file(db)).load(db);
+            let DefinitionKind::Assignment(a) = def.kind(db) else { return };
+            let (None, Expr::Call(call)) = (a.unpack(), a.value(&module)) else { return };
+            assigned.push(match (&*call.func, &call.arguments.args[..]) {
+                (Expr::Name(f), [x]) if f.id.as_str() == "iter" => {
+                    (self.index.location(x.start()), format!("iter({})", self.text(x.range())), true)
+                }
+                (func, _) => (self.index.location(call.start()), self.text(func.range()), false),
+            });
+        }
+        for call in self.out.calls.iter_mut().filter(|c| c.caller == self.current) {
+            let same = |(at, text, implicit): &(Location, String, bool)| {
+                call.location == *at && call.text == *text && call.implicit == *implicit
+            };
+            if assigned.iter().any(same) {
+                call.iterates = true;
+            }
+        }
+    }
+
+    /// Marks the calls recorded since `from` (in this function, outside `eager`) as computing the
+    /// elements of a lazy iterable given to the call at offset `to`, see
+    /// [`hydroid_core::facts::Call::lazy_in`].
+    fn defer_calls(&mut self, from: usize, to: u32, eager: Option<ruff_text_size::TextRange>) {
+        let at = self.index.location(ruff_text_size::TextSize::new(to));
+        let position = |offset| {
+            let location = self.index.location(offset);
+            (location.line, location.column)
+        };
+        let eager = eager.map(|range| (position(range.start()), position(range.end())));
+        for call in &mut self.out.calls[from..] {
+            let here = (call.location.line, call.location.column);
+            if call.caller == self.current
+                && call.lazy_in.is_none()
+                && !eager.is_some_and(|(start, end)| start <= here && here < end)
+            {
+                call.lazy_in = Some((at.line, at.column));
+            }
         }
     }
 
@@ -887,6 +950,7 @@ impl<'db> Extractor<'_, 'db> {
             super_name: None,
             logging: None,
             instance: None,
+            lazy_in: None,
         });
     }
 
@@ -1242,6 +1306,7 @@ impl<'db> Extractor<'_, 'db> {
                 super_name: None,
                 logging: None,
                 instance: None,
+                lazy_in: None,
             });
         }
     }
@@ -1252,7 +1317,11 @@ impl<'db> Extractor<'_, 'db> {
         match name {
             "map" | "filter" | "reduce" => {
                 if let Some(f) = args.first().filter(|_| !self.streamed.contains(&call.start().to_u32())) {
+                    let from = self.out.calls.len();
                     self.call_value(call, f);
+                    if let Some(&to) = self.deferred.get(&call.start().to_u32()) {
+                        self.defer_calls(from, to, None);
+                    }
                 }
                 if name == "reduce"
                     && let Some(xs) = args.get(1)
@@ -1264,6 +1333,10 @@ impl<'db> Extractor<'_, 'db> {
             // contextlib: `stack.enter_context(cm)` enters `cm`, `closing(x)` closes `x`.
             "enter_context" => {
                 if let Some(cm) = args.first() {
+                    if let Expr::Call(call) = cm {
+                        self.iterated.insert(call.start().to_u32());
+                    }
+                    self.iterate_later(cm);
                     let text = format!("enter_context({})", self.text(cm.range()));
                     self.implicit_call(cm, "__enter__", text.clone(), false, false);
                     self.implicit_call(cm, "__exit__", text, false, false);
@@ -1281,6 +1354,15 @@ impl<'db> Extractor<'_, 'db> {
             "callback" | "run" => {
                 if let Some(f) = args.first() {
                     self.call_value(call, f);
+                }
+                return;
+            }
+            // `iter(x)` only calls `x.__iter__()`: a generator `__iter__` (like a generator
+            // function) creates its generator, whose body runs when that is advanced (`next`,
+            // `for`, see `LAZY`), maybe in a worker thread (`to_thread(next, it)`).
+            "iter" => {
+                if let [x] = &args[..] {
+                    self.implicit_call(x, "__iter__", format!("iter({})", self.text(x.range())), false, false);
                 }
                 return;
             }
@@ -1413,6 +1495,7 @@ impl<'db> Extractor<'_, 'db> {
             super_name: None,
             logging: None,
             instance: None,
+            lazy_in: None,
         });
     }
 
@@ -1532,6 +1615,7 @@ impl<'db> Extractor<'_, 'db> {
             super_name,
             logging,
             instance,
+            lazy_in: None,
         });
     }
 
@@ -1963,6 +2047,7 @@ impl<'db> Extractor<'_, 'db> {
             super_name: None,
             logging: None,
             instance: None,
+            lazy_in: None,
         });
     }
 
@@ -2427,6 +2512,11 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
             Stmt::With(with) if self.recording() => {
                 let (enter, exit) = if with.is_async { ("__aenter__", "__aexit__") } else { ("__enter__", "__exit__") };
                 for item in &with.items {
+                    // Entering what a `@contextmanager` function returns runs its generator.
+                    if let Expr::Call(call) = &item.context_expr {
+                        self.iterated.insert(call.start().to_u32());
+                    }
+                    self.iterate_later(&item.context_expr);
                     let text = format!("{}with {}", if with.is_async { "async " } else { "" }, self.text(item.context_expr.range()));
                     self.implicit_call(&item.context_expr, enter, text.clone(), with.is_async, false);
                     self.implicit_call(&item.context_expr, exit, text, with.is_async, false);
@@ -2486,6 +2576,19 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                 if let Some(first) = generators.first() {
                     self.visit_expr(&first.iter);
                 }
+            }
+            // A generator expression given to a call evaluates its first iterable here, the rest
+            // where that call pulls its elements.
+            Expr::Generator(ast::ExprGenerator { generators, .. })
+                if self.recording() && self.deferred.contains_key(&expr.start().to_u32()) =>
+            {
+                let from = self.out.calls.len();
+                for generator in generators.iter().filter(|g| !g.is_async) {
+                    self.iterate(&generator.iter);
+                }
+                walk_expr(self, expr);
+                let to = self.deferred[&expr.start().to_u32()];
+                self.defer_calls(from, to, generators.first().map(|g| g.iter.range()));
             }
             Expr::ListComp(ast::ExprListComp { generators, .. })
             | Expr::SetComp(ast::ExprSetComp { generators, .. })
@@ -2595,6 +2698,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                         super_name: None,
                         logging: None,
                         instance: None,
+                        lazy_in: None,
                     });
                 }
                 walk_expr(self, expr);
@@ -2642,13 +2746,22 @@ fn body_calls(body: &[Stmt]) -> Vec<&ast::ExprCall> {
     finder.0
 }
 
-/// Lazy iterables given to a `StreamingResponse` (`is_streaming` says which calls construct
-/// one) as its content, directly or through a variable only used there: generator expressions
-/// and `map(f, xs)` / `filter(f, xs)`, also inside `zip`, `enumerate` or `iter` (by offset).
-/// Starlette advances a sync iterable in a worker thread (`iterate_in_threadpool`), so their
-/// elements are computed there; only `iter(content)` runs on the loop, which for these does
-/// nothing. A generator expression that awaits is an async generator, iterated on the loop.
-fn streamed(body: &[Stmt], is_streaming: &dyn Fn(&ast::ExprCall) -> bool) -> FxHashSet<u32> {
+/// Lazy iterables given to calls as arguments, directly or through a variable only used there:
+/// generator expressions and `map(f, xs)` / `filter(f, xs)`, also inside `zip`, `enumerate` or
+/// `iter` (by offset). A generator expression that awaits is an async generator, iterated on the
+/// loop. Returns:
+///
+/// - those given to a `StreamingResponse` (`is_streaming` says which calls construct one) as its
+///   content. Starlette advances a sync iterable in a worker thread (`iterate_in_threadpool`),
+///   so their elements are computed there; only `iter(content)` runs on the loop, which for
+///   these does nothing.
+/// - the others, with the offset of the call they are given to: their elements are computed
+///   wherever that call pulls them, a worker thread when it is an offload API handed a consumer
+///   (`to_thread(list, map(f, xs))`), see [`hydroid_core::facts::Call::lazy_in`].
+fn lazy_arguments(
+    body: &[Stmt],
+    is_streaming: &dyn Fn(&ast::ExprCall) -> bool,
+) -> (FxHashSet<u32>, FxHashMap<u32, u32>) {
     #[derive(Default)]
     struct Scope<'a> {
         functions: Vec<&'a ast::StmtFunctionDef>,
@@ -2656,8 +2769,8 @@ fn streamed(body: &[Stmt], is_streaming: &dyn Fn(&ast::ExprCall) -> bool) -> FxH
         assigned: Vec<(&'a str, &'a Expr)>,
         stores: Vec<&'a str>,
         loads: Vec<&'a str>,
-        /// Calls (`StreamingResponse(content)`), with their first argument.
-        contents: Vec<(&'a ast::ExprCall, &'a Expr)>,
+        /// Calls with their arguments, and whether each could be a `StreamingResponse`'s content.
+        arguments: Vec<(&'a ast::ExprCall, &'a Expr, bool)>,
     }
     impl<'a> SourceOrderVisitor<'a> for Scope<'a> {
         fn visit_stmt(&mut self, stmt: &'a Stmt) {
@@ -2680,8 +2793,15 @@ fn streamed(body: &[Stmt], is_streaming: &dyn Fn(&ast::ExprCall) -> bool) -> FxH
             match expr {
                 // Any call: `StreamingResponse` may be imported under another name.
                 Expr::Call(call) => {
-                    let content = call.arguments.args.first().or(call.arguments.find_keyword("content").map(|k| &k.value));
-                    self.contents.extend(content.map(|content| (call, content)));
+                    let arguments = &call.arguments;
+                    let positional = arguments.args.iter().take_while(|a| !a.is_starred_expr());
+                    for (i, argument) in positional.enumerate() {
+                        self.arguments.push((call, argument, i == 0));
+                    }
+                    for keyword in &arguments.keywords {
+                        let content = keyword.arg.as_ref().is_some_and(|a| a.as_str() == "content");
+                        self.arguments.extend(keyword.arg.as_ref().map(|_| (call, &keyword.value, content)));
+                    }
                 }
                 Expr::Name(name) if name.ctx == ExprContext::Store => self.stores.push(name.id.as_str()),
                 Expr::Name(name) if name.ctx == ExprContext::Load => self.loads.push(name.id.as_str()),
@@ -2717,14 +2837,14 @@ fn streamed(body: &[Stmt], is_streaming: &dyn Fn(&ast::ExprCall) -> bool) -> FxH
             _ => {}
         }
     }
-    let mut found = FxHashSet::default();
+    let (mut streamed, mut deferred) = (FxHashSet::default(), FxHashMap::default());
     let mut bodies = vec![body];
     while let Some(body) = bodies.pop() {
         let mut scope = Scope::default();
         scope.visit_body(body);
         bodies.extend(scope.functions.iter().map(|def| &def.body[..]));
-        for &(call, content) in &scope.contents {
-            let content = match content {
+        for &(call, argument, content) in &scope.arguments {
+            let argument = match argument {
                 Expr::Name(name) => {
                     let name = name.id.as_str();
                     let once = |uses: &[&str]| uses.iter().filter(|n| **n == name).count() == 1;
@@ -2734,17 +2854,26 @@ fn streamed(body: &[Stmt], is_streaming: &dyn Fn(&ast::ExprCall) -> bool) -> FxH
                         _ => continue,
                     }
                 }
-                content => content,
+                argument => argument,
             };
             let mut parts = FxHashSet::default();
-            lazy(content, &mut parts);
+            lazy(argument, &mut parts);
+            if parts.is_empty() {
+                continue;
+            }
             // The callee last: checking it runs type inference.
-            if !parts.is_empty() && is_streaming(call) {
-                found.extend(parts);
+            if content && is_streaming(call) {
+                streamed.extend(parts);
+            } else {
+                // Calls come outermost first: `to_thread(sorted, filter(None, map(f, xs)))`
+                // defers `map` to `to_thread`, not to `filter`, which only wraps it.
+                for part in parts {
+                    deferred.entry(part).or_insert(call.start().to_u32());
+                }
             }
         }
     }
-    found
+    (streamed, deferred)
 }
 
 /// Whether an expression awaits (outside nested lambdas, which cannot).

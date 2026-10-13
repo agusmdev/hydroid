@@ -86,7 +86,7 @@ pub fn analyze(facts: &Facts, catalog: &Catalog) -> Report {
     report.stats.functions_analyzed = original.functions.iter().filter(|f| f.analyzed).count();
     report.stats.call_sites = original.calls.len();
     report.stats.call_sites_resolved = (0..original.calls.len())
-        .filter(|&i| !graph.targets[i].is_empty() || facts.calls[i].param.is_some())
+        .filter(|&i| !graph.targets[i].is_empty() || facts.calls[i].param.is_some() || graph.offloaded[i])
         .count();
     report
 }
@@ -106,6 +106,9 @@ struct Graph<'a> {
     called: HashSet<ParamKey>,
     /// Catalog offload APIs, by function.
     offload: Vec<bool>,
+    /// Calls computing the elements of a lazy iterable handed to an offload API (see
+    /// [`Call::lazy_in`]): they run in its worker, never here.
+    offloaded: Vec<bool>,
     /// Sinks that only count when called directly from loop code, by function.
     direct: Vec<bool>,
     /// Blocking decorators (not sinks themselves), by function: calling the wrapper one returns
@@ -183,6 +186,7 @@ impl<'a> Graph<'a> {
             sink,
             called: HashSet::default(),
             offload,
+            offloaded: Vec::new(),
             direct,
             wrapper,
             unless_given: facts.functions.iter().map(|f| catalog.unless_given(&f.qualname)).collect(),
@@ -250,11 +254,26 @@ impl<'a> Graph<'a> {
             graph.log_threshold = graph.logger_threshold();
             graph.log_stops = graph.logger_stops();
         }
+        let offloading: HashSet<(FnId, u32, u32)> = facts
+            .calls
+            .iter()
+            .filter(|c| c.targets.iter().any(|t| graph.is_offload(*t)))
+            .map(|c| (c.caller, c.location.line, c.location.column))
+            .collect();
+        graph.offloaded = facts
+            .calls
+            .iter()
+            .map(|c| c.lazy_in.is_some_and(|(line, column)| offloading.contains(&(c.caller, line, column))))
+            .collect();
         let mut runs = HashMap::default();
         graph.targets = facts
             .calls
             .iter()
-            .map(|call| {
+            .enumerate()
+            .map(|(i, call)| {
+                if graph.offloaded[i] {
+                    return Vec::new();
+                }
                 let at = (call.caller, call.location.line, call.location.column);
                 let flows = flows_at.get(&at).map_or(&[][..], |f| &f[..]);
                 graph.effective_targets(call, flows, &cx, &mut runs)
@@ -1494,6 +1513,7 @@ impl<'a> Graph<'a> {
                 || caller.origin != Origin::Project
                 || caller.specializes.is_some()
                 || !self.targets[i].is_empty()
+                || self.offloaded[i]
             {
                 continue;
             }
