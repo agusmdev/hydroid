@@ -17,7 +17,9 @@ use ty_python_semantic::{
 };
 
 use crate::db::HydroidDb;
-use crate::index::{FileIndex, Key, MODULE_KEY, annotation_classes, is_class_object, yields};
+use crate::index::{
+    FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, is_class_object, state_owner, yield_values, yields,
+};
 
 pub struct RawCall {
     pub caller: u32,
@@ -49,6 +51,17 @@ pub struct Implicit {
     pub names: FxHashSet<String>,
     /// Classes defining (or inheriting) `__getattr__`.
     pub getattr_classes: FxHashSet<Key>,
+}
+
+/// What the project keeps on application and connection state (Starlette types `request.app`
+/// and every `state` attribute as `Any`).
+#[derive(Default)]
+pub struct AppState {
+    /// The class of what is stored under each name (`None`: the stores disagree, or one stores
+    /// a value of unknown class).
+    pub stored: FxHashMap<(StateOwner, String), Option<Key>>,
+    /// The class of `request.app`: the one `Starlette` subclass the project defines, if any.
+    pub app: Option<Key>,
 }
 
 pub struct RawStore {
@@ -108,11 +121,14 @@ pub fn extract_file(
     index: &FileIndex,
     wanted: Option<&FxHashSet<u32>>,
     implicit: Option<&Implicit>,
+    state: &AppState,
 ) -> FileFacts {
     let program_file = ty_python_semantic::Db::program_file(db, index.file);
     let model = SemanticModel::new(db, program_file);
     let parsed = parsed_module(db, model.python_file()).load(db);
     let mut extractor = Extractor {
+        db,
+        state,
         model: &model,
         index,
         wanted,
@@ -164,6 +180,8 @@ const VALIDATES: &[&str] =
     &["model_validate", "model_validate_json", "model_validate_strings", "parse_obj", "parse_raw"];
 
 struct Extractor<'a, 'db> {
+    db: &'a HydroidDb,
+    state: &'a AppState,
     model: &'a SemanticModel<'db>,
     index: &'a FileIndex,
     wanted: Option<&'a FxHashSet<u32>>,
@@ -625,6 +643,9 @@ impl<'db> Extractor<'_, 'db> {
         match receiver.inferred_type(self.model)? {
             ty @ Type::NominalInstance(_) => self.class_key(&ty),
             Type::Dynamic(_) => {
+                if let Some(class) = self.state_class(receiver, 0) {
+                    return Some(class);
+                }
                 if let Some(class) = self.dependency_classes(receiver).first() {
                     return Some(*class);
                 }
@@ -634,6 +655,47 @@ impl<'db> Extractor<'_, 'db> {
                 if union.elements(self.model.db()).iter().all(|t| matches!(t, Type::Dynamic(_))) =>
             {
                 self.dependency_classes(receiver).first().copied()
+            }
+            _ => None,
+        }
+    }
+
+    /// The class of an object read back from application or connection state:
+    /// `request.state.name`, `request.app.state.name`, `request.app` (see [`AppState`]), or a
+    /// local variable assigned one in this file.
+    fn state_class(&self, expr: &Expr, depth: u8) -> Option<Key> {
+        match expr {
+            Expr::Attribute(attr) if attr.attr.as_str() == "app" => {
+                let owner = state_owner(self.db, self.model, &attr.value)?;
+                if owner == StateOwner::Connection { self.state.app } else { None }
+            }
+            Expr::Attribute(attr) => {
+                let Expr::Attribute(state) = &*attr.value else { return None };
+                if state.attr.as_str() != "state" {
+                    return None;
+                }
+                let owner = state_owner(self.db, self.model, &state.value)?;
+                self.state.stored.get(&(owner, attr.attr.to_string())).copied().flatten()
+            }
+            Expr::Name(name) if depth < 3 && (!self.state.stored.is_empty() || self.state.app.is_some()) => {
+                let db = self.model.db();
+                let mut class = None;
+                for definition in
+                    definitions_for_name(self.model, &name.id, expr.into(), ImportAliasResolution::ResolveAliases)
+                {
+                    let ResolvedDefinition::Definition(def) = definition else { return None };
+                    let DefinitionKind::Assignment(assignment) = def.kind(db) else { return None };
+                    if def.file(db) != self.index.file || assignment.unpack().is_some() {
+                        return None;
+                    }
+                    let module = parsed_module(db, def.python_file(db)).load(db);
+                    let found = self.state_class(assignment.value(&module), depth + 1)?;
+                    if class.is_some_and(|c| c != found) {
+                        return None;
+                    }
+                    class = Some(found);
+                }
+                class
             }
             _ => None,
         }
@@ -1248,10 +1310,16 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
             }
             Expr::Call(call) => {
                 self.callees.insert((call.func.start().to_u32(), call.func.end().to_u32()));
+                // Recorded after the calls in its receiver and arguments, in evaluation order (the
+                // first blocking call to run is the witness), but handled first: it marks which
+                // of them it awaits or iterates.
+                let mark = self.out.calls.len();
                 if self.recording() {
                     self.handle_call(call);
                 }
+                let handled = self.out.calls.split_off(mark);
                 walk_expr(self, expr);
+                self.out.calls.extend(handled);
             }
             Expr::Attribute(attr)
                 if self.recording()
@@ -1350,31 +1418,6 @@ fn find_function(module: &ast::ModModule, offset: u32) -> Option<&ast::StmtFunct
     let mut finder = Finder { offset, found: None };
     finder.visit_body(&module.body);
     finder.found
-}
-
-/// The values a generator body yields (in its own scope; not `yield from`).
-fn yield_values(body: &[Stmt]) -> Vec<&Expr> {
-    struct Yields<'a>(Vec<&'a Expr>);
-    impl<'a> SourceOrderVisitor<'a> for Yields<'a> {
-        fn visit_stmt(&mut self, stmt: &'a Stmt) {
-            if !matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
-                walk_stmt(self, stmt);
-            }
-        }
-        fn visit_expr(&mut self, expr: &'a Expr) {
-            match expr {
-                Expr::Yield(ast::ExprYield { value: Some(value), .. }) => {
-                    self.0.push(value);
-                    walk_expr(self, value);
-                }
-                Expr::Lambda(_) => {}
-                _ => walk_expr(self, expr),
-            }
-        }
-    }
-    let mut yields = Yields(Vec::new());
-    yields.visit_body(body);
-    yields.0
 }
 
 /// The values a function body returns (in its own scope).

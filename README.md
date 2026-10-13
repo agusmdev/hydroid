@@ -122,7 +122,11 @@ drop it and the upload step to fail the build instead.
    `send = TABLE[key]; send(...)`, where `TABLE` is a dict, list or tuple literal) resolve to the
    callables stored there, only the one under `key` when the key is a literal. When ty does not know a value's type because it comes
    from an unannotated function, the class that function returns is used; an unannotated
-   `client=Depends(provider)` parameter holds what the provider returns (or yields). Signatures record
+   `client=Depends(provider)` parameter holds what the provider returns (or yields). Objects read
+   back from state, which Starlette types as `Any`, get the class the project stores under that
+   name (`app.state.x = ...` for `request.app.state.x`; a lifespan's `yield {"x": ...}` or
+   `request.state.x = ...` for `request.state.x`) when every store agrees on it, and
+   `request.app` is the project's one `FastAPI` subclass, if it defines one. Signatures record
    what FastAPI validates and serializes: the models (and `AfterValidator`-style callables) in
    parameter annotations, the return annotation, the classes returned. The facts of an unchanged project are reused from `.hydroid_cache/` (keyed by the
    binary, the options, the installed packages and every source file's contents).

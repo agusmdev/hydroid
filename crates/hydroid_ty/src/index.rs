@@ -48,6 +48,23 @@ pub struct ClassEntry {
     pub fields: Vec<Key>,
 }
 
+/// Whose `state` an attribute is stored on: the application's (`app.state.x`), or the one
+/// Starlette copies into every connection's scope (`yield {"x": ...}` in a lifespan, or
+/// `request.state.x`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum StateOwner {
+    App,
+    Connection,
+}
+
+/// `app.state.name = value`, `request.state.name = value`, or `"name": value` in a dict a
+/// lifespan yields. `class` is the class of the value (`None`: unknown).
+pub struct StateStore {
+    pub owner: StateOwner,
+    pub name: String,
+    pub class: Option<Key>,
+}
+
 pub struct FileIndex {
     pub file: File,
     pub origin: Origin,
@@ -58,6 +75,8 @@ pub struct FileIndex {
     /// Class attributes assigned the result of a call (`flags = FromFile(...)`): the only ones
     /// that can hold a descriptor.
     pub class_attributes: Vec<String>,
+    /// Objects stored on application or connection state (project files only).
+    pub state_stores: Vec<StateStore>,
     display_path: String,
     lines: LineIndex,
     source: ruff_db::source::SourceText,
@@ -89,6 +108,7 @@ impl FileIndex {
             classes: FxHashMap::default(),
             suppressed,
             class_attributes: Vec::new(),
+            state_stores: Vec::new(),
             display_path,
             lines,
             source,
@@ -108,7 +128,7 @@ impl FileIndex {
             class: None,
         };
         index.functions.insert(MODULE_KEY, module_entry);
-        let mut builder = Builder { index: &mut index, model: &model, scopes: Vec::new(), module };
+        let mut builder = Builder { db, index: &mut index, model: &model, scopes: Vec::new(), module };
         builder.visit_body(&parsed.syntax().body);
         index
     }
@@ -166,6 +186,7 @@ enum Scope {
 }
 
 struct Builder<'a, 'db> {
+    db: &'a HydroidDb,
     index: &'a mut FileIndex,
     model: &'a SemanticModel<'db>,
     scopes: Vec<(Scope, String)>,
@@ -195,6 +216,35 @@ impl Builder<'_, '_> {
         }
     }
 
+    /// `<owner>.state.<name> = value`: see [`StateStore`].
+    fn state_store(&mut self, target: &Expr, value: &Expr) {
+        let Expr::Attribute(attr) = target else { return };
+        let Expr::Attribute(state) = &*attr.value else { return };
+        if state.attr.as_str() != "state" || value.is_none_literal_expr() {
+            return;
+        }
+        let Some(owner) = state_owner(self.db, self.model, &state.value) else { return };
+        let class = instance_class(self.model, value);
+        self.index.state_stores.push(StateStore { owner, name: attr.attr.to_string(), class });
+    }
+
+    /// `yield {"name": value}` in an `@asynccontextmanager` lifespan: Starlette copies the
+    /// dict into every connection's state.
+    fn lifespan_state(&mut self, def: &ast::StmtFunctionDef) {
+        if !def.is_async || !def.decorator_list.iter().any(|d| decorator_name(d) == Some("asynccontextmanager")) {
+            return;
+        }
+        for value in yield_values(&def.body) {
+            let Expr::Dict(dict) = value else { continue };
+            for item in &dict.items {
+                let Some(Expr::StringLiteral(key)) = &item.key else { continue };
+                let class = instance_class(self.model, &item.value);
+                let name = key.value.to_str().to_string();
+                self.index.state_stores.push(StateStore { owner: StateOwner::Connection, name, class });
+            }
+        }
+    }
+
     fn params(parameters: &ast::Parameters) -> (Vec<String>, usize) {
         let positional: Vec<String> = parameters
             .posonlyargs
@@ -215,8 +265,12 @@ impl Builder<'_, '_> {
 }
 
 fn resolve_base(model: &SemanticModel<'_>, base: &Expr) -> Option<Key> {
+    class_of(model, base.inferred_type(model)?)
+}
+
+/// The class a class object or an instance type is defined by.
+fn class_of<'db>(model: &SemanticModel<'db>, ty: Type<'db>) -> Option<Key> {
     let db = model.db();
-    let ty = base.inferred_type(model)?;
     let def = match ty.definition(db, &model.program_environment())? {
         TypeDefinition::StaticClass(def) | TypeDefinition::DynamicClass(def) => def,
         _ => return None,
@@ -253,6 +307,75 @@ pub fn class_bases(db: &HydroidDb, class: Key) -> Vec<Key> {
     finder.visit_body(&parsed.syntax().body);
     let Some(def) = finder.found else { return Vec::new() };
     def.bases().iter().filter_map(|b| resolve_base(&model, b)).collect()
+}
+
+/// The class an expression's value is an instance of (`T | None`: `T`), if it is one class.
+pub fn instance_class(model: &SemanticModel<'_>, expr: &Expr) -> Option<Key> {
+    let db = model.db();
+    let types = match expr.inferred_type(model)? {
+        Type::Union(union) => union.elements(db).to_vec(),
+        ty => vec![ty],
+    };
+    let mut class = None;
+    for ty in types.into_iter().filter(|t| !t.is_none(db)) {
+        if !matches!(ty, Type::NominalInstance(_)) {
+            return None;
+        }
+        let key = class_of(model, ty)?;
+        if class.is_some_and(|c| c != key) {
+            return None;
+        }
+        class = Some(key);
+    }
+    class
+}
+
+/// The fully qualified name (`module.Class`) of a top-level class, and its bases.
+fn qualname_and_bases(db: &HydroidDb, class: Key) -> Option<(String, Vec<Key>)> {
+    let (module, _, _) = describe(db, class.0);
+    let source = source_text(db, class.0);
+    let name: String =
+        source.as_str().get(class.1 as usize..)?.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    Some((format!("{module}.{name}"), class_bases(db, class)))
+}
+
+/// Whose state `<owner>.state` is: the application's when `owner` is an application (a
+/// `Starlette` instance, or `request.app`), a connection's when it is a request or websocket.
+/// Untyped owners are told apart by name (`app`, `request`, `websocket`).
+pub fn state_owner(db: &HydroidDb, model: &SemanticModel<'_>, owner: &Expr) -> Option<StateOwner> {
+    if let Expr::Attribute(attr) = owner
+        && attr.attr.as_str() == "app"
+    {
+        return Some(StateOwner::App);
+    }
+    if let Some(class) = instance_class(model, owner) {
+        let (mut queue, mut seen) = (vec![class], rustc_hash::FxHashSet::default());
+        while let Some(class) = queue.pop() {
+            if !seen.insert(class) || seen.len() > 32 {
+                continue;
+            }
+            let Some((qualname, bases)) = qualname_and_bases(db, class) else { continue };
+            match qualname.as_str() {
+                "starlette.applications.Starlette" => return Some(StateOwner::App),
+                "starlette.requests.HTTPConnection" => return Some(StateOwner::Connection),
+                _ => queue.extend(bases),
+            }
+        }
+        return None;
+    }
+    if !matches!(owner.inferred_type(model), Some(Type::Dynamic(_))) {
+        return None;
+    }
+    let name = match owner {
+        Expr::Name(name) => name.id.as_str(),
+        Expr::Attribute(attr) => attr.attr.as_str(),
+        _ => return None,
+    };
+    match name {
+        "app" | "application" => Some(StateOwner::App),
+        "request" | "req" | "websocket" | "ws" | "conn" | "connection" => Some(StateOwner::Connection),
+        _ => None,
+    }
 }
 
 /// The last name of a decorator: `property`, `setter` (`@x.setter`), `field_validator` (`@field_validator("x")`).
@@ -338,6 +461,31 @@ pub fn annotation_classes<'e>(
     }
 }
 
+/// The values a generator body yields (in its own scope; not `yield from`).
+pub fn yield_values(body: &[Stmt]) -> Vec<&Expr> {
+    struct Yields<'a>(Vec<&'a Expr>);
+    impl<'a> SourceOrderVisitor<'a> for Yields<'a> {
+        fn visit_stmt(&mut self, stmt: &'a Stmt) {
+            if !matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                walk_stmt(self, stmt);
+            }
+        }
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            match expr {
+                Expr::Yield(ast::ExprYield { value: Some(value), .. }) => {
+                    self.0.push(value);
+                    walk_expr(self, value);
+                }
+                Expr::Lambda(_) => {}
+                _ => walk_expr(self, expr),
+            }
+        }
+    }
+    let mut yields = Yields(Vec::new());
+    yields.visit_body(body);
+    yields.0
+}
+
 /// Whether a body yields (in its own scope: not in nested functions or classes).
 pub fn yields(body: &[Stmt]) -> bool {
     struct Finder(bool);
@@ -375,6 +523,20 @@ fn is_protocol_base(base: &Expr) -> bool {
 
 impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
     fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+        if self.index.origin == Origin::Project {
+            match stmt {
+                Stmt::Assign(assign) => {
+                    for target in &assign.targets {
+                        self.state_store(target, &assign.value);
+                    }
+                }
+                Stmt::AnnAssign(ast::StmtAnnAssign { target, value: Some(value), .. }) => {
+                    self.state_store(target, value);
+                }
+                Stmt::FunctionDef(def) => self.lifespan_state(def),
+                _ => {}
+            }
+        }
         match stmt {
             Stmt::FunctionDef(def) => {
                 let key = def.name.start().to_u32();

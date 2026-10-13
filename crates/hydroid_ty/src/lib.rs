@@ -22,7 +22,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use ty_module_resolver::{ModuleName, resolve_module_confident};
 
 use crate::db::HydroidDb;
-use crate::extract::{FileFacts, Implicit, RawSlot, RawValue, extract_file};
+use crate::extract::{AppState, FileFacts, Implicit, RawSlot, RawValue, extract_file};
 use crate::index::{FileIndex, Key, class_bases};
 
 pub struct Extraction {
@@ -261,6 +261,59 @@ impl Indexes {
         }
     }
 
+    /// What project files store on application and connection state: see [`AppState`].
+    fn app_state(&self) -> AppState {
+        let map = self.0.lock();
+        let library_bases = self.1.lock();
+        let mut state = AppState::default();
+        let projects = || map.values().filter(|i| i.origin == Origin::Project);
+        for store in projects().flat_map(|i| &i.state_stores) {
+            state
+                .stored
+                .entry((store.owner, store.name.clone()))
+                .and_modify(|class| {
+                    if *class != store.class {
+                        *class = None;
+                    }
+                })
+                .or_insert(store.class);
+        }
+        // Project classes deriving from `Starlette` (through indexed ancestors).
+        let bases = |key: &Key| -> Vec<Key> {
+            match map.get(&key.0).and_then(|i| i.classes.get(&key.1)) {
+                Some(entry) if !entry.bases.is_empty() => entry.bases.clone(),
+                _ => library_bases.get(key).cloned().unwrap_or_default(),
+            }
+        };
+        let is_starlette = |key: &Key| {
+            map.get(&key.0)
+                .and_then(|i| i.classes.get(&key.1))
+                .is_some_and(|c| c.qualname == "starlette.applications.Starlette")
+        };
+        let mut apps: Vec<Key> = Vec::new();
+        for index in projects() {
+            for &offset in index.classes.keys() {
+                let (mut queue, mut seen) = (bases(&(index.file, offset)), FxHashSet::default());
+                while let Some(key) = queue.pop() {
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    if is_starlette(&key) {
+                        apps.push((index.file, offset));
+                        break;
+                    }
+                    queue.extend(bases(&key));
+                }
+            }
+        }
+        // The most derived one: `request.app` is an instance of a class no other app subclasses.
+        let leaves: Vec<Key> = apps.iter().copied().filter(|a| !apps.iter().any(|b| bases(b).contains(a))).collect();
+        if let [app] = leaves[..] {
+            state.app = Some(app);
+        }
+        state
+    }
+
     /// What can run implicitly, from the indexed files: see [`Implicit`].
     fn implicit(&self) -> Implicit {
         let map = self.0.lock();
@@ -365,6 +418,7 @@ fn run(
     all_implicit: bool,
 ) -> Vec<FileFacts> {
     let implicit = (!all_implicit).then(|| indexes.implicit());
+    let state = indexes.app_state();
     let shared = Mutex::new(db.clone());
     units
         .par_iter()
@@ -372,7 +426,7 @@ fn run(
             || shared.lock().clone(),
             |db, (file, wanted)| {
                 let index = indexes.get(db, *file);
-                extract_file(db, &index, wanted.as_ref(), implicit.as_ref())
+                extract_file(db, &index, wanted.as_ref(), implicit.as_ref(), &state)
             },
         )
         .collect()
