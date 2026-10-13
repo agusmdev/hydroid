@@ -213,18 +213,18 @@ pub struct Call {
     /// does not validate them into nested models again.
     pub instances: Vec<String>,
     /// A pydantic dump (`model.model_dump(...)`, see [`Dump`]), when the callee may be one.
-    pub dump: Option<Dump>,
+    pub dump: Option<Box<Dump>>,
     /// Why nothing was resolved (only set when `targets` is empty and `param` is `None`).
     pub unresolved: Option<String>,
     /// The logging level the call passes: its `level=` keyword, or the first argument of
     /// `setLevel(...)` and `log(...)`.
-    pub level: Option<Level>,
+    pub level: Option<Box<Level>>,
     /// See [`LogUse`]: set on logging calls, on calls attaching handlers, filters and formatters,
     /// and on constructions whose instance only gets attached.
-    pub logging: Option<LogUse>,
+    pub logging: Option<Box<LogUse>>,
     /// See [`Instance`]: set on `obj.name(...)` calls whose dispatch depends on more than the
     /// declared class of `obj`.
-    pub instance: Option<Instance>,
+    pub instance: Option<Box<Instance>>,
     /// `(line, column)` of a call in the same caller this call is deferred to: it computes an
     /// element of a lazy iterable passed to that call (`to_thread(list, map(f, xs))`,
     /// `run_in_threadpool(sum, (f(x) for x in xs))`), so it runs wherever that call pulls the

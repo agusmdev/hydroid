@@ -40,22 +40,22 @@ pub(super) fn specialize(facts: &mut Facts) {
     let generic: HashSet<String> =
         facts.calls.iter().filter_map(|c| c.instance.as_ref()?.generic.clone()).collect();
     let narrows = |i: &Instance| !i.exact.is_empty() || i.binds.iter().any(|(a, _)| generic.contains(a));
-    if !facts.calls.iter().any(|c| c.instance.as_ref().is_some_and(narrows)) {
+    if !facts.calls.iter().any(|c| c.instance.as_deref().is_some_and(narrows)) {
         return;
     }
     let n = facts.functions.len();
     let mut calls_of = vec![Vec::new(); n];
     // Methods whose calls depend on the kind of `self`.
     let mut sensitive = vec![false; n];
-    // The calls made on instances, as extracted: copies rewrite them again for their `self`.
-    let mut originals: HashMap<usize, Call> = HashMap::default();
+    // The calls made on instances, in call order: copies are numbered as they are first needed.
+    let mut on_instances = Vec::new();
     for (i, call) in facts.calls.iter().enumerate() {
         calls_of[call.caller.0 as usize].push(i);
         if let Some(instance) = &call.instance {
             if instance.is_self || instance.generic.is_some() {
                 sensitive[call.caller.0 as usize] = true;
             }
-            originals.insert(i, call.clone());
+            on_instances.push(i);
         }
     }
     let mut flows_of = vec![Vec::new(); n];
@@ -65,18 +65,11 @@ pub(super) fn specialize(facts: &mut Facts) {
     let hierarchy = Hierarchy::new(facts);
     let mut specializer =
         Specializer { facts, generic, hierarchy, sensitive, copies: HashMap::default(), queue: VecDeque::new() };
-    // In call order: copies are numbered as they are first needed.
-    let mut on_instances: Vec<usize> = originals.keys().copied().collect();
-    on_instances.sort_unstable();
-    for i in on_instances {
-        specializer.facts.calls[i] = specializer.rewrite(&originals[&i], None);
-    }
+    // Copies rewrite the calls as extracted: the rewritten originals replace them at the end.
+    let rewritten: Vec<(usize, Call)> = on_instances.into_iter().map(|i| (i, specializer.rewrite(i, None))).collect();
     while let Some((original, copy, kind)) = specializer.queue.pop_front() {
         for &i in &calls_of[original.0 as usize] {
-            let mut call = match originals.get(&i) {
-                Some(call) => specializer.rewrite(call, Some(&kind)),
-                None => specializer.facts.calls[i].clone(),
-            };
+            let mut call = specializer.rewrite(i, Some(&kind));
             call.caller = copy;
             specializer.facts.calls.push(call);
         }
@@ -85,6 +78,9 @@ pub(super) fn specialize(facts: &mut Facts) {
             flow.caller = copy;
             specializer.facts.flows.push(flow);
         }
+    }
+    for (i, call) in rewritten {
+        specializer.facts.calls[i] = call;
     }
 }
 
@@ -99,9 +95,9 @@ struct Specializer<'a> {
 }
 
 impl Specializer<'_> {
-    /// `call` (made in a copy for `kind` of `self`, if any) with its targets narrowed.
-    fn rewrite(&mut self, call: &Call, kind: Option<&SelfKind>) -> Call {
-        let mut call = call.clone();
+    /// Call `i` (made in a copy for `kind` of `self`, if any) with its targets narrowed.
+    fn rewrite(&mut self, i: usize, kind: Option<&SelfKind>) -> Call {
+        let mut call = self.facts.calls[i].clone();
         let Some(instance) = call.instance.take() else { return call };
         // Only plain method calls: a target that is something else (a decorator's wrapper, a
         // callable stored in an attribute) is kept as resolved.

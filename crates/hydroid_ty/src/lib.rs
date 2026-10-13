@@ -691,12 +691,12 @@ impl<'a> Merger<'a> {
                 given: raw.given,
                 unpacks: raw.unpacks,
                 instances: raw.instances,
-                dump: raw.dump,
-                level,
+                dump: raw.dump.map(Box::new),
+                level: level.map(Box::new),
                 receiver,
                 super_name: raw.super_name,
-                logging,
-                instance,
+                logging: logging.map(Box::new),
+                instance: instance.map(Box::new),
                 lazy_in: raw.lazy_in,
             });
         }

@@ -141,6 +141,31 @@ fn segment_matches(pattern: &str, segment: &str) -> bool {
     true
 }
 
+/// What the catalog says about one function, looked up once (see [`Catalog::roles`]).
+#[derive(Clone, Copy, Default)]
+pub struct Roles {
+    /// The sink group it belongs to.
+    sink: Option<usize>,
+    /// The blocking-decorator group it belongs to.
+    blocking_decorator: Option<usize>,
+    pub offload: bool,
+    pub loop_callback: bool,
+    pub inspector: bool,
+    pub log_dispatch: bool,
+    /// The entry-point kind it registers.
+    entry: Option<usize>,
+}
+
+impl Roles {
+    pub fn is_sink(&self) -> bool {
+        self.sink.is_some()
+    }
+
+    pub fn is_blocking_decorator(&self) -> bool {
+        self.blocking_decorator.is_some()
+    }
+}
+
 #[derive(Default)]
 pub struct Catalog {
     sinks: Patterns<usize>,
@@ -207,6 +232,48 @@ impl Catalog {
             }
         }
         Ok(())
+    }
+
+    /// Every role of `qualname`, for the lookups below that take [`Roles`].
+    pub fn roles(&self, qualname: &str) -> Roles {
+        Roles {
+            sink: self.sinks.get(qualname).copied(),
+            blocking_decorator: self.blocking_decorators.get(qualname).copied(),
+            offload: self.offload.get(qualname).is_some(),
+            loop_callback: self.loop_callbacks.get(qualname).is_some(),
+            inspector: self.inspectors.get(qualname).is_some(),
+            log_dispatch: self.log_dispatch.get(qualname).is_some(),
+            entry: self.entries.get(qualname).copied(),
+        }
+    }
+
+    /// [`Catalog::sink`] for a function whose roles are known.
+    pub fn sink_of(&self, roles: Roles, qualname: &str) -> Option<Sink> {
+        let index = roles.sink?;
+        let (category, advice) = &self.groups[index];
+        let qualname = self.blocks_in[index].as_deref().unwrap_or(qualname).to_string();
+        Some(Sink { qualname, category: category.clone(), advice: advice.clone() })
+    }
+
+    /// [`Catalog::blocking_decorator`] for a function whose roles are known.
+    pub fn blocking_decorator_of(&self, roles: Roles, qualname: &str) -> Option<Sink> {
+        let (category, advice) = &self.groups[roles.blocking_decorator?];
+        Some(Sink { qualname: qualname.to_string(), category: category.clone(), advice: advice.clone() })
+    }
+
+    /// [`Catalog::is_direct_sink`] for a function whose roles are known.
+    pub fn is_direct_sink_of(&self, roles: Roles) -> bool {
+        roles.sink.is_some_and(|index| self.direct[index])
+    }
+
+    /// [`Catalog::unless_given`] for a function whose roles are known.
+    pub fn unless_given_of(&self, roles: Roles) -> &[String] {
+        roles.sink.map_or(&[], |index| &self.unless_given[index])
+    }
+
+    /// [`Catalog::entry_kind`] for a function whose roles are known.
+    pub fn entry_kind_of(&self, roles: Roles) -> Option<&str> {
+        roles.entry.map(|i| self.entry_kinds[i].as_str())
     }
 
     pub fn sink(&self, qualname: &str) -> Option<Sink> {

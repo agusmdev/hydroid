@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, Roles};
 use crate::facts::{
     Call, ClassId, Dump, Facts, FnId, Flow, FunctionKind, Location, LoggerName, Origin, ResponseOptions, Signature, Slot,
     Value,
@@ -35,7 +35,13 @@ pub fn analyze(mut facts: Facts, catalog: &Catalog) -> Report {
     let functions_analyzed = facts.functions.iter().filter(|f| f.analyzed).count();
     let call_sites = facts.calls.len();
     specialize::specialize(&mut facts);
-    let facts = &facts;
+    let report = report(&facts, catalog, functions_analyzed, call_sites);
+    // Freeing the facts of a large project takes tens of milliseconds: off the critical path.
+    std::thread::spawn(move || drop(facts));
+    report
+}
+
+fn report(facts: &Facts, catalog: &Catalog, functions_analyzed: usize, call_sites: usize) -> Report {
     let graph = Graph::new(facts, catalog);
     let blocking = graph.blocking_distances();
     let roots = graph.roots();
@@ -134,6 +140,16 @@ struct Graph<'a> {
     log_stops: Vec<String>,
     /// Memoized [`Graph::validation_hooks`].
     validated: RefCell<HashMap<ClassId, Rc<[FnId]>>>,
+    /// Memoized [`Graph::ancestors`].
+    ancestry: RefCell<HashMap<ClassId, Rc<[ClassId]>>>,
+    /// Memoized [`Graph::construction_hooks`].
+    constructed: RefCell<HashMap<ClassId, Rc<[FnId]>>>,
+    /// Pydantic dump methods, by function.
+    dumps: Vec<bool>,
+    /// What the catalog says about each function.
+    roles: Vec<Roles>,
+    /// Functions defined in test code (see [`is_test_path`]).
+    in_tests: Vec<bool>,
     /// Memoized [`Graph::template_hooks`].
     templates: RefCell<HashMap<TemplateKey, Rc<[FnId]>>>,
 }
@@ -162,24 +178,29 @@ impl<'a> Graph<'a> {
         for (i, call) in facts.calls.iter().enumerate() {
             calls_of[call.caller.0 as usize].push(i);
         }
+        let roles: Vec<Roles> = facts.functions.iter().map(|f| catalog.roles(&f.qualname)).collect();
         let sink = facts
             .functions
             .iter()
-            .map(|f| {
+            .zip(&roles)
+            .map(|(f, &r)| {
                 catalog
-                    .sink(&f.qualname)
+                    .sink_of(r, &f.qualname)
                     .or_else(|| {
-                        let decorators = f.decorators.iter().map(|d| &facts.function(*d).qualname);
-                        (!f.is_async).then(|| decorators.filter_map(|d| catalog.blocking_decorator(d)).next())?
+                        let mut decorators = f.decorators.iter();
+                        (!f.is_async).then(|| {
+                            decorators.find_map(|d| {
+                                catalog.blocking_decorator_of(roles[d.0 as usize], &facts.function(*d).qualname)
+                            })
+                        })?
                     })
-                    .or_else(|| inherited_sink(facts, catalog, f))
-                    .or_else(|| catalog.blocking_decorator(&f.qualname))
+                    .or_else(|| inherited_sink(facts, catalog, &roles, f))
+                    .or_else(|| catalog.blocking_decorator_of(r, &f.qualname))
             })
             .collect();
-        let wrapper =
-            facts.functions.iter().map(|f| catalog.sink(&f.qualname).is_none() && catalog.blocking_decorator(&f.qualname).is_some()).collect();
-        let offload = facts.functions.iter().map(|f| catalog.is_offload(&f.qualname)).collect();
-        let direct = facts.functions.iter().map(|f| catalog.is_direct_sink(&f.qualname)).collect();
+        let wrapper = roles.iter().map(|r| !r.is_sink() && r.is_blocking_decorator()).collect();
+        let offload = roles.iter().map(|r| r.offload).collect();
+        let direct = roles.iter().map(|&r| catalog.is_direct_sink_of(r)).collect();
         let mut graph = Self {
             facts,
             catalog,
@@ -191,7 +212,7 @@ impl<'a> Graph<'a> {
             offloaded: Vec::new(),
             direct,
             wrapper,
-            unless_given: facts.functions.iter().map(|f| catalog.unless_given(&f.qualname)).collect(),
+            unless_given: roles.iter().map(|&r| catalog.unless_given_of(r)).collect(),
             used_params: HashSet::default(),
             hooks: Vec::new(),
             log_hooks: Vec::new(),
@@ -199,13 +220,18 @@ impl<'a> Graph<'a> {
             log_threshold: 0,
             log_stops: Vec::new(),
             validated: RefCell::default(),
+            ancestry: RefCell::default(),
+            constructed: RefCell::default(),
+            dumps: facts.functions.iter().map(|f| DUMPS.contains(&f.qualname.as_str())).collect(),
+            roles,
+            in_tests: facts.functions.iter().map(|f| is_test_path(&f.location.path)).collect(),
             templates: RefCell::default(),
         };
         let used_from_calls = facts.calls.iter().filter_map(|c| c.param.clone());
         let used_from_flows: Vec<ParamKey> = facts
             .flows
             .iter()
-            .filter(|f| !graph.is_offload(f.into) && !catalog.is_inspector(&facts.function(f.into).qualname))
+            .filter(|f| !graph.is_offload(f.into) && !graph.roles[f.into.0 as usize].inspector)
             .filter_map(|f| match &f.value {
                 Value::Param(owner, name) => Some((*owner, name.clone())),
                 _ => None,
@@ -252,7 +278,7 @@ impl<'a> Graph<'a> {
                 (call, level)
             };
             graph.log_dispatch =
-                facts.functions.iter().map(|f| catalog.is_log_dispatch(&f.qualname).then(|| kind(&f.qualname))).collect();
+                facts.functions.iter().zip(&graph.roles).map(|(f, r)| r.log_dispatch.then(|| kind(&f.qualname))).collect();
             graph.log_threshold = graph.logger_threshold();
             graph.log_stops = graph.logger_stops();
         }
@@ -283,6 +309,10 @@ impl<'a> Graph<'a> {
             .collect();
         graph.hooks = graph.framework_hooks();
         graph
+    }
+
+    fn entry_kind(&self, f: FnId) -> Option<&str> {
+        self.catalog.entry_kind_of(self.roles[f.0 as usize])
     }
 
     fn is_offload(&self, f: FnId) -> bool {
@@ -447,7 +477,7 @@ impl<'a> Graph<'a> {
         if let Some((logs, fixed)) = logs {
             // A level that is not known counts as high enough.
             let level = fixed.or_else(|| call.level.as_ref()?.value).unwrap_or(u32::MAX);
-            let in_tests = is_test_path(&self.facts.function(call.caller).location.path);
+            let in_tests = self.in_tests[call.caller.0 as usize];
             let logger = call.logging.as_ref().and_then(|l| l.logger.as_ref());
             if level >= self.log_threshold {
                 out.extend(
@@ -460,7 +490,7 @@ impl<'a> Graph<'a> {
             }
         }
         if let Some(class) = call.constructs {
-            out.extend(self.construction_hooks(class));
+            out.extend(self.construction_hooks(class).iter());
             if let Some(given) = &call.given {
                 out.extend(self.default_factories(class, given));
             }
@@ -470,10 +500,10 @@ impl<'a> Graph<'a> {
         // `model.model_dump()` runs the serialization hooks of the model.
         if let Some(class) = call.receiver
             && call.super_name.is_none()
-            && call.targets.iter().any(|t| DUMPS.contains(&self.facts.function(*t).qualname.as_str()))
+            && call.targets.iter().any(|t| self.dumps[t.0 as usize])
         {
             let all = Dump { json: true, ..Dump::default() };
-            out.extend(self.serialization_hooks(class, call.dump.as_ref().unwrap_or(&all)));
+            out.extend(self.serialization_hooks(class, call.dump.as_deref().unwrap_or(&all)));
         }
         if let Some((class, names)) = &call.sets {
             out.extend(self.attribute_hooks(*class, names));
@@ -564,18 +594,20 @@ impl<'a> Graph<'a> {
 
     /// What constructing `class` runs besides `__init__`: dataclass `__post_init__`, pydantic
     /// `model_post_init` and validators (of the class and its bases).
-    fn construction_hooks(&self, class: ClassId) -> Vec<FnId> {
+    fn construction_hooks(&self, class: ClassId) -> Rc<[FnId]> {
+        if let Some(hooks) = self.constructed.borrow().get(&class) {
+            return hooks.clone();
+        }
         let mut hooks: Vec<FnId> = ["__post_init__", "model_post_init"]
             .iter()
             .filter_map(|name| Hierarchy::lookup(self.facts, class, name))
             .collect();
-        let mut seen = HashSet::from_iter([class]);
-        let mut queue = VecDeque::from([class]);
-        while let Some(c) = queue.pop_front() {
+        for &c in self.ancestors(class).iter() {
             let cls = self.facts.class(c);
             hooks.extend(cls.methods.iter().map(|(_, m)| *m).filter(|m| self.facts.function(*m).is_validator));
-            queue.extend(cls.bases.iter().filter(|b| seen.insert(**b)));
         }
+        let hooks: Rc<[FnId]> = hooks.into();
+        self.constructed.borrow_mut().insert(class, hooks.clone());
         hooks
     }
 
@@ -583,11 +615,8 @@ impl<'a> Graph<'a> {
     /// (of the class and its bases). A class as factory runs its `__init__`.
     fn default_factories(&self, class: ClassId, given: &[String]) -> Vec<FnId> {
         let mut factories = Vec::new();
-        let mut seen = HashSet::from_iter([class]);
-        let mut queue = VecDeque::from([class]);
-        while let Some(c) = queue.pop_front() {
-            let cls = self.facts.class(c);
-            for (names, factory) in &cls.default_factories {
+        for &c in self.ancestors(class).iter() {
+            for (names, factory) in &self.facts.class(c).default_factories {
                 if names.iter().any(|n| given.contains(n)) {
                     continue;
                 }
@@ -597,7 +626,6 @@ impl<'a> Graph<'a> {
                     Value::Param(..) => {}
                 }
             }
-            queue.extend(cls.bases.iter().filter(|b| seen.insert(**b)));
         }
         factories
     }
@@ -606,23 +634,24 @@ impl<'a> Graph<'a> {
     /// its bases).
     fn attribute_hooks(&self, class: ClassId, names: &[String]) -> Vec<FnId> {
         let mut hooks = Vec::new();
-        let mut seen = HashSet::from_iter([class]);
-        let mut queue = VecDeque::from([class]);
-        while let Some(c) = queue.pop_front() {
-            let cls = self.facts.class(c);
+        for &c in self.ancestors(class).iter() {
             hooks.extend(
-                cls.methods
+                self.facts
+                    .class(c)
+                    .methods
                     .iter()
                     .map(|(_, m)| *m)
                     .filter(|m| self.facts.function(*m).validates.iter().any(|v| names.contains(v))),
             );
-            queue.extend(cls.bases.iter().filter(|b| seen.insert(**b)));
         }
         hooks
     }
 
-    /// `class` and its bases, transitively.
-    fn ancestors(&self, class: ClassId) -> Vec<ClassId> {
+    /// `class` and its bases, transitively (breadth-first).
+    fn ancestors(&self, class: ClassId) -> Rc<[ClassId]> {
+        if let Some(found) = self.ancestry.borrow().get(&class) {
+            return found.clone();
+        }
         let mut seen = HashSet::from_iter([class]);
         let mut queue = VecDeque::from([class]);
         let mut out = Vec::new();
@@ -630,6 +659,8 @@ impl<'a> Graph<'a> {
             out.push(c);
             queue.extend(self.facts.class(c).bases.iter().filter(|b| seen.insert(**b)));
         }
+        let out: Rc<[ClassId]> = out.into();
+        self.ancestry.borrow_mut().insert(class, out.clone());
         out
     }
 
@@ -638,7 +669,7 @@ impl<'a> Graph<'a> {
     /// them, unless they are given model instances (`instances`), which pydantic keeps as is.
     fn field_hooks(&self, class: ClassId, given: Option<&[String]>, instances: &[String]) -> Vec<FnId> {
         let mut hooks = Vec::new();
-        for c in self.ancestors(class) {
+        for &c in self.ancestors(class).iter() {
             for field in &self.facts.class(c).model_fields {
                 if given.is_some_and(|g| !field.names.iter().any(|n| g.contains(n))) {
                     continue;
@@ -665,9 +696,9 @@ impl<'a> Graph<'a> {
         let mut seen = HashSet::from_iter([class]);
         let mut queue = VecDeque::from([class]);
         while let Some(c) = queue.pop_front() {
-            hooks.extend(self.construction_hooks(c));
+            hooks.extend(self.construction_hooks(c).iter());
             hooks.extend(self.default_factories(c, &[]));
-            for a in self.ancestors(c) {
+            for &a in self.ancestors(c).iter() {
                 let cls = self.facts.class(a);
                 hooks.extend(cls.model_fields.iter().flat_map(|f| &f.validators));
                 let nested = cls.fields.iter().chain(cls.model_fields.iter().flat_map(|f| &f.classes));
@@ -693,7 +724,7 @@ impl<'a> Graph<'a> {
             let dumped = |name: &String| {
                 !top || (!dump.exclude.contains(name) && dump.include.as_ref().is_none_or(|i| i.contains(name)))
             };
-            for a in self.ancestors(c) {
+            for &a in self.ancestors(c).iter() {
                 let cls = self.facts.class(a);
                 let runs = |m: &FnId| {
                     let f = self.facts.function(*m);
@@ -734,7 +765,7 @@ impl<'a> Graph<'a> {
         let mut attached: HashMap<ClassId, bool> = HashMap::default();
         let mut hooks: Vec<LogHook> = Vec::new();
         let mut attach = |class: ClassId, caller: FnId| {
-            let outside_tests = !is_test_path(&self.facts.function(caller).location.path);
+            let outside_tests = !self.in_tests[caller.0 as usize];
             *attached.entry(class).or_default() |= outside_tests;
         };
         for call in &self.facts.calls {
@@ -752,7 +783,7 @@ impl<'a> Graph<'a> {
                 Value::Class(class) => attach(class, flow.caller),
                 // A plain callable as a filter (`handler.addFilter(drop_health_checks)`).
                 Value::Function(f) if self.facts.function(flow.into).qualname == "logging.Filterer.addFilter" => {
-                    let outside_tests = !is_test_path(&self.facts.function(flow.caller).location.path);
+                    let outside_tests = !self.in_tests[flow.caller.0 as usize];
                     let call = self.facts.calls.iter().find(|c| {
                         c.caller == flow.caller && c.location == flow.location && c.targets.contains(&flow.into)
                     });
@@ -947,8 +978,7 @@ impl<'a> Graph<'a> {
     fn logger_threshold(&self) -> u32 {
         let mut threshold: Option<u32> = None;
         for call in &self.facts.calls {
-            let caller = self.facts.function(call.caller);
-            if caller.origin != Origin::Project || is_test_path(&caller.location.path) {
+            if self.facts.function(call.caller).origin != Origin::Project || self.in_tests[call.caller.0 as usize] {
                 continue;
             }
             for &t in &call.targets {
@@ -1016,15 +1046,7 @@ impl<'a> Graph<'a> {
 
     /// Whether `class` is `base` or a subclass of it.
     fn inherits(&self, class: ClassId, base: ClassId) -> bool {
-        let mut seen = HashSet::from_iter([class]);
-        let mut queue = VecDeque::from([class]);
-        while let Some(c) = queue.pop_front() {
-            if c == base {
-                return true;
-            }
-            queue.extend(self.facts.class(c).bases.iter().filter(|b| seen.insert(**b)));
-        }
-        false
+        class == base || self.ancestors(class).contains(&base)
     }
 
     /// Pydantic (and response class) code FastAPI runs on the loop around endpoints and dependencies, with what runs
@@ -1046,7 +1068,7 @@ impl<'a> Graph<'a> {
             }
             if let Value::Function(f) = flow.value
                 && (flow.slot == Slot::Decorated || matches!(&flow.slot, Slot::Param(p) if p == "endpoint"))
-                && self.catalog.entry_kind(&self.facts.function(flow.into).qualname) == Some("route")
+                && self.entry_kind(flow.into) == Some("route")
             {
                 endpoints.entry((flow.caller, &flow.location)).or_default().push(f);
             }
@@ -1057,7 +1079,7 @@ impl<'a> Graph<'a> {
         let mut hooks = Vec::new();
         for flow in &self.facts.flows {
             let into = &self.facts.function(flow.into).qualname;
-            let kind = self.catalog.entry_kind(into);
+            let kind = self.entry_kind(flow.into);
             let slot = |name: &str| matches!(&flow.slot, Slot::Param(p) if p == name);
             // `response_class=` on a route (or `default_response_class=` on the app, a router or
             // `include_router`): `get_request_handler` constructs it on the loop after the
@@ -1156,7 +1178,7 @@ impl<'a> Graph<'a> {
         for flow in &self.facts.flows {
             let (Value::Function(method), Some(receiver)) = (flow.value.clone(), flow.receiver) else { continue };
             let into = &self.facts.function(flow.into).qualname;
-            let Some(kind) = self.catalog.entry_kind(into) else { continue };
+            let Some(kind) = self.entry_kind(flow.into) else { continue };
             let slot = |name: &str| matches!(&flow.slot, Slot::Param(p) if p == name);
             let applies = match kind {
                 "dependency" => slot("dependency"),
@@ -1202,7 +1224,7 @@ impl<'a> Graph<'a> {
     fn loop_self_calls(&self, class: ClassId) -> HashMap<String, FnId> {
         let mut found: HashMap<String, FnId> = HashMap::default();
         let mut queue = VecDeque::new();
-        for c in self.ancestors(class) {
+        for &c in self.ancestors(class).iter() {
             for &(_, m) in &self.facts.class(c).methods {
                 let f = self.facts.function(m);
                 if f.origin == Origin::Project {
@@ -1291,8 +1313,9 @@ impl<'a> Graph<'a> {
     /// (overrides defined in test code) only stand in for real classes in test code, and classes
     /// defined inside a function only in their own file.
     fn dispatches_into(&self, caller: FnId, method: FnId) -> bool {
+        let tests = !self.in_tests[method.0 as usize] || self.in_tests[caller.0 as usize];
         let (caller, method) = (self.facts.function(caller), self.facts.function(method));
-        (!is_test_path(&method.location.path) || is_test_path(&caller.location.path))
+        tests
             && (!method.qualname.contains(".<locals>.") || method.location.path == caller.location.path)
     }
 
@@ -1325,8 +1348,7 @@ impl<'a> Graph<'a> {
             .collect();
         for flow in &self.facts.flows {
             // Starlette calls sync startup/shutdown handlers directly on the loop.
-            let into = &self.facts.function(flow.into).qualname;
-            let on_loop = self.catalog.is_loop_callback(into) || self.catalog.entry_kind(into) == Some("lifecycle");
+            let on_loop = self.roles[flow.into.0 as usize].loop_callback || self.entry_kind(flow.into) == Some("lifecycle");
             if let Value::Function(f) = flow.value
                 && on_loop
                 && self.facts.function(f).analyzed
@@ -1426,7 +1448,7 @@ impl<'a> Graph<'a> {
         // Copies (see `specialize`) register what their original does.
         for flow in self.facts.flows.iter().filter(|f| self.facts.function(f.caller).specializes.is_none()) {
             let into = &self.facts.function(flow.into).qualname;
-            let Some(kind) = self.catalog.entry_kind(into) else { continue };
+            let Some(kind) = self.entry_kind(flow.into) else { continue };
             let label = entry_label(kind, into, flow);
             match flow.value {
                 Value::Function(f) => entries.push((f, label)),
@@ -1665,15 +1687,15 @@ impl EntryPaths<'_> {
 /// `Session.execute` and delegates to it through `super()`. Library bodies are not analyzed (or,
 /// with `--follow-libs`, are, and need no help), and a sync override of a blocking method keeps
 /// its base's contract: it blocks like it.
-fn inherited_sink(facts: &Facts, catalog: &Catalog, f: &crate::facts::Function) -> Option<Sink> {
+fn inherited_sink(facts: &Facts, catalog: &Catalog, roles: &[Roles], f: &crate::facts::Function) -> Option<Sink> {
     if f.origin != Origin::Library || f.analyzed || f.is_async || f.property.is_some() {
         return None;
     }
     let class = facts.class(f.class?);
     let name = f.qualname.rsplit('.').next()?;
     let base = class.bases.iter().find_map(|&b| Hierarchy::lookup(facts, b, name))?;
-    let base = facts.function(base);
-    catalog.sink(&base.qualname).or_else(|| inherited_sink(facts, catalog, base))
+    let found = catalog.sink_of(roles[base.0 as usize], &facts.function(base).qualname);
+    found.or_else(|| inherited_sink(facts, catalog, roles, facts.function(base)))
 }
 
 /// Class hierarchy analysis: which methods may run for `obj.method()`.
