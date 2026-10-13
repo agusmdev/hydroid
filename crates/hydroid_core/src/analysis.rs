@@ -32,7 +32,7 @@ const DUMPS: &[&str] = &[
 
 pub fn analyze(facts: &Facts, catalog: &Catalog) -> Report {
     let original = facts;
-    let specialized = specialize::specialize(facts);
+    let specialized = specialize::specialize(facts, &route_instances(facts));
     let facts = specialized.as_ref().unwrap_or(facts);
     let graph = Graph::new(facts, catalog);
     let blocking = graph.blocking_distances();
@@ -1094,6 +1094,18 @@ impl<'a> Graph<'a> {
                 hooks.extend(factory.map(|f| (f, format!("{label} (construction)"))));
                 continue;
             }
+            // `APIRouter(route_class=C)`: `APIRoute.handle` calls `get_route_handler()` on the loop
+            // on every request to a route of the router reached through `include_router`.
+            if let Value::Class(class) = flow.value
+                && into == "fastapi.routing.APIRouter.__init__"
+                && slot("route_class")
+            {
+                hooks.extend(
+                    Hierarchy::lookup(self.facts, class, "get_route_handler")
+                        .map(|h| (h, "route class (get_route_handler)".to_string())),
+                );
+                continue;
+            }
             let is_route =
                 matches!(kind, Some("route" | "websocket")) && (flow.slot == Slot::Decorated || slot("endpoint"));
             let is_dependency = kind == Some("dependency") && slot("dependency");
@@ -1545,6 +1557,59 @@ impl<'a> Graph<'a> {
 
 /// Test code by the usual conventions: a `tests`/`test` directory, `test_*.py`, `*_test.py`,
 /// `conftest.py`.
+/// For each project `APIRoute` subclass, the classes its instances can be: the route classes
+/// FastAPI creates route objects of itself (`APIRouter(route_class=C)`,
+/// `route_class_override=C`, `router.route_class = C`) and the classes of the routes the project
+/// constructs, that inherit it. Inside
+/// `FileAuditRoute.get_route_handler`, `self.record(...)` runs `QueuedAuditRoute.record` when
+/// only `QueuedAuditRoute` is registered. Empty when a route class is not known (a parameter).
+fn route_instances(facts: &Facts) -> HashMap<ClassId, Vec<ClassId>> {
+    let none = HashMap::default();
+    let Some(base) = facts.classes.iter().position(|c| c.qualname == "fastapi.routing.APIRoute") else { return none };
+    let hierarchy = Hierarchy::new(facts);
+    let is_route = |c: ClassId| hierarchy.mro(facts, c).contains(&ClassId(base as u32));
+    let mut registered = Vec::new();
+    for flow in &facts.flows {
+        let into = &facts.function(flow.into).qualname;
+        let slot = matches!(&flow.slot, Slot::Param(p) if p == "route_class" || p == "route_class_override");
+        if !slot || !into.starts_with("fastapi.") || facts.function(flow.caller).origin != Origin::Project {
+            continue;
+        }
+        match flow.value {
+            Value::Class(class) if is_route(class) => registered.push(class),
+            _ => return none,
+        }
+    }
+    // Stores of a parameter are `APIRouter.__init__` keeping its own `route_class`.
+    let is_router = |c: ClassId| hierarchy.mro(facts, c).iter().any(|c| facts.class(*c).qualname == "fastapi.routing.APIRouter");
+    for store in facts.stores.iter().filter(|s| s.name == "route_class" && is_router(s.class)) {
+        match store.value {
+            Value::Class(class) if is_route(class) => registered.push(class),
+            Value::Param(..) => {}
+            _ => return none,
+        }
+    }
+    if registered.is_empty() {
+        return none;
+    }
+    let mut created: Vec<ClassId> = facts.calls.iter().filter_map(|c| c.constructs).filter(|&c| is_route(c)).collect();
+    created.extend(registered.iter().copied());
+    created.sort_unstable();
+    created.dedup();
+    let mut instances: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
+    for class in (0..facts.classes.len()).map(|i| ClassId(i as u32)) {
+        let project = facts.class(class).methods.iter().any(|(_, m)| facts.function(*m).origin == Origin::Project);
+        if !project || !is_route(class) {
+            continue;
+        }
+        let of: Vec<ClassId> = created.iter().copied().filter(|&c| hierarchy.mro(facts, c).contains(&class)).collect();
+        if !of.is_empty() {
+            instances.insert(class, of);
+        }
+    }
+    instances
+}
+
 fn is_test_path(path: &str) -> bool {
     let mut parts = path.split('/').rev();
     let file = parts.next().unwrap_or_default();

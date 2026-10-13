@@ -34,12 +34,16 @@ struct SelfKind {
 
 /// The facts with call targets narrowed by what is known about the instances methods are called
 /// on, and the method copies that takes. `None` when nothing is known beyond declared classes.
-pub(super) fn specialize(facts: &Facts) -> Option<Facts> {
+///
+/// `instantiated` maps classes whose instances only a framework creates to the classes it
+/// creates (see `route_instances`): `self` in their methods, and in the closures those define,
+/// is exactly one of these.
+pub(super) fn specialize(facts: &Facts, instantiated: &HashMap<ClassId, Vec<ClassId>>) -> Option<Facts> {
     // Only attributes some method calls through a type variable matter.
     let generic: HashSet<&str> =
         facts.calls.iter().filter_map(|c| c.instance.as_ref()?.generic.as_deref()).collect();
     let narrows = |i: &Instance| !i.exact.is_empty() || i.binds.iter().any(|(a, _)| generic.contains(a.as_str()));
-    if !facts.calls.iter().any(|c| c.instance.as_ref().is_some_and(narrows)) {
+    if instantiated.is_empty() && !facts.calls.iter().any(|c| c.instance.as_ref().is_some_and(narrows)) {
         return None;
     }
     let n = facts.functions.len();
@@ -66,9 +70,20 @@ pub(super) fn specialize(facts: &Facts) -> Option<Facts> {
         out: facts.clone(),
     };
     for (i, call) in facts.calls.iter().enumerate() {
-        if call.instance.is_some() {
-            specializer.out.calls[i] = specializer.rewrite(call, None);
-        }
+        let Some(instance) = &call.instance else { continue };
+        // `self.name(...)` where only the framework creates the instance: as on an exact one.
+        let created = instance.is_self.then(|| self_class(facts, call.caller)).flatten().and_then(|c| instantiated.get(&c));
+        specializer.out.calls[i] = match created {
+            Some(classes) => {
+                let mut call = call.clone();
+                if let Some(instance) = call.instance.as_mut() {
+                    instance.is_self = false;
+                    instance.exact = classes.clone();
+                }
+                specializer.rewrite(&call, None)
+            }
+            None => specializer.rewrite(call, None),
+        };
     }
     while let Some((original, copy, kind)) = specializer.queue.pop_front() {
         for &i in &calls_of[original.0 as usize] {
@@ -83,6 +98,18 @@ pub(super) fn specialize(facts: &Facts) -> Option<Facts> {
         }
     }
     Some(specializer.out)
+}
+
+/// The class whose instance `self` is in `function`: its own class for a method, the enclosing
+/// method's for a closure.
+fn self_class(facts: &Facts, mut function: FnId) -> Option<ClassId> {
+    loop {
+        let f = facts.function(function);
+        if let Some(class) = f.class {
+            return Some(class);
+        }
+        function = f.parent?;
+    }
 }
 
 struct Specializer<'a> {

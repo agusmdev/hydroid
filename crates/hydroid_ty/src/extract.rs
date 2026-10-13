@@ -538,7 +538,7 @@ impl<'db> Extractor<'_, 'db> {
         }
         let receiver = &*attr.value;
         let is_self = matches!(receiver, Expr::Name(n) if matches!(n.id.as_str(), "self" | "cls"))
-            && self.self_class(receiver).is_some();
+            && (self.self_class(receiver).is_some() || self.closure_self(receiver));
         let generic = match receiver {
             Expr::Attribute(inner)
                 if self.self_class(&inner.value).is_some()
@@ -1241,6 +1241,19 @@ impl<'db> Extractor<'_, 'db> {
         let Expr::Name(name) = expr else { return None };
         let entry = self.index.functions.get(&self.current)?;
         (entry.params.first()? == name.id.as_str()).then_some((self.index.file, entry.class?))
+    }
+
+    /// Whether `expr` is the `self` of the method the current closure is defined in (the
+    /// `async def` wrapper a `get_route_handler` override returns).
+    fn closure_self(&self, expr: &Expr) -> bool {
+        let Expr::Name(name) = expr else { return false };
+        let name = name.id.as_str();
+        let Some(mut entry) = self.index.functions.get(&self.current) else { return false };
+        while !entry.params.iter().any(|p| p == name) {
+            let Some(parent) = entry.parent.and_then(|p| self.index.functions.get(&p)) else { return false };
+            entry = parent;
+        }
+        entry.class.is_some() && entry.params.first().is_some_and(|p| p == name)
     }
 
     /// `self.name = value` in a method, or `obj.name = value` in project code (`app.openapi =
