@@ -32,6 +32,8 @@ pub struct FnEntry {
     pub is_serializer: bool,
     /// See [`hydroid_core::facts::Function::serializes`].
     pub serializes: Vec<String>,
+    /// See [`hydroid_core::facts::Function::json_only`].
+    pub json_only: bool,
     /// See [`hydroid_core::facts::Function::validates`] (project files only).
     pub validates: Vec<String>,
     pub params: Vec<String>,
@@ -137,6 +139,7 @@ impl FileIndex {
             is_validator: false,
             is_serializer: false,
             serializes: Vec::new(),
+            json_only: false,
             validates: Vec::new(),
             params: Vec::new(),
             positional: 0,
@@ -538,6 +541,14 @@ fn is_serializer(def: &ast::StmtFunctionDef) -> bool {
         .any(|d| matches!(decorator_name(d), Some("computed_field" | "field_serializer" | "model_serializer")))
 }
 
+/// Whether pydantic serializer metadata or a serializer decorator call is only used when dumping
+/// to JSON: `when_used="json"` or `"json-unless-none"`.
+pub fn json_only(call: &ast::ExprCall) -> bool {
+    call.arguments.find_keyword("when_used").is_some_and(|k| {
+        matches!(&k.value, Expr::StringLiteral(s) if matches!(s.value.to_str(), "json" | "json-unless-none"))
+    })
+}
+
 /// The fields a serialization hook is for: the names a `@field_serializer` lists (none for
 /// `"*"`), the property of a `@computed_field`.
 fn serialized_fields(def: &ast::StmtFunctionDef) -> Vec<String> {
@@ -745,6 +756,10 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                         is_validator: is_validator(def),
                         is_serializer: is_serializer(def),
                         serializes: serialized_fields(def),
+                        json_only: def.decorator_list.iter().any(|d| {
+                            matches!(decorator_name(d), Some("field_serializer" | "model_serializer"))
+                                && matches!(&d.expression, Expr::Call(call) if json_only(call))
+                        }),
                         validates: if self.index.origin == Origin::Project && class.is_some() {
                             orm_validates(self.model, def)
                         } else {
@@ -855,6 +870,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     is_validator: false,
                     is_serializer: false,
                     serializes: Vec::new(),
+                    json_only: false,
                     validates: Vec::new(),
                     params,
                     positional,

@@ -69,6 +69,9 @@ pub struct Function {
     /// The fields a serialization hook is for (`@field_serializer("a", "b")`, the name of a
     /// `@computed_field`): excluding all of them from a dump skips it. Empty: any field.
     pub serializes: Vec<String>,
+    /// A serialization hook only used when dumping to JSON (`when_used="json"` or
+    /// `"json-unless-none"`): python-mode dumps (`model_dump()`) skip it.
+    pub json_only: bool,
     /// A SQLAlchemy attribute validator (`@validates("email")`): setting one of these attributes
     /// on an instance of its class (in the constructor, or `obj.email = ...`) runs it.
     pub validates: Vec<String>,
@@ -118,6 +121,8 @@ pub struct ModelField {
     /// Serializers attached by `Annotated` metadata (`PlainSerializer(f)`, ...): dumping the
     /// field runs them.
     pub serializers: Vec<FnId>,
+    /// The `serializers` only used when dumping to JSON (`when_used="json"`, ...).
+    pub json_serializers: Vec<FnId>,
 }
 
 /// What FastAPI validates and serializes around a function when it is an endpoint or a
@@ -196,6 +201,8 @@ pub struct Call {
     /// Keyword arguments given model instances (or nothing to validate, like `[]`): pydantic
     /// does not validate them into nested models again.
     pub instances: Vec<String>,
+    /// A pydantic dump (`model.model_dump(...)`, see [`Dump`]), when the callee may be one.
+    pub dump: Option<Dump>,
     /// Why nothing was resolved (only set when `targets` is empty and `param` is `None`).
     pub unresolved: Option<String>,
     /// The logging level the call passes: its `level=` keyword, or the first argument of
@@ -204,6 +211,19 @@ pub struct Call {
     /// See [`LogUse`]: set on logging calls, on calls attaching handlers, filters and formatters,
     /// and on constructions whose instance only gets attached.
     pub logging: Option<LogUse>,
+}
+
+/// The arguments of a pydantic dump that decide which serializers run.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Dump {
+    /// Dumps to JSON (`model_dump_json()`, `model_dump(mode="json")`), or the mode is not
+    /// known: JSON-only serializers run too.
+    pub json: bool,
+    /// `exclude={"a"}` (a literal set, or a dict mapping names to `True`): top-level fields
+    /// left out.
+    pub exclude: Vec<String>,
+    /// `include={"a", "b"}` (a literal set or dict): the only top-level fields dumped.
+    pub include: Option<Vec<String>>,
 }
 
 /// How a call takes part in the logging setup.

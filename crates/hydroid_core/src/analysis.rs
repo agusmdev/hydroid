@@ -15,7 +15,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::catalog::Catalog;
 use crate::facts::{
-    Call, ClassId, Facts, FnId, Flow, FunctionKind, Location, LoggerName, Origin, ResponseOptions, Signature, Slot,
+    Call, ClassId, Dump, Facts, FnId, Flow, FunctionKind, Location, LoggerName, Origin, ResponseOptions, Signature, Slot,
     Value,
 };
 use crate::report::{Diagnostic, Frame, ReachedFrom, Report, Sink, Unresolved};
@@ -434,7 +434,8 @@ impl<'a> Graph<'a> {
             && call.super_name.is_none()
             && call.targets.iter().any(|t| DUMPS.contains(&self.facts.function(*t).qualname.as_str()))
         {
-            out.extend(self.serialization_hooks(class, &[]));
+            let all = Dump { json: true, ..Dump::default() };
+            out.extend(self.serialization_hooks(class, call.dump.as_ref().unwrap_or(&all)));
         }
         if let Some((class, names)) = &call.sets {
             out.extend(self.attribute_hooks(*class, names));
@@ -638,29 +639,36 @@ impl<'a> Graph<'a> {
 
     /// What dumping an instance of `class` runs: serialization hooks of the class, its bases and
     /// the models nested in its fields, and the `Annotated` serializers of their fields. Fields
-    /// of `class` named in `exclude` are not dumped.
-    fn serialization_hooks(&self, class: ClassId, exclude: &[String]) -> Vec<FnId> {
+    /// of `class` that `dump` leaves out are not dumped; a python-mode dump skips JSON-only
+    /// serializers.
+    fn serialization_hooks(&self, class: ClassId, dump: &Dump) -> Vec<FnId> {
         let mut hooks = Vec::new();
         let mut seen = HashSet::from_iter([class]);
-        let mut queue = VecDeque::from([(class, exclude)]);
-        while let Some((c, exclude)) = queue.pop_front() {
+        let mut queue = VecDeque::from([(class, true)]);
+        while let Some((c, top)) = queue.pop_front() {
+            let dumped = |name: &String| {
+                !top || (!dump.exclude.contains(name) && dump.include.as_ref().is_none_or(|i| i.contains(name)))
+            };
             for a in self.ancestors(c) {
                 let cls = self.facts.class(a);
-                let dumped = |m: &FnId| {
+                let runs = |m: &FnId| {
                     let f = self.facts.function(*m);
-                    f.is_serializer && (f.serializes.is_empty() || !f.serializes.iter().all(|n| exclude.contains(n)))
+                    f.is_serializer
+                        && (dump.json || !f.json_only)
+                        && (f.serializes.is_empty() || f.serializes.iter().any(dumped))
                 };
-                hooks.extend(cls.methods.iter().map(|(_, m)| *m).filter(dumped));
-                let fields = cls.model_fields.iter().filter(|f| !exclude.contains(&f.names[0]));
+                hooks.extend(cls.methods.iter().map(|(_, m)| *m).filter(runs));
                 let mut nested: Vec<ClassId> = Vec::new();
-                for field in fields {
-                    hooks.extend(&field.serializers);
+                for field in cls.model_fields.iter().filter(|f| dumped(&f.names[0])) {
+                    let json_only = |s: &&FnId| dump.json || !field.json_serializers.contains(s);
+                    hooks.extend(field.serializers.iter().filter(json_only));
                     nested.extend(&field.classes);
                 }
-                if exclude.is_empty() {
+                // Other attributes holding models are dumped unless the fields are filtered.
+                if !top || (dump.exclude.is_empty() && dump.include.is_none()) {
                     nested.extend(&cls.fields);
                 }
-                queue.extend(nested.into_iter().filter(|f| seen.insert(*f)).map(|f| (f, &[][..])));
+                queue.extend(nested.into_iter().filter(|f| seen.insert(*f)).map(|f| (f, false)));
             }
         }
         hooks
@@ -1084,10 +1092,12 @@ impl<'a> Graph<'a> {
             };
             // Without a response model, `jsonable_encoder` dumps whatever is returned (and
             // ignores `response_model_exclude`).
-            let exclude = options.map_or(&[][..], |o| &o.exclude[..]);
-            let (dumped, exclude) = if models.is_empty() { (&signature.returned[..], &[][..]) } else { (models, exclude) };
+            // Both dump in JSON mode.
+            let exclude = options.map(|o| o.exclude.clone()).filter(|_| !models.is_empty()).unwrap_or_default();
+            let dump = Dump { json: true, exclude, include: None };
+            let dumped = if models.is_empty() { &signature.returned[..] } else { models };
             for &class in dumped {
-                add(self.serialization_hooks(class, exclude), "response serialization");
+                add(self.serialization_hooks(class, &dump), "response serialization");
             }
             // Validating an instance of the model (or of a subclass) keeps it as is.
             if self.facts.function(function).is_async && !signature.returns_unknown {

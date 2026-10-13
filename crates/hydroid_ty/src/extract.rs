@@ -1,6 +1,6 @@
 //! Walks function bodies and records calls (with their resolved callees) and callable flows.
 
-use hydroid_core::facts::{Accessor, Location, LoggerName, Origin};
+use hydroid_core::facts::{Accessor, Dump, Location, LoggerName, Origin};
 use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::visitor::source_order::{SourceOrderVisitor, walk_expr, walk_stmt};
@@ -9,7 +9,7 @@ use ruff_text_size::{Ranged, TextRange};
 use std::cell::RefCell;
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use ty_python_core::definition::{Definition, DefinitionKind};
+use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind};
 use ty_python_semantic::types::ide_support::{ResolvedDefinition, call_signature_details};
 use ty_python_semantic::types::{Type, TypeDefinition};
 use ty_python_semantic::{
@@ -19,7 +19,7 @@ use ty_python_semantic::{
 use crate::db::HydroidDb;
 use crate::index::{
     FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, describe, inherits_from, instance_class, is_class_object,
-    state_owner, yield_values, yields,
+    json_only, state_owner, yield_values, yields,
 };
 
 pub struct RawCall {
@@ -50,6 +50,8 @@ pub struct RawCall {
     pub unpacks: bool,
     /// See [`hydroid_core::facts::Call::instances`].
     pub instances: Vec<String>,
+    /// See [`hydroid_core::facts::Call::dump`].
+    pub dump: Option<Dump>,
     /// See [`hydroid_core::facts::Call::level`]: `(value, receiver class of a `setLevel`)`.
     pub level: Option<(Option<u32>, Option<Key>)>,
     /// See [`hydroid_core::facts::Call::receiver`].
@@ -145,6 +147,8 @@ pub struct RawField {
     pub classes: Vec<Key>,
     pub validators: Vec<RawValue>,
     pub serializers: Vec<RawValue>,
+    /// The `serializers` only used when dumping to JSON.
+    pub json_serializers: Vec<RawValue>,
 }
 
 /// See [`hydroid_core::facts::ResponseOptions`].
@@ -231,6 +235,67 @@ struct Resolution {
     virtual_dispatch: bool,
     constructs: Option<Key>,
     reason: String,
+}
+
+/// Whether `expr` is an instance of a project class (or `None`).
+fn is_project_instance(db: &HydroidDb, model: &SemanticModel<'_>, expr: &Expr) -> bool {
+    instance_class(model, expr).is_some_and(|(file, _)| describe(db, file).1 == Origin::Project)
+}
+
+/// Whether an annotation declares instances of project classes, or a collection of them
+/// (`list[Attachment]`, `dict[str, Attachment] | None`).
+fn declares_instances(db: &HydroidDb, model: &SemanticModel<'_>, annotation: &Expr) -> bool {
+    match annotation {
+        Expr::NoneLiteral(_) => true,
+        Expr::BinOp(ast::ExprBinOp { left, op: ast::Operator::BitOr, right, .. }) => {
+            declares_instances(db, model, left) && declares_instances(db, model, right)
+        }
+        Expr::Subscript(subscript) => {
+            let container = match &*subscript.value {
+                Expr::Name(n) => n.id.as_str(),
+                Expr::Attribute(a) => a.attr.as_str(),
+                _ => return false,
+            };
+            let elements = match &*subscript.slice {
+                Expr::Tuple(tuple) => &tuple.elts[..],
+                slice => std::slice::from_ref(slice),
+            };
+            match container {
+                "list" | "List" | "set" | "Set" | "frozenset" | "FrozenSet" | "Sequence" | "Optional" | "Union" => {
+                    elements.iter().all(|e| declares_instances(db, model, e))
+                }
+                "tuple" | "Tuple" => {
+                    elements.iter().all(|e| e.is_ellipsis_literal_expr() || declares_instances(db, model, e))
+                }
+                "dict" | "Dict" | "Mapping" => elements.last().is_some_and(|e| declares_instances(db, model, e)),
+                _ => false,
+            }
+        }
+        Expr::Name(_) | Expr::Attribute(_) => is_project_instance(db, model, annotation),
+        _ => false,
+    }
+}
+
+/// The top-level fields a keyword argument of a call leaves out: a literal set of field names, or
+/// the names a literal dict maps to `True` (or `...`).
+fn excluded_fields(call: &ast::ExprCall, keyword: &str) -> Vec<String> {
+    let mut exclude = Vec::new();
+    match call.arguments.find_keyword(keyword).map(|k| &k.value) {
+        Some(Expr::Set(set)) => {
+            exclude.extend(set.elts.iter().filter_map(|e| Some(e.as_string_literal_expr()?.value.to_str().to_string())));
+        }
+        Some(Expr::Dict(dict)) => {
+            for item in &dict.items {
+                if matches!(item.value, Expr::BooleanLiteral(ast::ExprBooleanLiteral { value: true, .. }) | Expr::EllipsisLiteral(_))
+                    && let Some(Expr::StringLiteral(key)) = &item.key
+                {
+                    exclude.push(key.value.to_str().to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+    exclude
 }
 
 /// Builtins that iterate their positional arguments during the call.
@@ -687,6 +752,7 @@ impl<'db> Extractor<'_, 'db> {
             given: None,
             unpacks: false,
             instances: Vec::new(),
+            dump: None,
             level: None,
             receiver: None,
             super_name: None,
@@ -978,6 +1044,7 @@ impl<'db> Extractor<'_, 'db> {
                 given: None,
                 unpacks: false,
                 instances: Vec::new(),
+                dump: None,
                 level: None,
                 receiver: None,
                 super_name: None,
@@ -1147,6 +1214,7 @@ impl<'db> Extractor<'_, 'db> {
             given: None,
             unpacks: false,
             instances: Vec::new(),
+            dump: None,
             level: None,
             receiver: None,
             super_name: None,
@@ -1234,12 +1302,13 @@ impl<'db> Extractor<'_, 'db> {
             call.arguments
                 .keywords
                 .iter()
-                .filter(|k| self.holds_instances(&k.value))
+                .filter(|k| self.holds_instances(self.model, &k.value, 0))
                 .filter_map(|k| k.arg.as_ref().map(|a| a.to_string()))
                 .collect()
         } else {
             Vec::new()
         };
+        let dump = self.dump(call);
         self.response_options(call, &location);
         let level = self.level_argument(call);
         let logging = self.log_use(call, resolution.constructs.is_some());
@@ -1262,6 +1331,7 @@ impl<'db> Extractor<'_, 'db> {
             given,
             unpacks,
             instances,
+            dump,
             level,
             receiver,
             super_name,
@@ -1271,44 +1341,93 @@ impl<'db> Extractor<'_, 'db> {
 
     /// See [`hydroid_core::facts::Call::logging`].
     /// Whether a keyword argument of a construction holds nothing pydantic validates into a
-    /// nested model: an instance of a project class (`Attachment(...)`, a variable holding one),
-    /// `None`, or a literal collection of those (`[]`).
-    fn holds_instances(&self, value: &Expr) -> bool {
+    /// nested model (instances are kept as is, `revalidate_instances` defaults to `"never"`): an
+    /// instance of a project class (`Attachment(...)`), `None`, a literal collection or a
+    /// comprehension of those (`[]`), or a variable only ever bound to one of those or declared
+    /// as one (`attachments: list[Attachment]`).
+    fn holds_instances(&self, model: &SemanticModel<'db>, value: &Expr, depth: u8) -> bool {
         match value {
             Expr::NoneLiteral(_) => true,
             Expr::List(ast::ExprList { elts, .. })
             | Expr::Tuple(ast::ExprTuple { elts, .. })
-            | Expr::Set(ast::ExprSet { elts, .. }) => elts.iter().all(|e| self.holds_instances(e)),
-            _ => {
-                instance_class(self.model, value).is_some_and(|(file, _)| describe(self.db, file).1 == Origin::Project)
+            | Expr::Set(ast::ExprSet { elts, .. }) => elts.iter().all(|e| self.holds_instances(model, e, depth)),
+            Expr::ListComp(ast::ExprListComp { elt, .. })
+            | Expr::SetComp(ast::ExprSetComp { elt, .. })
+            | Expr::Generator(ast::ExprGenerator { elt, .. }) => self.holds_instances(model, elt, depth),
+            _ if is_project_instance(self.db, model, value) => true,
+            Expr::Name(name) if depth < 3 => {
+                let db = model.db();
+                let definitions =
+                    definitions_for_name(model, &name.id, value.into(), ImportAliasResolution::ResolveAliases);
+                !definitions.is_empty()
+                    && definitions.iter().all(|definition| {
+                        let ResolvedDefinition::Definition(def) = definition else { return false };
+                        if def.file(db) != model.file() {
+                            return false;
+                        }
+                        let module = parsed_module(db, def.python_file(db)).load(db);
+                        match def.kind(db) {
+                            DefinitionKind::Assignment(a) if a.unpack().is_none() => {
+                                self.holds_instances(model, a.value(&module), depth + 1)
+                            }
+                            DefinitionKind::AnnotatedAssignment(a) => {
+                                declares_instances(self.db, model, a.annotation(&module))
+                            }
+                            DefinitionKind::Parameter(ParameterDefinitionNodeKind::Parameter(p)) => {
+                                let annotation = p.node(&module).parameter.annotation();
+                                annotation.is_some_and(|a| declares_instances(self.db, model, a))
+                            }
+                            _ => false,
+                        }
+                    })
             }
+            _ => false,
         }
     }
 
-    /// `response_model=None` and `response_model_exclude={...}` (a literal set of field names, or
-    /// a dict mapping names to `True`) given to a call.
+    /// `response_model=None` and `response_model_exclude={...}` (see [`excluded_fields`]) given
+    /// to a call.
     fn response_options(&mut self, call: &ast::ExprCall, location: &Location) {
         let no_model = call.arguments.find_keyword("response_model").is_some_and(|k| k.value.is_none_literal_expr());
-        let mut exclude = Vec::new();
-        match call.arguments.find_keyword("response_model_exclude").map(|k| &k.value) {
-            Some(Expr::Set(set)) => {
-                exclude.extend(set.elts.iter().filter_map(|e| Some(e.as_string_literal_expr()?.value.to_str().to_string())));
-            }
-            Some(Expr::Dict(dict)) => {
-                for item in &dict.items {
-                    if matches!(item.value, Expr::BooleanLiteral(ast::ExprBooleanLiteral { value: true, .. }) | Expr::EllipsisLiteral(_))
-                        && let Some(Expr::StringLiteral(key)) = &item.key
-                    {
-                        exclude.push(key.value.to_str().to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
+        let exclude = excluded_fields(call, "response_model_exclude");
         if no_model || !exclude.is_empty() {
             let (caller, location) = (self.current, location.clone());
             self.out.response_options.push(RawResponseOptions { caller, location, no_model, exclude });
         }
+    }
+
+    /// See [`Dump`]: `obj.model_dump(...)` and the other pydantic dump methods by name (the
+    /// analysis keeps it only for calls resolving to them).
+    fn dump(&self, call: &ast::ExprCall) -> Option<Dump> {
+        let Expr::Attribute(attr) = &*call.func else { return None };
+        let json = match attr.attr.as_str() {
+            "model_dump_json" | "json" => true,
+            "dict" => false,
+            "model_dump" => match call.arguments.find_keyword("mode").map(|k| &k.value) {
+                None => false,
+                Some(Expr::StringLiteral(mode)) => mode.value.to_str() != "python",
+                Some(_) => true,
+            },
+            _ => return None,
+        };
+        let exclude = excluded_fields(call, "exclude");
+        // Any key of a literal `include` is dumped (a nested set or dict dumps part of it).
+        let include = match call.arguments.find_keyword("include").map(|k| &k.value) {
+            None => None,
+            Some(Expr::Set(set)) => {
+                set.elts.iter().map(|e| Some(e.as_string_literal_expr()?.value.to_str().to_string())).collect()
+            }
+            Some(Expr::Dict(dict)) => dict
+                .items
+                .iter()
+                .map(|item| match &item.key {
+                    Some(Expr::StringLiteral(key)) => Some(key.value.to_str().to_string()),
+                    _ => None,
+                })
+                .collect(),
+            Some(_) => None,
+        };
+        Some(Dump { json, exclude, include })
     }
 
     fn log_use(&self, call: &ast::ExprCall, constructs: bool) -> Option<(Option<LoggerName>, Option<Key>, bool)> {
@@ -1633,6 +1752,7 @@ impl<'db> Extractor<'_, 'db> {
             given: None,
             unpacks: false,
             instances: Vec::new(),
+            dump: None,
             level: None,
             receiver: None,
             super_name: None,
@@ -1981,14 +2101,21 @@ impl<'db> Extractor<'_, 'db> {
                 self.field_types(model, &binop.right, depth, out);
             }
             Expr::Call(call) => {
-                let into = match called_name(call) {
-                    Some(name) if VALIDATOR_METADATA.contains(&name) => &mut out.validators,
-                    Some(name) if SERIALIZER_METADATA.contains(&name) => &mut out.serializers,
+                let serializer = match called_name(call) {
+                    Some(name) if VALIDATOR_METADATA.contains(&name) => false,
+                    Some(name) if SERIALIZER_METADATA.contains(&name) => true,
                     _ => return,
                 };
                 let func = call.arguments.args.first().or_else(|| call.arguments.find_keyword("func").map(|k| &k.value));
                 if let Some(value @ RawValue::Function(_)) = func.and_then(|f| self.function_value(model, f)) {
-                    into.push(value);
+                    if !serializer {
+                        out.validators.push(value);
+                    } else if json_only(call) {
+                        out.json_serializers.push(value.clone());
+                        out.serializers.push(value);
+                    } else {
+                        out.serializers.push(value);
+                    }
                 }
             }
             _ => {}
@@ -2248,6 +2375,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                         given: None,
                         unpacks: false,
                         instances: Vec::new(),
+                        dump: None,
                         level: None,
                         receiver: None,
                         super_name: None,

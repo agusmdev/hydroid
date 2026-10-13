@@ -543,6 +543,7 @@ impl<'a> Merger<'a> {
             is_validator: entry.is_validator,
             is_serializer: entry.is_serializer,
             serializes: entry.serializes.clone(),
+            json_only: entry.json_only,
             validates: entry.validates.clone(),
             params: entry.params.clone(),
             self_calls: entry.self_calls.clone(),
@@ -639,6 +640,7 @@ impl<'a> Merger<'a> {
                 given: raw.given,
                 unpacks: raw.unpacks,
                 instances: raw.instances,
+                dump: raw.dump,
                 level,
                 receiver,
                 super_name: raw.super_name,
@@ -687,7 +689,8 @@ impl<'a> Merger<'a> {
             let classes = raw.classes.into_iter().filter_map(|k| self.class_id(k)).collect();
             let validators = functions(self, raw.validators);
             let serializers = functions(self, raw.serializers);
-            let field = ModelField { names: raw.names, classes, validators, serializers };
+            let json_serializers = functions(self, raw.json_serializers);
+            let field = ModelField { names: raw.names, classes, validators, serializers, json_serializers };
             self.facts.classes[class.0 as usize].model_fields.push(field);
         }
         for raw in file_facts.response_options {
