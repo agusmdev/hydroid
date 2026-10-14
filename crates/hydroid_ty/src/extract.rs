@@ -3516,7 +3516,7 @@ fn find_call(module: &ast::ModModule, range: TextRange) -> Option<&ast::ExprCall
 }
 
 /// The function whose name starts at `offset`.
-fn find_function(module: &ast::ModModule, offset: u32) -> Option<&ast::StmtFunctionDef> {
+pub(crate) fn find_function(module: &ast::ModModule, offset: u32) -> Option<&ast::StmtFunctionDef> {
     struct Finder<'a> {
         offset: u32,
         found: Option<&'a ast::StmtFunctionDef>,

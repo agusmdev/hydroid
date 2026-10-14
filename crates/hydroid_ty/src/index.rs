@@ -212,6 +212,12 @@ pub(crate) fn describe(db: &HydroidDb, file: File) -> (String, Origin, String) {
     let module_of = |relative: &str| {
         let stem = relative.trim_end_matches(".pyi").trim_end_matches(".py");
         let stem = stem.strip_suffix("/__init__").unwrap_or(stem);
+        // A PEP 561 stub-only package `<pkg>-stubs` provides the module `<pkg>` (a directory
+        // name with a hyphen is not importable otherwise).
+        let stem = match stem.split_once('/') {
+            Some((top, rest)) => top.strip_suffix("-stubs").map_or_else(|| stem.to_string(), |pkg| format!("{pkg}/{rest}")),
+            None => stem.strip_suffix("-stubs").unwrap_or(stem).to_string(),
+        };
         stem.replace('/', ".")
     };
     match file.path(db) {

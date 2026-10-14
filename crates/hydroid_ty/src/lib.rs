@@ -20,13 +20,18 @@ use hydroid_core::facts::{
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use ruff_db::files::{File, system_path_to_file};
+use ruff_db::parsed::parsed_module;
 use ruff_db::system::{SystemPath, SystemPathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};
 use ty_module_resolver::{ModuleName, resolve_module_confident};
+use ty_python_core::definition::DefinitionKind;
+use ty_python_semantic::types::ide_support::ResolvedDefinition;
+use ty_python_semantic::{HasDefinition, SemanticModel, map_stub_definition};
 
 use crate::db::HydroidDb;
 use crate::extract::{
     AppState, CatalogKeys, Expiry, FileFacts, Implicit, Instances, Orm, RawInstance, RawSlot, RawValue, Shared, extract_file,
+    find_function,
 };
 use crate::index::{FileIndex, IndexCatalog, Key, class_bases};
 
@@ -950,17 +955,60 @@ impl<'a> Merger<'a> {
     }
 
     /// Library functions called from analyzed code whose bodies have not been analyzed yet.
+    /// The definition a function declared in a library stub stands for (ty's stub mapping, as
+    /// for go-to-definition): `foo/bar.py` for `foo-stubs/bar.pyi`.
+    fn implementation(&self, (file, offset): Key) -> Option<Key> {
+        let db = self.db;
+        let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, file));
+        let parsed = parsed_module(db, model.python_file()).load(db);
+        let definition = find_function(parsed.syntax(), offset)?.definition(&model);
+        let mapped = map_stub_definition(db, &ResolvedDefinition::Definition(definition), None)?;
+        mapped.into_iter().find_map(|d| {
+            let ResolvedDefinition::Definition(d) = d else { return None };
+            if !matches!(d.kind(db), DefinitionKind::Function(_)) {
+                return None;
+            }
+            let module = parsed_module(db, d.python_file(db)).load(db);
+            let range = d.focus_range(db, &module);
+            Some((range.file(), ruff_text_size::Ranged::start(&range).to_u32()))
+        })
+    }
+
     fn library_frontier(&mut self, follow: &(dyn Fn(&str) -> bool + Sync)) -> Vec<(File, Option<FxHashSet<u32>>)> {
         let mut wanted: FxHashMap<File, FxHashSet<u32>> = FxHashMap::default();
         let keys: FxHashMap<FnId, Key> = self.fn_ids.iter().map(|(k, v)| (*v, *k)).collect();
+        let mut stubs: FxHashSet<FnId> = FxHashSet::default();
         for call in &self.facts.calls {
             for &t in &call.targets {
                 let f = self.facts.function(t);
-                if f.analyzed || f.origin != Origin::Library || !f.location.path.ends_with(".py") || !follow(&f.qualname) {
+                if f.analyzed || f.origin != Origin::Library || !follow(&f.qualname) {
+                    continue;
+                }
+                if f.location.path.ends_with(".pyi") {
+                    stubs.insert(t);
                     continue;
                 }
                 let (file, key) = keys[&t];
                 wanted.entry(file).or_default().insert(key);
+            }
+        }
+        // A function declared in a stub (a `foo-stubs` package, or a `.pyi` next to the source)
+        // runs its implementation: follow that one.
+        let mut stubs: Vec<FnId> = stubs.into_iter().collect();
+        stubs.sort_unstable();
+        for stub in stubs {
+            let Some(implementation) = self.implementation(keys[&stub]) else { continue };
+            let Some(id) = self.fn_id(implementation) else { continue };
+            let f = self.facts.function(id);
+            if f.location.path.ends_with(".pyi") {
+                continue;
+            }
+            let (text, analyzed) = (f.qualname.clone(), f.analyzed);
+            let location = self.facts.function(stub).location.clone();
+            self.facts.calls.push(Call { caller: stub, location, text, targets: vec![id], ..Call::default() });
+            self.facts.functions[stub.0 as usize].analyzed = true;
+            if !analyzed {
+                wanted.entry(implementation.0).or_default().insert(implementation.1);
             }
         }
         for (file, keys_in_file) in &wanted {
