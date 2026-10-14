@@ -685,6 +685,11 @@ impl Catalog {
         self.offload.get(qualname).is_some()
     }
 
+    /// Every `[offload]` name (or pattern).
+    pub fn offloads(&self) -> impl Iterator<Item = String> + '_ {
+        self.offload.all()
+    }
+
     pub fn is_loop_callback(&self, qualname: &str) -> bool {
         self.loop_callbacks.get(qualname).is_some()
     }

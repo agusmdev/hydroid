@@ -109,6 +109,9 @@ fn catalog_keys<'c>(db: &HydroidDb, indexes: &Indexes, catalog: &'c Catalog) -> 
             keys.operations.insert(key, operation);
         }
     }
+    for name in catalog.offloads() {
+        keys.offloads.extend(catalog_definitions(db, indexes, &name));
+    }
     for (name, entry) in catalog.entry_entries() {
         if entry.response_model.is_some() || entry.response_exclude.is_some() {
             for key in catalog_definitions(db, indexes, &name) {

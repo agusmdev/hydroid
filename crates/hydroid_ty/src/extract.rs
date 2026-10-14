@@ -21,7 +21,7 @@ use ty_python_semantic::{
 
 use crate::db::HydroidDb;
 use crate::index::{
-    FileIndex, Key, MODULE_KEY, annotation_classes, class_method, class_of, class_qualname, describe, inherits,
+    FileIndex, Key, MODULE_KEY, annotation_classes, class_method, class_of, describe, inherits,
     instance_class, is_class_object, is_class_variable, is_owner, namespace_of, yield_values, yields,
 };
 
@@ -240,6 +240,8 @@ pub struct CatalogKeys<'c> {
     pub operations: FxHashMap<Key, &'c RunsHooks>,
     /// `[[entry]]` functions taking response options (`response_model`, `response_exclude`).
     pub entries: FxHashMap<Key, &'c Entry>,
+    /// `[offload]` functions.
+    pub offloads: FxHashSet<Key>,
     /// `[[entry]]` `passthrough` classes, with their catalog names.
     pub passthrough: Vec<(Key, &'c str)>,
     /// `[[entry]]` functions with `injects`: where a call to them takes the provider (the
@@ -267,6 +269,7 @@ pub fn extract_file(
         catalog,
         keys,
         call_arguments: RefCell::default(),
+        offloaded_params: RefCell::default(),
         lazy_reads: Vec::new(),
         model: &model,
         index,
@@ -300,10 +303,9 @@ pub fn extract_file(
             hooks: Vec::new(),
         },
     };
-    let streaming = index.text(parsed.syntax().range()).contains("StreamingResponse");
     let (streamed, deferred) = lazy_arguments(
         &parsed.syntax().body,
-        &|call| streaming && extractor.is_streaming_response(call),
+        &|call, slot| extractor.hands_to_offload(call, slot),
         &|call| extractor.call_arguments(call).filter(|a| a.lazy),
     );
     (extractor.streamed, extractor.deferred) = (streamed, deferred);
@@ -408,6 +410,9 @@ const LOGS: &[&str] = &["debug", "info", "warning", "warn", "error", "exception"
 /// Methods attaching a handler, filter or formatter to a logger or handler.
 const ATTACHES: &[&str] = &["addHandler", "addFilter", "setFormatter"];
 
+/// A parameter a function hands on: its position (if it can be passed positionally) and name.
+type HandedParam = (Option<usize>, String);
+
 struct Extractor<'a, 'db> {
     db: &'a HydroidDb,
     state: &'a AppState,
@@ -417,6 +422,8 @@ struct Extractor<'a, 'db> {
     keys: &'a CatalogKeys<'a>,
     /// Memoized [`Extractor::call_arguments`], by call offset.
     call_arguments: RefCell<FxHashMap<u32, Option<&'a Arguments>>>,
+    /// Memoized [`Extractor::offloaded_params`].
+    offloaded_params: RefCell<FxHashMap<Key, Vec<HandedParam>>>,
     /// Lazy relationship reads recorded: `(function, location, relationship)`.
     lazy_reads: Vec<(u32, Location, String)>,
     model: &'a SemanticModel<'db>,
@@ -2060,13 +2067,87 @@ impl<'a, 'db> Extractor<'a, 'db> {
         }
     }
 
-    /// Whether `call` constructs Starlette's `StreamingResponse` itself (subclasses may iterate
-    /// their content differently).
-    fn is_streaming_response(&self, call: &ast::ExprCall) -> bool {
-        let Some(ty @ Type::ClassLiteral(_)) = call.func.inferred_type(self.model) else { return false };
-        self.class_key(&ty)
-            .and_then(|class| class_qualname(self.db, class))
-            .is_some_and(|name| name == "starlette.responses.StreamingResponse")
+    /// Whether every callee of `call` hands the parameter at `slot` on to an offload API
+    /// (catalog `[offload]`) as it is, the way Starlette's `StreamingResponse.__init__` does with
+    /// `iterate_in_threadpool(content)`: a lazy iterable given there is consumed in a worker
+    /// thread, as if it were given to the offload API directly.
+    fn hands_to_offload(&self, call: &ast::ExprCall, slot: &RawSlot) -> bool {
+        if self.keys.offloads.is_empty() {
+            return false;
+        }
+        let resolution = self.resolve(&call.func, Some(call));
+        !resolution.targets.is_empty()
+            && resolution.targets.iter().all(|&(key, bound)| {
+                self.offloaded_params(key).iter().any(|(position, name)| match slot {
+                    RawSlot::Positional(i) => *position == Some(i + usize::from(bound)),
+                    RawSlot::Keyword(keyword) => keyword == name,
+                    RawSlot::Decorated => false,
+                })
+            })
+    }
+
+    /// The parameters (with their position, if they can be passed positionally) a function
+    /// hands, as they are, to an offload API in its body (not in nested functions). Memoized.
+    fn offloaded_params(&self, (file, offset): Key) -> Vec<HandedParam> {
+        if let Some(found) = self.offloaded_params.borrow().get(&(file, offset)) {
+            return found.clone();
+        }
+        struct Calls<'b> {
+            calls: Vec<&'b ast::ExprCall>,
+        }
+        impl<'b> SourceOrderVisitor<'b> for Calls<'b> {
+            fn visit_stmt(&mut self, stmt: &'b Stmt) {
+                if !matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                    walk_stmt(self, stmt);
+                }
+            }
+            fn visit_expr(&mut self, expr: &'b Expr) {
+                if let Expr::Call(call) = expr {
+                    self.calls.push(call);
+                }
+                walk_expr(self, expr);
+            }
+        }
+        let db = self.model.db();
+        let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, file));
+        let parsed = parsed_module(db, model.python_file()).load(db);
+        let mut found = Vec::new();
+        if let Some(def) = find_function(parsed.syntax(), offset) {
+            let parameters = &def.parameters;
+            let positional = parameters.posonlyargs.iter().chain(&parameters.args).map(|p| p.parameter.name.as_str());
+            let mut params: Vec<(Option<usize>, &str)> = positional.enumerate().map(|(i, p)| (Some(i), p)).collect();
+            params.extend(parameters.kwonlyargs.iter().map(|p| (None, p.parameter.name.as_str())));
+            let mut finder = Calls { calls: Vec::new() };
+            finder.visit_body(&def.body);
+            for call in finder.calls {
+                let arguments = call.arguments.args.iter().chain(call.arguments.keywords.iter().map(|k| &k.value));
+                let passed: Vec<&(Option<usize>, &str)> = arguments
+                    .filter_map(|a| match a {
+                        Expr::Name(n) => params.iter().find(|(_, p)| *p == n.id.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if passed.is_empty() {
+                    continue;
+                }
+                let offloads = match call.func.inferred_type(&model) {
+                    Some(ty @ (Type::FunctionLiteral(_) | Type::BoundMethod(_))) => {
+                        match ty.definition(db, &model.program_environment()) {
+                            Some(TypeDefinition::Function(def)) => {
+                                self.function_key(def).is_some_and(|k| self.keys.offloads.contains(&k))
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                };
+                if offloads {
+                    found.extend(passed.into_iter().map(|&(i, p)| (i, p.to_string())));
+                }
+            }
+        }
+        self.offloaded_params.borrow_mut().insert((file, offset), found.clone());
+        found
     }
 
     /// The `[[entry]]` `passthrough` classes a function body always returns instances of (every
@@ -2856,16 +2937,16 @@ fn body_calls(body: &[Stmt]) -> Vec<&ast::ExprCall> {
 /// `iter` (by offset). A generator expression that awaits is an async generator, iterated on the
 /// loop. Returns:
 ///
-/// - those given to a `StreamingResponse` (`is_streaming` says which calls construct one) as its
-///   content. Starlette advances a sync iterable in a worker thread (`iterate_in_threadpool`),
-///   so their elements are computed there; only `iter(content)` runs on the loop, which for
-///   these does nothing.
+/// - those given at a slot whose callee hands it on to an offload API (`streams` says which),
+///   as Starlette's `StreamingResponse(content)` does with `iterate_in_threadpool(content)`:
+///   advanced in a worker thread, their elements are computed there; only `iter(content)` runs
+///   on the loop, which for these does nothing.
 /// - the others, with the offset of the call they are given to: their elements are computed
 ///   wherever that call pulls them, a worker thread when it is an offload API handed a consumer
 ///   (`to_thread(list, map(f, xs))`), see [`hydroid_core::facts::Call::lazy_in`].
 fn lazy_arguments<'c>(
     body: &[Stmt],
-    is_streaming: &dyn Fn(&ast::ExprCall) -> bool,
+    streams: &dyn Fn(&ast::ExprCall, &RawSlot) -> bool,
     lazy_iterator: &dyn Fn(&ast::ExprCall) -> Option<&'c Arguments>,
 ) -> (FxHashSet<u32>, FxHashMap<u32, u32>) {
     #[derive(Default)]
@@ -2875,8 +2956,8 @@ fn lazy_arguments<'c>(
         assigned: Vec<(&'a str, &'a Expr)>,
         stores: Vec<&'a str>,
         loads: Vec<&'a str>,
-        /// Calls with their arguments, and whether each could be a `StreamingResponse`'s content.
-        arguments: Vec<(&'a ast::ExprCall, &'a Expr, bool)>,
+        /// Calls with their arguments, and the slot of each.
+        arguments: Vec<(&'a ast::ExprCall, &'a Expr, RawSlot)>,
     }
     impl<'a> SourceOrderVisitor<'a> for Scope<'a> {
         fn visit_stmt(&mut self, stmt: &'a Stmt) {
@@ -2897,16 +2978,15 @@ fn lazy_arguments<'c>(
         }
         fn visit_expr(&mut self, expr: &'a Expr) {
             match expr {
-                // Any call: `StreamingResponse` may be imported under another name.
                 Expr::Call(call) => {
                     let arguments = &call.arguments;
                     let positional = arguments.args.iter().take_while(|a| !a.is_starred_expr());
                     for (i, argument) in positional.enumerate() {
-                        self.arguments.push((call, argument, i == 0));
+                        self.arguments.push((call, argument, RawSlot::Positional(i)));
                     }
                     for keyword in &arguments.keywords {
-                        let content = keyword.arg.as_ref().is_some_and(|a| a.as_str() == "content");
-                        self.arguments.extend(keyword.arg.as_ref().map(|_| (call, &keyword.value, content)));
+                        let slot = keyword.arg.as_ref().map(|a| RawSlot::Keyword(a.to_string()));
+                        self.arguments.extend(slot.map(|slot| (call, &keyword.value, slot)));
                     }
                 }
                 Expr::Name(name) if name.ctx == ExprContext::Store => self.stores.push(name.id.as_str()),
@@ -2952,7 +3032,8 @@ fn lazy_arguments<'c>(
         let mut scope = Scope::default();
         scope.visit_body(body);
         bodies.extend(scope.functions.iter().map(|def| &def.body[..]));
-        for &(call, argument, content) in &scope.arguments {
+        for (call, argument, slot) in &scope.arguments {
+            let call = *call;
             let argument = match argument {
                 Expr::Name(name) => {
                     let name = name.id.as_str();
@@ -2971,7 +3052,7 @@ fn lazy_arguments<'c>(
                 continue;
             }
             // The callee last: checking it runs type inference.
-            if content && is_streaming(call) {
+            if streams(call, slot) {
                 streamed.extend(parts);
             } else {
                 // Calls come outermost first: `to_thread(sorted, filter(None, map(f, xs)))`
