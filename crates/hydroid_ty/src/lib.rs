@@ -703,6 +703,7 @@ impl<'a> Merger<'a> {
             is_async: entry.is_async,
             property: entry.property,
             is_generator: entry.is_generator,
+            takes_receiver: entry.takes_receiver,
             is_validator: false,
             is_serializer: false,
             serializes: Vec::new(),

@@ -626,8 +626,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
             return None;
         }
         let receiver = &*attr.value;
-        let is_self = matches!(receiver, Expr::Name(n) if matches!(n.id.as_str(), "self" | "cls"))
-            && self.self_class(receiver).is_some();
+        let is_self = self.self_class(receiver).is_some();
         let generic = match receiver {
             Expr::Attribute(inner)
                 if self.self_class(&inner.value).is_some()
@@ -1340,7 +1339,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
     /// a `Self` type variable).
     fn self_class(&self, expr: &Expr) -> Option<Key> {
         let Expr::Name(name) = expr else { return None };
-        let entry = self.index.functions.get(&self.current)?;
+        let entry = self.index.functions.get(&self.current).filter(|f| f.takes_receiver)?;
         (entry.params.first()? == name.id.as_str()).then_some((self.index.file, entry.class?))
     }
 
@@ -2061,7 +2060,8 @@ impl<'a, 'db> Extractor<'a, 'db> {
             let Some(annotation) = parameter.parameter.annotation.as_deref() else { continue };
             let is_dependency = |call: &ast::ExprCall| self.injection(call).is_some();
             let default_dependency = matches!(parameter.default.as_deref(), Some(Expr::Call(c)) if is_dependency(c));
-            if name == "self" || name == "cls" || default_dependency {
+            let receiver = self.index.functions.get(&key).is_some_and(|f| f.takes_receiver && f.params.first().is_some_and(|p| p == name));
+            if receiver || default_dependency {
                 continue;
             }
             let mut classes = Vec::new();
@@ -2459,7 +2459,8 @@ impl<'a, 'db> Extractor<'a, 'db> {
             let Some(helper_def) = find_function(helper_module.syntax(), helper.1) else { continue };
             let mut params: Vec<&str> =
                 helper_def.parameters.iter_non_variadic_params().map(|p| p.parameter.name.as_str()).collect();
-            if matches!(&args[at], Expr::Attribute(_)) && matches!(params.first(), Some(&("self" | "cls"))) {
+            // A bound method (`service.load`): its receiver is not passed.
+            if matches!(args[at].inferred_type(self.model), Some(Type::BoundMethod(_))) && !params.is_empty() {
                 params.remove(0);
             }
             // The helper's names for the variable: the parameter it is passed as, and what it

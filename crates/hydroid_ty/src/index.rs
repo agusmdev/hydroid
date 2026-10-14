@@ -31,6 +31,8 @@ pub struct FnEntry {
     pub is_async: bool,
     pub property: Option<Accessor>,
     pub is_generator: bool,
+    /// See [`hydroid_core::facts::Function::takes_receiver`].
+    pub takes_receiver: bool,
     /// The decorator calls of a project method giving string literals (`@validates("a", "b")`):
     /// the function called, and the strings. See [`crate::extract::Orm::validated`].
     pub naming_decorators: Vec<(Key, Vec<String>)>,
@@ -171,6 +173,7 @@ impl FileIndex {
             is_async: false,
             property: None,
             is_generator: false,
+            takes_receiver: false,
             naming_decorators: Vec::new(),
             params: Vec::new(),
             positional: 0,
@@ -708,17 +711,19 @@ pub fn yield_values(body: &[Stmt]) -> Vec<&Expr> {
 
 /// The methods an instance method calls on its own instance (`self.name(...)`), in its own
 /// scope: not in nested functions, lambdas or classes, which may run elsewhere.
-/// `X` of the `self.X.name(...)` calls in the methods of a class.
+/// `X` of the `self.X.name(...)` calls in the instance methods of a class (`self` being each
+/// method's first parameter).
 fn attribute_calls(class: &ast::StmtClassDef) -> Vec<String> {
-    struct Finder {
+    struct Finder<'r> {
+        receiver: &'r str,
         names: Vec<String>,
     }
-    impl<'ast> SourceOrderVisitor<'ast> for Finder {
+    impl<'ast> SourceOrderVisitor<'ast> for Finder<'_> {
         fn visit_expr(&mut self, expr: &'ast Expr) {
             if let Expr::Call(call) = expr
                 && let Expr::Attribute(method) = &*call.func
                 && let Expr::Attribute(attr) = &*method.value
-                && matches!(&*attr.value, Expr::Name(n) if n.id.as_str() == "self")
+                && matches!(&*attr.value, Expr::Name(n) if n.id.as_str() == self.receiver)
                 && !self.names.iter().any(|n| n == attr.attr.as_str())
             {
                 self.names.push(attr.attr.to_string());
@@ -726,9 +731,15 @@ fn attribute_calls(class: &ast::StmtClassDef) -> Vec<String> {
             walk_expr(self, expr);
         }
     }
-    let mut finder = Finder { names: Vec::new() };
-    finder.visit_body(&class.body);
-    finder.names
+    let mut names = Vec::new();
+    for stmt in &class.body {
+        let Stmt::FunctionDef(def) = stmt else { continue };
+        let Some(receiver) = receiver_name(def) else { continue };
+        let mut finder = Finder { receiver, names: std::mem::take(&mut names) };
+        finder.visit_body(&def.body);
+        names = finder.names;
+    }
+    names
 }
 
 /// What a library function calls of what it is given, to construct it (`route_class(...)`): the
@@ -991,8 +1002,16 @@ fn is_protocol_base(base: &Expr) -> bool {
 impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
     fn visit_stmt(&mut self, stmt: &'ast Stmt) {
         if self.index.origin == Origin::Project {
+            // Attributes set on anything but the enclosing method's receiver.
+            let receiver = self
+                .enclosing_function()
+                .and_then(|f| self.index.functions.get(&f))
+                .filter(|f| f.takes_receiver)
+                .and_then(|f| f.params.first().cloned());
             let rebound = |target: &Expr| match target {
-                Expr::Attribute(attr) if !matches!(&*attr.value, Expr::Name(n) if matches!(n.id.as_str(), "self" | "cls")) => {
+                Expr::Attribute(attr)
+                    if !matches!(&*attr.value, Expr::Name(n) if receiver.as_deref() == Some(n.id.as_str())) =>
+                {
                     Some(attr.attr.to_string())
                 }
                 _ => None,
@@ -1047,6 +1066,8 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                         // A decorated generator is called through its decorator, which decides
                         // when the body runs (see `Call::deferred_body`).
                         is_generator: !def.is_async && def.decorator_list.is_empty() && yields(&def.body),
+                        takes_receiver: class.is_some()
+                            && !def.decorator_list.iter().any(|d| decorator_name(d) == Some("staticmethod")),
                         naming_decorators: if self.index.origin == Origin::Project && class.is_some() {
                             naming_decorators(self.model, def)
                         } else {
@@ -1164,6 +1185,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     is_async: false,
                     property: None,
                     is_generator: false,
+                    takes_receiver: false,
                     naming_decorators: Vec::new(),
                     params,
                     positional,

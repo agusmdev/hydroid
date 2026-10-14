@@ -61,6 +61,10 @@ pub struct Function {
     /// An undecorated generator function: calling it only creates the generator, iterating the
     /// generator runs the body.
     pub is_generator: bool,
+    /// A method whose first parameter is its receiver (the instance, or the class of a
+    /// `classmethod`): not a `staticmethod`.
+    #[serde(default)]
+    pub takes_receiver: bool,
     /// A pydantic validator: constructing or validating its model runs it.
     pub is_validator: bool,
     /// A pydantic serialization hook (`@computed_field`, `@field_serializer`,

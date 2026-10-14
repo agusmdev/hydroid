@@ -367,7 +367,8 @@ impl<'a> Graph<'a> {
                 .chain(nested[into.0 as usize].iter().copied())
                 .filter_map(|owner| {
                     let f = self.facts.function(owner);
-                    let first = f.params.iter().find(|p| *p != "self" && *p != "cls")?;
+                    // The first parameter after the receiver.
+                    let first = f.params.get(usize::from(f.takes_receiver))?;
                     Some((owner, first.clone()))
                 })
                 .collect(),
