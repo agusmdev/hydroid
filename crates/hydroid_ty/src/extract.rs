@@ -21,8 +21,8 @@ use ty_python_semantic::{
 
 use crate::db::HydroidDb;
 use crate::index::{
-    FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, class_method, class_of, class_qualname, describe, inherits,
-    instance_class, is_class_object, is_class_variable, state_owner, yield_values, yields,
+    FileIndex, Key, MODULE_KEY, annotation_classes, class_method, class_of, class_qualname, describe, inherits,
+    instance_class, is_class_object, is_class_variable, is_owner, namespace_of, yield_values, yields,
 };
 
 pub struct RawCall {
@@ -89,15 +89,16 @@ pub struct Implicit {
     pub getattr_classes: FxHashSet<Key>,
 }
 
-/// What the project keeps on application and connection state (Starlette types `request.app`
-/// and every `state` attribute as `Any`).
+/// What the project keeps in the catalog `[[state_namespace]]` groups (which the library types
+/// as `Any`, like `request.app`).
 #[derive(Default)]
 pub struct AppState {
-    /// The class of what is stored under each name (`None`: the stores disagree, or one stores
-    /// a value of unknown class).
-    pub stored: FxHashMap<(StateOwner, String), Option<Key>>,
-    /// The class of `request.app`: the one `Starlette` subclass the project defines, if any.
-    pub app: Option<Key>,
+    /// The class of what is stored under each name of each namespace (`None`: the stores
+    /// disagree, or one stores a value of unknown class).
+    pub stored: FxHashMap<(usize, String), Option<Key>>,
+    /// For each namespace with `app`, by index: the class of the application its owners give,
+    /// the one project subclass of the application classes, if there is one.
+    pub apps: FxHashMap<usize, Key>,
 }
 
 /// What the indexed project files say about the instances methods are called on.
@@ -1147,24 +1148,25 @@ impl<'a, 'db> Extractor<'a, 'db> {
             && values.iter().all(|v| matches!(v, Expr::Name(n) if n.id == receiver.parameter.name.id))
     }
 
-    /// The class of an object read back from application or connection state:
+    /// The class of an object read back from a namespace (catalog `[[state_namespace]]`):
     /// `request.state.name`, `request.app.state.name`, `request.app` (see [`AppState`]), or a
     /// local variable assigned one in this file.
     fn state_class(&self, expr: &Expr, depth: u8) -> Option<Key> {
+        let namespaces = self.catalog.state_namespaces();
         match expr {
-            Expr::Attribute(attr) if attr.attr.as_str() == "app" => {
-                let owner = state_owner(self.db, self.model, &attr.value)?;
-                if owner == StateOwner::Connection { self.state.app } else { None }
-            }
             Expr::Attribute(attr) => {
-                let Expr::Attribute(state) = &*attr.value else { return None };
-                if state.attr.as_str() != "state" {
-                    return None;
+                let app = self.state.apps.iter().find(|&(&n, _)| {
+                    let group = &namespaces[n];
+                    group.app.as_ref().is_some_and(|a| a.attribute == attr.attr.as_str())
+                        && is_owner(self.db, self.model, namespaces, &attr.value, &group.owners)
+                });
+                if let Some((_, &app)) = app {
+                    return Some(app);
                 }
-                let owner = state_owner(self.db, self.model, &state.value)?;
-                self.state.stored.get(&(owner, attr.attr.to_string())).copied().flatten()
+                let namespace = namespace_of(self.db, self.model, namespaces, &attr.value)?;
+                self.state.stored.get(&(namespace, attr.attr.to_string())).copied().flatten()
             }
-            Expr::Name(name) if depth < 3 && (!self.state.stored.is_empty() || self.state.app.is_some()) => {
+            Expr::Name(name) if depth < 3 && (!self.state.stored.is_empty() || !self.state.apps.is_empty()) => {
                 let db = self.model.db();
                 let mut class = None;
                 for definition in

@@ -883,3 +883,29 @@ functions = [
     "starlette.background.BackgroundTasks.add_task",
     "starlette.background.BackgroundTask.__init__",
 ]
+
+# ---------------------------------------------------------------------------------------------
+# Attribute namespaces the library types as `Any`: a read gets the class of what the project
+# stores under that name (when every store agrees).
+#   owners     classes whose instances (and subclasses') own one
+#   attribute  the owners' attribute holding it (`app.state`); without it, the owner itself
+#   app        `{ attribute, owners }`: `<owner>.<attribute>` is the application, an instance
+#              of `owners`, typed as the one project subclass of them
+#   lifespan   `{ owners, keyword }`: the dicts yielded by the lifespan given at `keyword` to
+#              the constructor of `owners` are copied into the namespace
+# ---------------------------------------------------------------------------------------------
+[[state_namespace]]
+owners = ["starlette.applications.Starlette"]
+attribute = "state"
+
+# Starlette copies a lifespan's state into every connection's.
+[[state_namespace]]
+owners = ["starlette.requests.HTTPConnection"]
+attribute = "state"
+app = { attribute = "app", owners = ["starlette.applications.Starlette"] }
+lifespan = { owners = ["starlette.applications.Starlette"], keyword = "lifespan" }
+
+# Flask and Quart (not built in; work through `[tool.hydroid]` as is): `g`, typed as
+# `_AppCtxGlobals`, is its own namespace.
+# [[state_namespace]]
+# owners = ["flask.ctx._AppCtxGlobals"]

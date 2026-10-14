@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use hydroid_core::catalog::{Catalog, HookPhase, qualname_matches};
+use hydroid_core::catalog::{Catalog, HookPhase, StateNamespace, qualname_matches};
 use hydroid_core::facts::{
     Call, Class, ClassId, Facts, FnId, Flow, Function, Instance, Level, LogUse, ModelField, Origin, ResponseOptions, Signature, Slot,
     Store, Value,
@@ -180,7 +180,7 @@ pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
     let files = project_files(&db, &root, options.exclude)?;
     timings.phase("environment and project files");
 
-    let indexes = Indexes::default();
+    let indexes = Indexes(Default::default(), Default::default(), options.catalog.state_namespaces().to_vec());
     let keys = catalog_keys(&db, &indexes, options.catalog);
     let mut merger = Merger::new(&db, &indexes);
     let units: Vec<(File, Option<FxHashSet<u32>>)> = files.iter().map(|&f| (f, None)).collect();
@@ -254,17 +254,18 @@ fn project_files(db: &HydroidDb, root: &SystemPath, exclude: &[String]) -> anyho
     Ok(files)
 }
 
-/// File indexes shared between extraction threads and the merge, and the bases of the library
-/// classes that are ancestors of project classes.
+/// File indexes shared between extraction threads and the merge, the bases of the library
+/// classes that are ancestors of project classes, and the catalog `[[state_namespace]]` groups
+/// (project files record what is stored in them).
 #[derive(Default)]
-struct Indexes(Mutex<FxHashMap<File, Arc<FileIndex>>>, Mutex<FxHashMap<Key, Vec<Key>>>);
+struct Indexes(Mutex<FxHashMap<File, Arc<FileIndex>>>, Mutex<FxHashMap<Key, Vec<Key>>>, Vec<StateNamespace>);
 
 impl Indexes {
     fn get(&self, db: &HydroidDb, file: File) -> Arc<FileIndex> {
         if let Some(index) = self.0.lock().get(&file) {
             return index.clone();
         }
-        let index = Arc::new(FileIndex::build(db, file));
+        let index = Arc::new(FileIndex::build(db, file, &self.2));
         self.0.lock().entry(file).or_insert(index).clone()
     }
 
@@ -289,7 +290,7 @@ impl Indexes {
             let shared = Mutex::new(db.clone());
             let built: Vec<(File, Arc<FileIndex>)> = pending
                 .par_iter()
-                .map_init(|| shared.lock().clone(), |db, &file| (file, Arc::new(FileIndex::build(db, file))))
+                .map_init(|| shared.lock().clone(), |db, &file| (file, Arc::new(FileIndex::build(db, file, &self.2))))
                 .collect();
             {
                 let mut map = self.0.lock();
@@ -345,7 +346,7 @@ impl Indexes {
         classes
     }
 
-    /// What project files store on application and connection state: see [`AppState`].
+    /// What project files store in the catalog `[[state_namespace]]` groups: see [`AppState`].
     fn app_state(&self) -> AppState {
         let map = self.0.lock();
         let library_bases = self.1.lock();
@@ -354,7 +355,7 @@ impl Indexes {
         for store in projects().flat_map(|i| &i.state_stores) {
             state
                 .stored
-                .entry((store.owner, store.name.clone()))
+                .entry((store.namespace, store.name.clone()))
                 .and_modify(|class| {
                     if *class != store.class {
                         *class = None;
@@ -362,38 +363,40 @@ impl Indexes {
                 })
                 .or_insert(store.class);
         }
-        // Project classes deriving from `Starlette` (through indexed ancestors).
+        // Project classes deriving from the application classes (through indexed ancestors).
         let bases = |key: &Key| -> Vec<Key> {
             match map.get(&key.0).and_then(|i| i.classes.get(&key.1)) {
                 Some(entry) if !entry.bases.is_empty() => entry.bases.clone(),
                 _ => library_bases.get(key).cloned().unwrap_or_default(),
             }
         };
-        let is_starlette = |key: &Key| {
-            map.get(&key.0)
-                .and_then(|i| i.classes.get(&key.1))
-                .is_some_and(|c| c.qualname == "starlette.applications.Starlette")
-        };
-        let mut apps: Vec<Key> = Vec::new();
-        for index in projects() {
-            for &offset in index.classes.keys() {
-                let (mut queue, mut seen) = (bases(&(index.file, offset)), FxHashSet::default());
-                while let Some(key) = queue.pop() {
-                    if !seen.insert(key) {
-                        continue;
+        for (namespace, group) in self.2.iter().enumerate() {
+            let Some(app) = &group.app else { continue };
+            let is_app = |key: &Key| {
+                map.get(&key.0).and_then(|i| i.classes.get(&key.1)).is_some_and(|c| app.owners.contains(&c.qualname))
+            };
+            let mut apps: Vec<Key> = Vec::new();
+            for index in projects() {
+                for &offset in index.classes.keys() {
+                    let (mut queue, mut seen) = (bases(&(index.file, offset)), FxHashSet::default());
+                    while let Some(key) = queue.pop() {
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                        if is_app(&key) {
+                            apps.push((index.file, offset));
+                            break;
+                        }
+                        queue.extend(bases(&key));
                     }
-                    if is_starlette(&key) {
-                        apps.push((index.file, offset));
-                        break;
-                    }
-                    queue.extend(bases(&key));
                 }
             }
-        }
-        // The most derived one: `request.app` is an instance of a class no other app subclasses.
-        let leaves: Vec<Key> = apps.iter().copied().filter(|a| !apps.iter().any(|b| bases(b).contains(a))).collect();
-        if let [app] = leaves[..] {
-            state.app = Some(app);
+            // The most derived one: the application is an instance of a class no other app
+            // subclasses.
+            let leaves: Vec<Key> = apps.iter().copied().filter(|a| !apps.iter().any(|b| bases(b).contains(a))).collect();
+            if let [app] = leaves[..] {
+                state.apps.insert(namespace, app);
+            }
         }
         state
     }

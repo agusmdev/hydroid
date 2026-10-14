@@ -41,6 +41,45 @@ struct CatalogFile {
     runs_hooks: Vec<RunsHooksGroup>,
     #[serde(default)]
     entry: Vec<EntryGroup>,
+    /// Objects whose attributes hold what project code stores on them.
+    #[serde(default)]
+    state_namespace: Vec<StateNamespace>,
+}
+
+/// An attribute namespace the library types as `Any` (`app.state`): reading `<namespace>.name`
+/// gets the class of what the project stores under `name` there.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateNamespace {
+    /// Classes whose instances (and their subclasses') own one.
+    pub owners: Vec<String>,
+    /// The owner's attribute holding it; without it, the owner itself.
+    #[serde(default)]
+    pub attribute: Option<String>,
+    /// An attribute of the owners giving the application (`request.app`).
+    #[serde(default)]
+    pub app: Option<AppAttribute>,
+    /// What a lifespan given to an application's constructor yields is copied into it.
+    #[serde(default)]
+    pub lifespan: Option<Lifespan>,
+}
+
+/// `<owner>.<attribute>` is the application: an instance of `owners`, typed as the one project
+/// subclass of them, if there is one.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppAttribute {
+    pub attribute: String,
+    pub owners: Vec<String>,
+}
+
+/// The string keys of a dict literal yielded by the lifespan given at `keyword` to the
+/// constructor of `owners` (or of a subclass) go into the namespace.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Lifespan {
+    pub owners: Vec<String>,
+    pub keyword: String,
 }
 
 #[derive(Deserialize)]
@@ -416,6 +455,7 @@ pub struct Catalog {
     operations: Vec<(String, RunsHooks)>,
     entries: Patterns<usize>,
     entry_groups: Vec<Entry>,
+    state_namespaces: Vec<StateNamespace>,
 }
 
 impl Catalog {
@@ -476,6 +516,7 @@ impl Catalog {
         for group in file.loop_probe {
             self.loop_probes.extend(group.functions.into_iter().map(|f| (f, group.raises.clone())));
         }
+        self.state_namespaces.extend(file.state_namespace);
         for group in file.entry {
             let EntryGroup {
                 kind,
@@ -635,6 +676,11 @@ impl Catalog {
         &self.operations
     }
 
+    /// The `[[state_namespace]]` groups, in order (their index identifies them).
+    pub fn state_namespaces(&self) -> &[StateNamespace] {
+        &self.state_namespaces
+    }
+
     /// Every `[[loop_probe]]` name (or pattern), with the class it raises.
     pub fn loop_probes(&self) -> &[(String, String)] {
         &self.loop_probes
@@ -661,6 +707,11 @@ impl Catalog {
             .chain(self.operations.iter().map(|(f, _)| f.clone()))
             .chain(self.entries.all())
             .chain(self.entry_groups.iter().flat_map(|e| e.passthrough.iter().cloned()))
+            .chain(self.state_namespaces.iter().flat_map(|n| {
+                let app = n.app.iter().flat_map(|a| a.owners.iter());
+                let lifespan = n.lifespan.iter().flat_map(|l| l.owners.iter());
+                n.owners.iter().chain(app).chain(lifespan).cloned()
+            }))
             .chain(self.blocks_in.iter().flatten().cloned())
             .collect();
         names.sort();

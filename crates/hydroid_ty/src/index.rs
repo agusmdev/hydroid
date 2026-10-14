@@ -1,6 +1,7 @@
 //! Per-file index of function and class definitions: qualified names, parameters, nesting.
 //! Built for project files and for every file a call resolves into.
 
+use hydroid_core::catalog::StateNamespace;
 use hydroid_core::facts::{Accessor, FunctionKind, Location, Origin};
 use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::parsed_module;
@@ -10,8 +11,10 @@ use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_source_file::LineIndex;
 use ruff_text_size::{Ranged, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
+use ty_python_core::definition::DefinitionKind;
+use ty_python_semantic::types::ide_support::ResolvedDefinition;
 use ty_python_semantic::types::{Type, TypeDefinition};
-use ty_python_semantic::{HasType, SemanticModel, TypeQualifiers};
+use ty_python_semantic::{HasType, ImportAliasResolution, SemanticModel, TypeQualifiers, definitions_for_name};
 
 use crate::db::HydroidDb;
 
@@ -64,19 +67,11 @@ pub struct ClassEntry {
     pub registered: bool,
 }
 
-/// Whose `state` an attribute is stored on: the application's (`app.state.x`), or the one
-/// Starlette copies into every connection's scope (`yield {"x": ...}` in a lifespan, or
-/// `request.state.x`).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum StateOwner {
-    App,
-    Connection,
-}
-
-/// `app.state.name = value`, `request.state.name = value`, or `"name": value` in a dict a
-/// lifespan yields. `class` is the class of the value (`None`: unknown).
+/// `<namespace>.name = value` (`app.state.name = value`), or `"name": value` in a dict a
+/// lifespan yields, for the catalog `[[state_namespace]]` at index `namespace`. `class` is the
+/// class of the value (`None`: unknown).
 pub struct StateStore {
-    pub owner: StateOwner,
+    pub namespace: usize,
     pub name: String,
     pub class: Option<Key>,
 }
@@ -113,7 +108,7 @@ pub struct FileIndex {
 }
 
 impl FileIndex {
-    pub fn build(db: &HydroidDb, file: File) -> Self {
+    pub fn build(db: &HydroidDb, file: File, namespaces: &[StateNamespace]) -> Self {
         let (module, origin, display_path) = describe(db, file);
         let program_file = ty_python_semantic::Db::program_file(db, file);
         let model = SemanticModel::new(db, program_file);
@@ -166,7 +161,7 @@ impl FileIndex {
             called_attributes: Vec::new(),
         };
         index.functions.insert(MODULE_KEY, module_entry);
-        let mut builder = Builder { db, index: &mut index, model: &model, scopes: Vec::new(), module };
+        let mut builder = Builder { db, index: &mut index, model: &model, namespaces, scopes: Vec::new(), module };
         builder.visit_body(&parsed.syntax().body);
         index
     }
@@ -227,6 +222,7 @@ struct Builder<'a, 'db> {
     db: &'a HydroidDb,
     index: &'a mut FileIndex,
     model: &'a SemanticModel<'db>,
+    namespaces: &'a [StateNamespace],
     scopes: Vec<(Scope, String)>,
     module: String,
 }
@@ -254,31 +250,48 @@ impl Builder<'_, '_> {
         }
     }
 
-    /// `<owner>.state.<name> = value`: see [`StateStore`].
+    /// `<namespace>.<name> = value`: see [`StateStore`].
     fn state_store(&mut self, target: &Expr, value: &Expr) {
         let Expr::Attribute(attr) = target else { return };
-        let Expr::Attribute(state) = &*attr.value else { return };
-        if state.attr.as_str() != "state" || value.is_none_literal_expr() {
+        if value.is_none_literal_expr() {
             return;
         }
-        let Some(owner) = state_owner(self.db, self.model, &state.value) else { return };
+        let Some(namespace) = namespace_of(self.db, self.model, self.namespaces, &attr.value) else { return };
         let class = instance_class(self.model, value);
-        self.index.state_stores.push(StateStore { owner, name: attr.attr.to_string(), class });
+        self.index.state_stores.push(StateStore { namespace, name: attr.attr.to_string(), class });
     }
 
-    /// `yield {"name": value}` in an `@asynccontextmanager` lifespan: Starlette copies the
-    /// dict into every connection's state.
-    fn lifespan_state(&mut self, def: &ast::StmtFunctionDef) {
-        if !def.is_async || !def.decorator_list.iter().any(|d| decorator_name(d) == Some("asynccontextmanager")) {
-            return;
-        }
-        for value in yield_values(&def.body) {
-            let Expr::Dict(dict) = value else { continue };
-            for item in &dict.items {
-                let Some(Expr::StringLiteral(key)) = &item.key else { continue };
-                let class = instance_class(self.model, &item.value);
-                let name = key.value.to_str().to_string();
-                self.index.state_stores.push(StateStore { owner: StateOwner::Connection, name, class });
+    /// `yield {"name": value}` in the lifespan given to an application's constructor (catalog
+    /// `[[state_namespace]]` `lifespan`): the framework copies the dict into the namespace.
+    fn lifespan_state(&mut self, call: &ast::ExprCall) {
+        for (namespace, group) in self.namespaces.iter().enumerate() {
+            let Some(lifespan) = &group.lifespan else { continue };
+            let Some(keyword) = call.arguments.find_keyword(&lifespan.keyword) else { continue };
+            let Expr::Name(name) = &keyword.value else { continue };
+            let constructs = match call.func.inferred_type(self.model) {
+                Some(ty @ Type::ClassLiteral(_)) => class_of(self.model, ty),
+                _ => None,
+            };
+            if !constructs.is_some_and(|class| inherits_any(self.db, class, &lifespan.owners)) {
+                continue;
+            }
+            let db = self.model.db();
+            let definitions =
+                definitions_for_name(self.model, &name.id, (&keyword.value).into(), ImportAliasResolution::ResolveAliases);
+            for definition in definitions {
+                let ResolvedDefinition::Definition(def) = definition else { continue };
+                let DefinitionKind::Function(function) = def.kind(db) else { continue };
+                let module = parsed_module(db, def.python_file(db)).load(db);
+                let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, def.file(db)));
+                for value in yield_values(&function.node(&module).body) {
+                    let Expr::Dict(dict) = value else { continue };
+                    for item in &dict.items {
+                        let Some(Expr::StringLiteral(key)) = &item.key else { continue };
+                        let class = instance_class(&model, &item.value);
+                        let name = key.value.to_str().to_string();
+                        self.index.state_stores.push(StateStore { namespace, name, class });
+                    }
+                }
             }
         }
     }
@@ -484,43 +497,46 @@ pub fn class_qualname(db: &HydroidDb, class: Key) -> Option<String> {
     Some(format!("{module}.{name}"))
 }
 
-/// Whose state `<owner>.state` is: the application's when `owner` is an application (a
-/// `Starlette` instance, or `request.app`), a connection's when it is a request or websocket.
-/// Untyped owners are told apart by name (`app`, `request`, `websocket`).
-pub fn state_owner(db: &HydroidDb, model: &SemanticModel<'_>, owner: &Expr) -> Option<StateOwner> {
-    if let Expr::Attribute(attr) = owner
-        && attr.attr.as_str() == "app"
-    {
-        return Some(StateOwner::App);
-    }
-    if let Some(class) = instance_class(model, owner) {
-        let (mut queue, mut seen) = (vec![class], rustc_hash::FxHashSet::default());
-        while let Some(class) = queue.pop() {
-            if !seen.insert(class) || seen.len() > 32 {
-                continue;
-            }
-            let Some((qualname, bases)) = qualname_and_bases(db, class) else { continue };
-            match qualname.as_str() {
-                "starlette.applications.Starlette" => return Some(StateOwner::App),
-                "starlette.requests.HTTPConnection" => return Some(StateOwner::Connection),
-                _ => queue.extend(bases),
-            }
+/// Whether `class` is one of the top-level classes `qualnames` or inherits from one.
+pub fn inherits_any(db: &HydroidDb, class: Key, qualnames: &[String]) -> bool {
+    let (mut queue, mut seen) = (vec![class], rustc_hash::FxHashSet::default());
+    while let Some(class) = queue.pop() {
+        if !seen.insert(class) || seen.len() > 32 {
+            continue;
         }
-        return None;
+        let Some((name, bases)) = qualname_and_bases(db, class) else { continue };
+        if qualnames.contains(&name) {
+            return true;
+        }
+        queue.extend(bases);
     }
-    if !matches!(owner.inferred_type(model), Some(Type::Dynamic(_))) {
-        return None;
+    false
+}
+
+/// Whether `expr` is an instance of `owners` (or of a subclass): by its type, or as what the
+/// `app` attribute of another namespace's owner gives (`request.app`).
+pub fn is_owner(db: &HydroidDb, model: &SemanticModel<'_>, namespaces: &[StateNamespace], expr: &Expr, owners: &[String]) -> bool {
+    if let Expr::Attribute(attr) = expr {
+        let gives = |n: &StateNamespace| {
+            n.app.as_ref().is_some_and(|a| a.attribute == attr.attr.as_str() && a.owners.iter().any(|o| owners.contains(o)))
+        };
+        if namespaces.iter().any(|n| gives(n) && is_owner(db, model, namespaces, &attr.value, &n.owners)) {
+            return true;
+        }
     }
-    let name = match owner {
-        Expr::Name(name) => name.id.as_str(),
-        Expr::Attribute(attr) => attr.attr.as_str(),
-        _ => return None,
-    };
-    match name {
-        "app" | "application" => Some(StateOwner::App),
-        "request" | "req" | "websocket" | "ws" | "conn" | "connection" => Some(StateOwner::Connection),
-        _ => None,
-    }
+    instance_class(model, expr).is_some_and(|class| inherits_any(db, class, owners))
+}
+
+/// The catalog `[[state_namespace]]` (by index) `expr` is: `<owner>.<attribute>`, or an owner
+/// itself for a namespace without `attribute`. Untyped owners have none.
+pub fn namespace_of(db: &HydroidDb, model: &SemanticModel<'_>, namespaces: &[StateNamespace], expr: &Expr) -> Option<usize> {
+    namespaces.iter().position(|n| match (&n.attribute, expr) {
+        (Some(attribute), Expr::Attribute(attr)) => {
+            attr.attr.as_str() == attribute && is_owner(db, model, namespaces, &attr.value, &n.owners)
+        }
+        (Some(_), _) => false,
+        (None, _) => is_owner(db, model, namespaces, expr, &n.owners),
+    })
 }
 
 /// The last name of a decorator: `property`, `setter` (`@x.setter`), `field_validator` (`@field_validator("x")`).
@@ -968,7 +984,6 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                 Stmt::AnnAssign(ast::StmtAnnAssign { target, value: Some(value), .. }) => {
                     self.state_store(target, value);
                 }
-                Stmt::FunctionDef(def) => self.lifespan_state(def),
                 _ => {}
             }
         }
@@ -1101,6 +1116,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
             && self.index.origin == Origin::Project
         {
             self.eager_load(call);
+            self.lifespan_state(call);
         }
         if let Expr::Lambda(lambda) = expr {
             let key = lambda.start().to_u32();
