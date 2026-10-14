@@ -2055,21 +2055,53 @@ impl<'a, 'db> Extractor<'a, 'db> {
     }
 
     /// A level: a name in `[[observer]]` `level_names` (a string, or an attribute of a module:
-    /// `logging.ERROR`), a number, or a name ty knows the literal value of.
+    /// `logging.ERROR`), a number, or a name (or attribute) bound to one (see
+    /// [`Extractor::defined_level`]).
     fn level_value(&self, expr: &Expr) -> Option<u32> {
         let named = |name: &str| self.keys.level_names.get(name).copied();
         match expr {
             Expr::StringLiteral(s) => named(s.value.to_str()),
-            Expr::NumberLiteral(n) => n.value.as_int().and_then(|i| i.as_u16()).map(u32::from),
             Expr::Attribute(attr) if matches!(attr.value.inferred_type(self.model), Some(Type::ModuleLiteral(_))) => {
-                named(attr.attr.as_str())
+                named(attr.attr.as_str()).or_else(|| self.defined_level(self.model, expr, 0))
             }
-            _ => {
-                let ty = expr.inferred_type(self.model)?;
-                let shown = ty.display(self.model.db(), &self.model.program_environment()).to_string();
-                shown.strip_prefix("Literal[")?.strip_suffix(']')?.parse().ok()
-            }
+            _ => self.defined_level(self.model, expr, 0),
         }
+    }
+
+    /// The number a level expression (in the file of `model`) is: a number literal, or a name
+    /// (or attribute) whose every definition ty finds assigns one, directly or through other
+    /// names (`from logging import ERROR`: `ERROR: Final = 40` in typeshed; `LEVEL =
+    /// logging.WARNING` in the project).
+    fn defined_level(&self, model: &SemanticModel<'db>, expr: &Expr, depth: u8) -> Option<u32> {
+        let definitions = match expr {
+            Expr::NumberLiteral(n) => return n.value.as_int().and_then(|i| i.as_u16()).map(u32::from),
+            Expr::Name(_) | Expr::Attribute(_) if depth > 3 => return None,
+            Expr::Name(name) => definitions_for_name(model, &name.id, expr.into(), ImportAliasResolution::ResolveAliases),
+            Expr::Attribute(attr) => definitions_for_attribute(model, attr),
+            _ => return None,
+        };
+        let db = model.db();
+        let mut found = None;
+        for definition in definitions {
+            let ResolvedDefinition::Definition(def) = definition else { return None };
+            let module = parsed_module(db, def.python_file(db)).load(db);
+            let value = match def.kind(db) {
+                DefinitionKind::Assignment(a) if a.unpack().is_none() => a.value(&module),
+                DefinitionKind::AnnotatedAssignment(a) => a.value(&module)?,
+                _ => return None,
+            };
+            let level = if def.file(db) == model.file() {
+                self.defined_level(model, value, depth + 1)?
+            } else {
+                let other = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, def.file(db)));
+                self.defined_level(&other, value, depth + 1)?
+            };
+            if found.is_some_and(|f| f != level) {
+                return None;
+            }
+            found = Some(level);
+        }
+        found
     }
 
     fn handle_decorators(&mut self, def: &ast::StmtFunctionDef) {
