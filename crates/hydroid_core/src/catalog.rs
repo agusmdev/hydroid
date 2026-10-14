@@ -47,6 +47,58 @@ struct CatalogFile {
     /// Objects whose attributes hold what project code stores on them.
     #[serde(default)]
     state_namespace: Vec<StateNamespace>,
+    /// Class attributes whose first read loads them (I/O).
+    #[serde(default)]
+    lazy_attribute: Vec<LazyAttribute>,
+}
+
+/// `name = factory(...)` in a class body makes reading `instance.name` load it, running `loads`
+/// (SQLAlchemy's `relationship()`), unless it is already loaded.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LazyAttribute {
+    pub factories: Vec<String>,
+    /// The factory's keyword choosing how the attribute loads.
+    #[serde(default)]
+    pub keyword: Option<String>,
+    /// The literal values of `keyword` that load on read; without the keyword, it does.
+    #[serde(default)]
+    pub lazy: Vec<LiteralValue>,
+    /// What a load runs.
+    pub loads: String,
+    /// Options loading the attributes they name up front (`selectinload(Author.books)`).
+    #[serde(default)]
+    pub eager: Vec<String>,
+    /// Calls expiring every loaded attribute (`commit()`).
+    #[serde(default)]
+    pub expires_all: Vec<String>,
+    /// Calls expiring the loaded attributes of the instance they are given first.
+    #[serde(default)]
+    pub expires: Vec<String>,
+    /// Calls loading, on the instance given first, the attributes named (in a literal list,
+    /// tuple or set) at `names`; given no names, they expire it.
+    #[serde(default)]
+    pub reload: Option<Reload>,
+    /// Classes under which a load raises instead of blocking (async sessions): a function
+    /// naming one (in an annotation, or a value of one) loads nothing.
+    #[serde(default)]
+    pub raises_under: Vec<String>,
+}
+
+/// A literal argument value.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum LiteralValue {
+    Bool(bool),
+    Str(String),
+}
+
+/// See [`LazyAttribute::reload`].
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reload {
+    pub functions: Vec<String>,
+    pub names: Vec<ArgumentSlot>,
 }
 
 #[derive(Deserialize)]
@@ -493,6 +545,7 @@ pub struct Catalog {
     entry_groups: Vec<Entry>,
     builds_on_loop: Patterns<usize>,
     builders: Vec<BuildsOnLoop>,
+    lazy_attributes: Vec<LazyAttribute>,
     state_namespaces: Vec<StateNamespace>,
 }
 
@@ -555,6 +608,7 @@ impl Catalog {
             self.loop_probes.extend(group.functions.into_iter().map(|f| (f, group.raises.clone())));
         }
         self.state_namespaces.extend(file.state_namespace);
+        self.lazy_attributes.extend(file.lazy_attribute);
         for BuildsOnLoopGroup { kind, slot, label, unless_passthrough, functions } in file.builds_on_loop {
             let index = self.builders.len();
             self.builders.push(BuildsOnLoop { kind, slot, label, unless_passthrough });
@@ -732,6 +786,11 @@ impl Catalog {
         &self.operations
     }
 
+    /// The `[[lazy_attribute]]` groups.
+    pub fn lazy_attributes(&self) -> &[LazyAttribute] {
+        &self.lazy_attributes
+    }
+
     /// The `[[state_namespace]]` groups, in order (their index identifies them).
     pub fn state_namespaces(&self) -> &[StateNamespace] {
         &self.state_namespaces
@@ -764,6 +823,11 @@ impl Catalog {
             .chain(self.entries.all())
             .chain(self.builds_on_loop.all())
             .chain(self.entry_groups.iter().flat_map(|e| e.passthrough.iter().cloned()))
+            .chain(self.lazy_attributes.iter().flat_map(|l| {
+                let reload = l.reload.iter().flat_map(|r| r.functions.iter());
+                let lists = [&l.factories, &l.eager, &l.expires_all, &l.expires, &l.raises_under];
+                lists.into_iter().flatten().chain(reload).chain(std::iter::once(&l.loads)).cloned()
+            }))
             .chain(self.state_namespaces.iter().flat_map(|n| {
                 let app = n.app.iter().flat_map(|a| a.owners.iter());
                 let lifespan = n.lifespan.iter().flat_map(|l| l.owners.iter());

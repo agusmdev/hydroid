@@ -1,7 +1,7 @@
 //! Per-file index of function and class definitions: qualified names, parameters, nesting.
 //! Built for project files and for every file a call resolves into.
 
-use hydroid_core::catalog::StateNamespace;
+use hydroid_core::catalog::{LiteralValue, StateNamespace};
 use hydroid_core::facts::{Accessor, FunctionKind, Location, Origin};
 use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::parsed_module;
@@ -62,10 +62,31 @@ pub struct ClassEntry {
     pub fields: Vec<Key>,
     /// SQLAlchemy relationships loaded lazily on first access (`relationship(...)` with the
     /// default `lazy="select"`), project classes only.
-    pub lazy_relationships: Vec<String>,
+    pub attribute_factories: Vec<AttributeFactory>,
     /// Decorated, or given keywords (`metaclass=...`): something may register (and instantiate)
     /// it without naming it.
     pub registered: bool,
+}
+
+/// `name = factory(..., keyword=value)` in the body of a project class whose factory may build a
+/// lazily loaded attribute (its name is a `[[lazy_attribute]]` factory's): see
+/// [`crate::extract::Orm::lazy`].
+pub struct AttributeFactory {
+    pub name: String,
+    /// The function (or class) called.
+    pub factory: Key,
+    /// The keyword arguments, with their literal value (`None`: not a literal).
+    pub keywords: Vec<(String, Option<LiteralValue>)>,
+}
+
+/// What the index of a project file needs from the catalog: the `[[state_namespace]]` groups,
+/// and the last names of `[[lazy_attribute]]` factories and eager options (calls named
+/// otherwise are not resolved).
+#[derive(Default)]
+pub struct IndexCatalog {
+    pub namespaces: Vec<StateNamespace>,
+    pub factories: FxHashSet<String>,
+    pub eager: FxHashSet<String>,
 }
 
 /// `<namespace>.name = value` (`app.state.name = value`), or `"name": value` in a dict a
@@ -89,10 +110,10 @@ pub struct FileIndex {
     pub class_attributes: Vec<String>,
     /// Objects stored on application or connection state (project files only).
     pub state_stores: Vec<StateStore>,
-    /// Relationship names each function names in an eager loader option
-    /// (`selectinload(Author.books)`, `joinedload("books")`; `*` for wildcards), project files
-    /// only: what it loads is not loaded lazily later.
-    pub eager_loads: FxHashMap<u32, Vec<String>>,
+    /// The attribute names each function names in a call that may be an eager option (named
+    /// like a `[[lazy_attribute]]` `eager` one: `selectinload(Author.books)`,
+    /// `joinedload("books")`; `*` for wildcards), with the function called, project files only.
+    pub eager_loads: FxHashMap<u32, Vec<(Key, Vec<String>)>>,
     /// Attributes whose methods the methods of a generic class call (`self.repo.list_ids()` in
     /// `class Service(Generic[RepoT])`), project files only: an instance's type may specialize
     /// them (see [`hydroid_core::facts::Instance::binds`]).
@@ -109,7 +130,7 @@ pub struct FileIndex {
 }
 
 impl FileIndex {
-    pub fn build(db: &HydroidDb, file: File, namespaces: &[StateNamespace]) -> Self {
+    pub fn build(db: &HydroidDb, file: File, catalog: &IndexCatalog) -> Self {
         let (module, origin, display_path) = describe(db, file);
         let program_file = ty_python_semantic::Db::program_file(db, file);
         let model = SemanticModel::new(db, program_file);
@@ -162,7 +183,8 @@ impl FileIndex {
             called_attributes: Vec::new(),
         };
         index.functions.insert(MODULE_KEY, module_entry);
-        let mut builder = Builder { db, index: &mut index, model: &model, namespaces, scopes: Vec::new(), module };
+        let namespaces = &catalog.namespaces[..];
+        let mut builder = Builder { db, index: &mut index, model: &model, namespaces, catalog, scopes: Vec::new(), module };
         builder.visit_body(&parsed.syntax().body);
         index
     }
@@ -224,6 +246,7 @@ struct Builder<'a, 'db> {
     index: &'a mut FileIndex,
     model: &'a SemanticModel<'db>,
     namespaces: &'a [StateNamespace],
+    catalog: &'a IndexCatalog,
     scopes: Vec<(Scope, String)>,
     module: String,
 }
@@ -297,36 +320,40 @@ impl Builder<'_, '_> {
         }
     }
 
-    /// `name = relationship(...)` (or `name: Mapped[...] = relationship(...)`) in the body of a
-    /// project class, loaded lazily: see [`ClassEntry::lazy_relationships`].
-    fn relationship(&mut self, name: &ast::ExprName, value: &Expr) {
+    /// `name = factory(...)` (or `name: Mapped[...] = factory(...)`) in the body of a project
+    /// class: see [`AttributeFactory`].
+    fn attribute_factory(&mut self, name: &ast::ExprName, value: &Expr) {
         let Some(class) = self.direct_class() else { return };
         let Expr::Call(call) = value else { return };
-        if self.index.origin != Origin::Project
-            || !matches!(callee_name(&call.func), Some("relationship"))
-            || !defined_in_sqlalchemy(self.model, &call.func)
-        {
+        if self.index.origin != Origin::Project || !callee_name(&call.func).is_some_and(|n| self.catalog.factories.contains(n)) {
             return;
         }
-        // `lazy="selectin"`, `"joined"`, `"raise"`, `"noload"`, `"dynamic"`, `"write_only"`, ...:
-        // reading the attribute emits no query (or not by itself).
-        let lazy = match call.arguments.find_keyword("lazy").map(|k| &k.value) {
-            None => true,
-            Some(Expr::StringLiteral(s)) => s.value.to_str() == "select",
-            Some(Expr::BooleanLiteral(b)) => b.value,
-            Some(_) => false,
-        };
-        if lazy && let Some(entry) = self.index.classes.get_mut(&class) {
-            entry.lazy_relationships.push(name.id.to_string());
+        let Some(factory) = callee_key(self.model, &call.func) else { return };
+        let keywords = call
+            .arguments
+            .keywords
+            .iter()
+            .filter_map(|k| {
+                let value = match &k.value {
+                    Expr::StringLiteral(s) => Some(LiteralValue::Str(s.value.to_str().to_string())),
+                    Expr::BooleanLiteral(b) => Some(LiteralValue::Bool(b.value)),
+                    _ => None,
+                };
+                Some((k.arg.as_ref()?.to_string(), value))
+            })
+            .collect();
+        if let Some(entry) = self.index.classes.get_mut(&class) {
+            entry.attribute_factories.push(AttributeFactory { name: name.id.to_string(), factory, keywords });
         }
     }
 
     /// `selectinload(Author.books)`, `joinedload("books")`, `Load(Author).selectinload(...)`:
     /// see [`FileIndex::eager_loads`].
     fn eager_load(&mut self, call: &ast::ExprCall) {
-        if !callee_name(&call.func).is_some_and(|n| EAGER_LOADERS.contains(&n)) {
+        if !callee_name(&call.func).is_some_and(|n| self.catalog.eager.contains(n)) {
             return;
         }
+        let Some(option) = callee_key(self.model, &call.func) else { return };
         // Module-level options (`AUTHOR_OPTIONS = [selectinload(...)]`) may be used anywhere in
         // the file.
         let function = self.enclosing_function().unwrap_or(MODULE_KEY);
@@ -347,7 +374,7 @@ impl Builder<'_, '_> {
             }
         }
         if !names.is_empty() {
-            self.index.eager_loads.entry(function).or_default().extend(names);
+            self.index.eager_loads.entry(function).or_default().push((option, names));
         }
     }
 
@@ -553,10 +580,6 @@ fn decorator_name(decorator: &ast::Decorator) -> Option<&str> {
     }
 }
 
-/// SQLAlchemy loader options that load a relationship up front (or keep it from loading).
-const EAGER_LOADERS: &[&str] =
-    &["selectinload", "joinedload", "subqueryload", "immediateload", "contains_eager", "raiseload", "noload"];
-
 /// `relationship` in `relationship(...)` and `orm.relationship(...)`.
 fn callee_name(func: &Expr) -> Option<&str> {
     match func {
@@ -566,18 +589,24 @@ fn callee_name(func: &Expr) -> Option<&str> {
     }
 }
 
-/// Whether a callee is a function defined in the `sqlalchemy` package.
-fn defined_in_sqlalchemy(model: &SemanticModel<'_>, func: &Expr) -> bool {
+/// The function (or bound method, or class constructed) a callee is.
+pub fn callee_key(model: &SemanticModel<'_>, func: &Expr) -> Option<Key> {
     let db = model.db();
-    let Some(ty @ Type::FunctionLiteral(_)) = func.inferred_type(model) else { return false };
-    let Some(TypeDefinition::Function(def)) = ty.definition(db, &model.program_environment()) else { return false };
-    let path = def.file(db).path(db).as_str().replace('\\', "/");
-    path.contains("/sqlalchemy/")
+    let ty = func.inferred_type(model)?;
+    match ty {
+        Type::ClassLiteral(_) => class_of(model, ty),
+        Type::FunctionLiteral(_) | Type::BoundMethod(_) => {
+            let Some(TypeDefinition::Function(def)) = ty.definition(db, &model.program_environment()) else { return None };
+            let module = parsed_module(db, def.python_file(db)).load(db);
+            let range = def.focus_range(db, &module);
+            Some((range.file(), range.start().to_u32()))
+        }
+        _ => None,
+    }
 }
 
 /// See [`FnEntry::naming_decorators`].
 fn naming_decorators(model: &SemanticModel<'_>, def: &ast::StmtFunctionDef) -> Vec<(Key, Vec<String>)> {
-    let db = model.db();
     let mut found = Vec::new();
     for decorator in &def.decorator_list {
         let Expr::Call(call) = &decorator.expression else { continue };
@@ -586,11 +615,10 @@ fn naming_decorators(model: &SemanticModel<'_>, def: &ast::StmtFunctionDef) -> V
         if names.is_empty() {
             continue;
         }
-        let Some(ty @ Type::FunctionLiteral(_)) = call.func.inferred_type(model) else { continue };
-        let Some(TypeDefinition::Function(function)) = ty.definition(db, &model.program_environment()) else { continue };
-        let module = parsed_module(db, function.python_file(db)).load(db);
-        let range = function.focus_range(db, &module);
-        found.push(((range.file(), range.start().to_u32()), names));
+        if !matches!(call.func.inferred_type(model), Some(Type::FunctionLiteral(_))) {
+            continue;
+        }
+        found.extend(callee_key(model, &call.func).map(|key| (key, names)));
     }
     found
 }
@@ -1072,7 +1100,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                         is_protocol,
                         methods: Vec::new(),
                         fields: Vec::new(),
-                        lazy_relationships: Vec::new(),
+                        attribute_factories: Vec::new(),
                         registered: !def.decorator_list.is_empty()
                             || def.arguments.as_ref().is_some_and(|a| !a.keywords.is_empty()),
                     },
@@ -1083,7 +1111,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
             }
             Stmt::Assign(ast::StmtAssign { targets, value, .. }) if self.direct_class().is_some() => {
                 if let [Expr::Name(name)] = &targets[..] {
-                    self.relationship(name, value);
+                    self.attribute_factory(name, value);
                 }
                 if value.is_call_expr() {
                     let names = targets.iter().filter_map(|t| t.as_name_expr()).map(|n| n.id.to_string());
@@ -1097,7 +1125,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     && let Some(name) = target.as_name_expr()
                 {
                     self.index.class_attributes.push(name.id.to_string());
-                    self.relationship(name, value.as_deref().expect("a call value"));
+                    self.attribute_factory(name, value.as_deref().expect("a call value"));
                 }
                 // Models neither validate nor dump class variables and private attributes.
                 let is_class_var = is_class_variable(self.model, target);

@@ -996,3 +996,61 @@ lifespan = { owners = ["starlette.applications.Starlette"], keyword = "lifespan"
 # `_AppCtxGlobals`, is its own namespace.
 # [[state_namespace]]
 # owners = ["flask.ctx._AppCtxGlobals"]
+
+# ---------------------------------------------------------------------------------------------
+# Class attributes whose first read loads them (I/O), unless already loaded.
+#   factories     `name = factory(...)` in a class body makes `instance.name` one
+#   keyword       the factory's keyword choosing how it loads; `lazy`: its literal values that
+#                 load on read (without the keyword, it does)
+#   loads         what a load runs
+#   eager         options loading the attributes they name up front
+#   expires_all   calls expiring every loaded attribute
+#   expires       calls expiring the loaded attributes of the instance they are given first
+#   reload        { functions, names }: calls loading, on the instance given first, the
+#                 attributes named (in a literal list, tuple or set) at `names`; given no names,
+#                 they expire it
+#   raises_under  classes under which a load raises instead of blocking: a function naming one
+#                 (in an annotation, or a value of one) loads nothing
+# ---------------------------------------------------------------------------------------------
+# SQLAlchemy relationships: `lazy="select"` (the default) emits a query through the session on
+# first read (`LazyLoader._emit_lazyload`); an `AsyncSession` raises `MissingGreenlet` instead.
+[[lazy_attribute]]
+factories = ["sqlalchemy.orm._orm_constructors.relationship"]
+keyword = "lazy"
+lazy = ["select", true]
+loads = "sqlalchemy.orm.session.Session.execute"
+eager = [
+    "sqlalchemy.orm.strategy_options.selectinload",
+    "sqlalchemy.orm.strategy_options.joinedload",
+    "sqlalchemy.orm.strategy_options.subqueryload",
+    "sqlalchemy.orm.strategy_options.immediateload",
+    "sqlalchemy.orm.strategy_options.contains_eager",
+    "sqlalchemy.orm.strategy_options.raiseload",
+    "sqlalchemy.orm.strategy_options.noload",
+    "sqlalchemy.orm.strategy_options._AbstractLoad.selectinload",
+    "sqlalchemy.orm.strategy_options._AbstractLoad.joinedload",
+    "sqlalchemy.orm.strategy_options._AbstractLoad.subqueryload",
+    "sqlalchemy.orm.strategy_options._AbstractLoad.immediateload",
+    "sqlalchemy.orm.strategy_options._AbstractLoad.contains_eager",
+    "sqlalchemy.orm.strategy_options._AbstractLoad.raiseload",
+    "sqlalchemy.orm.strategy_options._AbstractLoad.noload",
+]
+expires_all = [
+    "sqlalchemy.orm.session.Session.commit",
+    "sqlalchemy.orm.session.Session.rollback",
+    "sqlalchemy.orm.session.Session.expire_all",
+    "sqlalchemy.orm.scoping.scoped_session.commit",
+    "sqlalchemy.orm.scoping.scoped_session.rollback",
+    "sqlalchemy.orm.scoping.scoped_session.expire_all",
+]
+expires = ["sqlalchemy.orm.session.Session.expire", "sqlalchemy.orm.scoping.scoped_session.expire"]
+reload = { functions = ["sqlalchemy.orm.session.Session.refresh", "sqlalchemy.orm.scoping.scoped_session.refresh"], names = [1, "attribute_names"] }
+raises_under = ["sqlalchemy.ext.asyncio.session.AsyncSession", "sqlalchemy.ext.asyncio.session.async_sessionmaker"]
+
+# Peewee (not built in; works through `[tool.hydroid]` as is): a `ForeignKeyField` queries the
+# related row on first read, unless declared with `lazy_load=False` (then it reads the id).
+# [[lazy_attribute]]
+# factories = ["peewee.ForeignKeyField"]
+# keyword = "lazy_load"
+# lazy = [true]
+# loads = "peewee.Database.execute_sql"

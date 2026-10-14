@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use hydroid_core::catalog::{Catalog, HookPhase, StateNamespace, qualname_matches};
+use hydroid_core::catalog::{Catalog, HookPhase, qualname_matches};
 use hydroid_core::facts::{
     Call, Class, ClassId, Facts, FnId, Flow, Function, Instance, Level, LogUse, ModelField, Origin, ResponseOptions, Signature, Slot,
     Store, Value,
@@ -26,9 +26,9 @@ use ty_module_resolver::{ModuleName, resolve_module_confident};
 
 use crate::db::HydroidDb;
 use crate::extract::{
-    AppState, CatalogKeys, FileFacts, Implicit, Instances, Orm, RawInstance, RawSlot, RawValue, Shared, extract_file,
+    AppState, CatalogKeys, Expiry, FileFacts, Implicit, Instances, Orm, RawInstance, RawSlot, RawValue, Shared, extract_file,
 };
-use crate::index::{FileIndex, Key, class_bases};
+use crate::index::{FileIndex, IndexCatalog, Key, class_bases};
 
 pub struct Extraction {
     pub facts: Facts,
@@ -119,6 +119,20 @@ fn catalog_keys<'c>(db: &HydroidDb, indexes: &Indexes, catalog: &'c Catalog) -> 
             }
         }
     }
+    for (group, lazy) in catalog.lazy_attributes().iter().enumerate() {
+        let definitions = |names: &[String]| -> Vec<Key> {
+            names.iter().flat_map(|n| catalog_definitions(db, indexes, n)).collect()
+        };
+        let loads = definitions(std::slice::from_ref(&lazy.loads)).first().copied();
+        keys.lazy_factories.extend(definitions(&lazy.factories).into_iter().map(|k| (k, (group, loads))));
+        keys.eager.extend(definitions(&lazy.eager));
+        keys.expiry.extend(definitions(&lazy.expires_all).into_iter().map(|k| (k, Expiry::All)));
+        keys.expiry.extend(definitions(&lazy.expires).into_iter().map(|k| (k, Expiry::Given)));
+        if let Some(reload) = &lazy.reload {
+            keys.expiry.extend(definitions(&reload.functions).into_iter().map(|k| (k, Expiry::Reload(&reload.names[..]))));
+        }
+        keys.raises_under.extend(definitions(&lazy.raises_under));
+    }
     for (name, entry) in catalog.entry_entries().filter(|(_, e)| e.injects) {
         let Some(slot) = entry.slot.first() else { continue };
         for key in catalog_definitions(db, indexes, &name) {
@@ -140,6 +154,19 @@ fn catalog_keys<'c>(db: &HydroidDb, indexes: &Indexes, catalog: &'c Catalog) -> 
         }
     }
     keys
+}
+
+/// See [`IndexCatalog`].
+fn index_catalog(catalog: &Catalog) -> IndexCatalog {
+    let last = |names: &[String]| -> Vec<String> {
+        names.iter().filter_map(|n| n.rsplit('.').next()).map(str::to_string).collect()
+    };
+    let lazy = catalog.lazy_attributes();
+    IndexCatalog {
+        namespaces: catalog.state_namespaces().to_vec(),
+        factories: lazy.iter().flat_map(|l| last(&l.factories)).collect(),
+        eager: lazy.iter().flat_map(|l| last(&l.eager)).collect(),
+    }
 }
 
 /// Phase timings on stderr when `HYDROID_TIMINGS` is set (for profiling large projects).
@@ -183,7 +210,7 @@ pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
     let files = project_files(&db, &root, options.exclude)?;
     timings.phase("environment and project files");
 
-    let indexes = Indexes(Default::default(), Default::default(), options.catalog.state_namespaces().to_vec());
+    let indexes = Indexes(Default::default(), Default::default(), index_catalog(options.catalog));
     let keys = catalog_keys(&db, &indexes, options.catalog);
     let mut merger = Merger::new(&db, &indexes);
     let units: Vec<(File, Option<FxHashSet<u32>>)> = files.iter().map(|&f| (f, None)).collect();
@@ -261,7 +288,7 @@ fn project_files(db: &HydroidDb, root: &SystemPath, exclude: &[String]) -> anyho
 /// classes that are ancestors of project classes, and the catalog `[[state_namespace]]` groups
 /// (project files record what is stored in them).
 #[derive(Default)]
-struct Indexes(Mutex<FxHashMap<File, Arc<FileIndex>>>, Mutex<FxHashMap<Key, Vec<Key>>>, Vec<StateNamespace>);
+struct Indexes(Mutex<FxHashMap<File, Arc<FileIndex>>>, Mutex<FxHashMap<Key, Vec<Key>>>, IndexCatalog);
 
 impl Indexes {
     fn get(&self, db: &HydroidDb, file: File) -> Arc<FileIndex> {
@@ -373,7 +400,7 @@ impl Indexes {
                 _ => library_bases.get(key).cloned().unwrap_or_default(),
             }
         };
-        for (namespace, group) in self.2.iter().enumerate() {
+        for (namespace, group) in self.2.namespaces.iter().enumerate() {
             let Some(app) = &group.app else { continue };
             let is_app = |key: &Key| {
                 map.get(&key.0).and_then(|i| i.classes.get(&key.1)).is_some_and(|c| app.owners.contains(&c.qualname))
@@ -405,7 +432,7 @@ impl Indexes {
     }
 
     /// What the project's SQLAlchemy models run implicitly: see [`Orm`].
-    fn orm(&self, db: &HydroidDb, keys: &CatalogKeys) -> Orm {
+    fn orm(&self, catalog: &Catalog, keys: &CatalogKeys) -> Orm {
         let mut orm = Orm::default();
         let mut lazy_classes: Vec<Key> = Vec::new();
         {
@@ -416,11 +443,15 @@ impl Indexes {
                 let sets = |(callee, _): &&(Key, Vec<String>)| keys.hooks.get(callee).is_some_and(|h| h.runs == HookPhase::Set);
                 let named = index.functions.values().flat_map(|f| f.naming_decorators.iter().filter(sets));
                 orm.validated.extend(named.flat_map(|(_, names)| names.iter().cloned()));
-                for (&function, names) in &index.eager_loads {
-                    orm.eager.insert((index.file, function), names.clone());
+                for (&function, options) in &index.eager_loads {
+                    let names = options.iter().filter(|(option, _)| keys.eager.contains(option));
+                    let names: Vec<String> = names.flat_map(|(_, names)| names.iter().cloned()).collect();
+                    if !names.is_empty() {
+                        orm.eager.insert((index.file, function), names);
+                    }
                 }
                 for (&offset, class) in &index.classes {
-                    if !class.lazy_relationships.is_empty() {
+                    if !class.attribute_factories.is_empty() {
                         lazy_classes.push((index.file, offset));
                     }
                 }
@@ -437,27 +468,26 @@ impl Indexes {
                             continue;
                         }
                         let Some(class) = map.get(&key.0).and_then(|i| i.classes.get(&key.1)) else { continue };
-                        for name in &class.lazy_relationships {
-                            orm.lazy.insert(((index.file, offset), name.clone()));
-                            orm.lazy_names.insert(name.clone());
+                        for found in &class.attribute_factories {
+                            let Some(&(group, Some(loads))) = keys.lazy_factories.get(&found.factory) else { continue };
+                            let group = &catalog.lazy_attributes()[group];
+                            // A literal value of the keyword choosing the strategy loads lazily
+                            // only if listed; any other value does not.
+                            let keyword = group.keyword.as_ref().and_then(|k| found.keywords.iter().find(|(n, _)| n == k));
+                            let lazy = match keyword {
+                                None => true,
+                                Some((_, Some(value))) => group.lazy.contains(value),
+                                Some((_, None)) => false,
+                            };
+                            if lazy {
+                                orm.lazy.insert(((index.file, offset), found.name.clone()), loads);
+                                orm.lazy_names.insert(found.name.clone());
+                            }
                         }
                         queue.extend(class.bases.iter().copied());
                     }
                 }
             }
-        }
-        // A lazy load runs `Session.execute` (`LazyLoader._emit_lazyload`).
-        let environment = db.program().resolver_environment(db);
-        let session = ModuleName::new("sqlalchemy.orm.session")
-            .and_then(|module| resolve_module_confident(db, environment, &module))
-            .and_then(|module| module.file(db));
-        if let Some(file) = session {
-            let index = self.get(db, file);
-            orm.load = index
-                .functions
-                .iter()
-                .find(|(_, f)| f.qualname == "sqlalchemy.orm.session.Session.execute")
-                .map(|(&offset, _)| (file, offset));
         }
         orm
     }
@@ -583,7 +613,7 @@ fn run(
 ) -> Vec<FileFacts> {
     let implicit = (!all_implicit).then(|| indexes.implicit());
     let state = indexes.app_state();
-    let orm = indexes.orm(db, keys);
+    let orm = indexes.orm(catalog, keys);
     let instances = indexes.instances();
     let shared = Mutex::new(db.clone());
     units

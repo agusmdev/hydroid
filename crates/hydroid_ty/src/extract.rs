@@ -110,19 +110,18 @@ pub struct Instances {
     pub rebound: FxHashSet<String>,
 }
 
-/// What the project's SQLAlchemy models run implicitly on attribute access.
+/// What the project's classes run implicitly on attribute access.
 #[derive(Default)]
 pub struct Orm {
-    /// Attributes some `@validates` validator names.
+    /// Attributes some run-on-set hook names (catalog `[[hook]]`, `runs = "set"`).
     pub validated: FxHashSet<String>,
-    /// `(mapped class, name)`: relationships loaded lazily on first read, inherited ones included.
-    pub lazy: FxHashSet<(Key, String)>,
+    /// `(class, name)`: attributes loaded on first read (catalog `[[lazy_attribute]]`),
+    /// inherited ones included, with what a load runs.
+    pub lazy: FxHashMap<(Key, String), Key>,
     pub lazy_names: FxHashSet<String>,
-    /// Relationships each function names in eager loader options (see
+    /// The attributes each function names in eager options (see
     /// [`crate::index::FileIndex::eager_loads`]).
     pub eager: FxHashMap<Key, Vec<String>>,
-    /// `Session.execute`, which a lazy load runs.
-    pub load: Option<Key>,
 }
 
 pub struct RawStore {
@@ -217,6 +216,18 @@ pub struct RawHook {
     pub json_only: bool,
 }
 
+/// What a call does to the loaded attributes of an instance (catalog `[[lazy_attribute]]`).
+#[derive(Clone, Copy, Debug)]
+pub enum Expiry<'c> {
+    /// Expires every one (`commit()`).
+    All,
+    /// Expires those of the instance it is given first (`expire(obj)`).
+    Given,
+    /// Loads, on the instance given first, the attributes named at these slots; given none,
+    /// expires them (`refresh(obj, attribute_names=[...])`).
+    Reload(&'c [ArgumentSlot]),
+}
+
 /// What every file's extraction reads besides its own index: what the project's indexes say,
 /// and the catalog.
 pub struct Shared<'a> {
@@ -242,6 +253,14 @@ pub struct CatalogKeys<'c> {
     pub entries: FxHashMap<Key, &'c Entry>,
     /// `[offload]` functions.
     pub offloads: FxHashSet<Key>,
+    /// `[[lazy_attribute]]` factories, with their group and what a load runs.
+    pub lazy_factories: FxHashMap<Key, (usize, Option<Key>)>,
+    /// `[[lazy_attribute]]` eager options.
+    pub eager: FxHashSet<Key>,
+    /// `[[lazy_attribute]]` calls expiring (or reloading) loaded attributes.
+    pub expiry: FxHashMap<Key, Expiry<'c>>,
+    /// `[[lazy_attribute]]` `raises_under` classes.
+    pub raises_under: Vec<Key>,
     /// `[[entry]]` `passthrough` classes, with their catalog names.
     pub passthrough: Vec<(Key, &'c str)>,
     /// `[[entry]]` functions with `injects`: where a call to them takes the provider (the
@@ -425,7 +444,7 @@ struct Extractor<'a, 'db> {
     /// Memoized [`Extractor::offloaded_params`].
     offloaded_params: RefCell<FxHashMap<Key, Vec<HandedParam>>>,
     /// Lazy relationship reads recorded: `(function, location, relationship)`.
-    lazy_reads: Vec<(u32, Location, String)>,
+    lazy_reads: Vec<(u32, Location, String, Key)>,
     model: &'a SemanticModel<'db>,
     index: &'a FileIndex,
     wanted: Option<&'a FxHashSet<u32>>,
@@ -2184,7 +2203,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
     fn orm_attribute(&mut self, attr: &ast::ExprAttribute) {
         let name = attr.attr.as_str();
         let validated = attr.ctx == ExprContext::Store && self.orm.validated.contains(name);
-        let lazy = attr.ctx == ExprContext::Load && self.orm.lazy_names.contains(name) && self.orm.load.is_some();
+        let lazy = attr.ctx == ExprContext::Load && self.orm.lazy_names.contains(name);
         if !validated && !lazy {
             return;
         }
@@ -2192,14 +2211,11 @@ impl<'a, 'db> Extractor<'a, 'db> {
         let (targets, sets) = if validated {
             (Vec::new(), Some((class, vec![name.to_string()])))
         } else {
-            if !self.orm.lazy.contains(&(class, name.to_string()))
-                || !self.may_be_persistent(&attr.value)
-                || self.preloaded_off_loop(&attr.value, name, attr.start().to_u32())
-            {
+            let Some(&load) = self.orm.lazy.get(&(class, name.to_string())) else { return };
+            if !self.may_be_persistent(&attr.value) || self.preloaded_off_loop(&attr.value, name, attr.start().to_u32()) {
                 return;
             }
-            let load = self.orm.load.expect("checked above");
-            self.lazy_reads.push((self.current, self.index.location(attr.start()), name.to_string()));
+            self.lazy_reads.push((self.current, self.index.location(attr.start()), name.to_string(), load));
             (vec![(load, true)], None)
         };
         self.out.calls.push(RawCall {
@@ -2267,7 +2283,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
             let Expr::Call(call) = value else { return None };
             let mut mapped = call.arguments.args.iter().filter_map(|argument| {
                 let ty = argument.inferred_type(self.model).filter(is_class_object)?;
-                self.class_key(&ty).filter(|class| self.orm.lazy.iter().any(|(c, _)| c == class))
+                self.class_key(&ty).filter(|class| self.orm.lazy.keys().any(|(c, _)| c == class))
             });
             let class = mapped.next()?;
             if mapped.next().is_some() || found.is_some_and(|c| c != class) {
@@ -2334,9 +2350,24 @@ impl<'a, 'db> Extractor<'a, 'db> {
         call.arguments.args.iter().any(|a| matches!(self.value_of(a), Some(RawValue::Function(_))))
     }
 
-    /// Whether the current function (or one enclosing it) mentions the async ORM:
-    /// `session: AsyncSession`, `async_sessionmaker`.
+    /// Whether the current function (or one enclosing it) names a class under which a load
+    /// raises instead of blocking (catalog `[[lazy_attribute]]` `raises_under`), or a value of
+    /// one: `session: AsyncSession`, `async_sessionmaker(...)`.
     fn uses_async_orm(&self) -> bool {
+        struct Names<'b> {
+            names: Vec<&'b Expr>,
+        }
+        impl<'b> SourceOrderVisitor<'b> for Names<'b> {
+            fn visit_expr(&mut self, expr: &'b Expr) {
+                if matches!(expr, Expr::Name(_)) {
+                    self.names.push(expr);
+                }
+                walk_expr(self, expr);
+            }
+        }
+        if self.keys.raises_under.is_empty() {
+            return false;
+        }
         let db = self.model.db();
         let parsed = parsed_module(db, self.model.python_file()).load(db);
         let mut scope = Some(self.current);
@@ -2344,14 +2375,31 @@ impl<'a, 'db> Extractor<'a, 'db> {
             if key != MODULE_KEY
                 && let Some(def) = find_function(parsed.syntax(), key)
             {
-                let text = self.index.text(def.range());
-                if text.contains("AsyncSession") || text.contains("async_sessionmaker") {
+                let mut finder = Names { names: Vec::new() };
+                finder.visit_parameters(&def.parameters);
+                finder.visit_body(&def.body);
+                let raises = |class: Key| self.keys.raises_under.iter().any(|&base| inherits(self.db, class, base));
+                let named = finder.names.iter().any(|name| match name.inferred_type(self.model) {
+                    Some(ty @ Type::ClassLiteral(_)) => class_of(self.model, ty).is_some_and(raises),
+                    Some(_) => instance_class(self.model, name).is_some_and(raises),
+                    None => false,
+                });
+                if named {
                     return true;
                 }
             }
             scope = self.index.functions.get(&key).and_then(|f| f.parent);
         }
         false
+    }
+
+    /// What `call` (in the file of `model`) does to the loaded attributes of an instance.
+    fn expiry(&self, model: &SemanticModel<'db>, call: &ast::ExprCall) -> Option<Expiry<'a>> {
+        if self.keys.expiry.is_empty() {
+            return None;
+        }
+        let key = crate::index::callee_key(model, &call.func)?;
+        self.keys.expiry.get(&key).copied()
     }
 
     /// Whether relationship `name` of the instance a variable holds was already loaded before
@@ -2378,7 +2426,9 @@ impl<'a, 'db> Extractor<'a, 'db> {
             // The value from where it is set (or passed) until the read stays as it was.
             let since = if *assigned == Some(var) { end } else { start };
             if stores.iter().any(|&at| at > since && at < read)
-                || body.calls.iter().any(|c| c.start().to_u32() > end && c.start().to_u32() < read && expires(c, var))
+                || body.calls.iter().any(|c| {
+                    c.start().to_u32() > end && c.start().to_u32() < read && expires(c, var, self.expiry(self.model, c))
+                })
             {
                 continue;
             }
@@ -2415,7 +2465,9 @@ impl<'a, 'db> Extractor<'a, 'db> {
                 }
             }
             let helper_body = scope_items(&helper_def.body);
-            if names.iter().any(|p| helper_body.preloads(p, name)) {
+            let helper_model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, helper.0));
+            let expiry = |c: &ast::ExprCall| self.expiry(&helper_model, c);
+            if names.iter().any(|p| helper_body.preloads(p, name, &expiry)) {
                 return true;
             }
             if *assigned == Some(var) {
@@ -2424,7 +2476,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
                 if !returned.is_empty()
                     && returned
                         .iter()
-                        .all(|v| matches!(v, Expr::Name(n) if helper_body.preloads(n.id.as_str(), name)))
+                        .all(|v| matches!(v, Expr::Name(n) if helper_body.preloads(n.id.as_str(), name, &expiry)))
                 {
                     return true;
                 }
@@ -2436,10 +2488,9 @@ impl<'a, 'db> Extractor<'a, 'db> {
     /// Drops the lazy relationship reads whose relationship the function (or one it calls or
     /// passes on, or the module) loads eagerly: `db.get(Author, id, options=[selectinload(Author.books)])`.
     fn drop_eager_reads(&mut self) {
-        let Some(load) = self.orm.load else { return };
         let file = self.index.file;
-        let mut dropped: Vec<(u32, Location)> = Vec::new();
-        for (function, location, name) in std::mem::take(&mut self.lazy_reads) {
+        let mut dropped: Vec<(u32, Location, Key)> = Vec::new();
+        for (function, location, name, load) in std::mem::take(&mut self.lazy_reads) {
             let mut sources: Vec<Key> = vec![(file, MODULE_KEY)];
             let mut scope = Some(function);
             while let Some(key) = scope {
@@ -2459,14 +2510,13 @@ impl<'a, 'db> Extractor<'a, 'db> {
                 .flatten()
                 .any(|n| n == &name || n == "*");
             if eager {
-                dropped.push((function, location));
+                dropped.push((function, location, load));
             }
         }
         self.out.calls.retain(|c| {
             !(c.targets.len() == 1
-                && c.targets[0].0 == load
                 && c.implicit
-                && dropped.iter().any(|(f, l)| *f == c.caller && *l == c.location))
+                && dropped.iter().any(|(f, l, load)| *f == c.caller && *l == c.location && c.targets[0].0 == *load))
         });
     }
 
@@ -3288,18 +3338,18 @@ impl ScopeItems<'_> {
     /// Whether relationship `name` of the instance in variable `var` is loaded when the body
     /// ends: read (`len(var.name)`) or refreshed by name (`db.refresh(var, attribute_names=[...])`)
     /// after anything that may expire it and after the variable is last assigned.
-    fn preloads(&self, var: &str, name: &str) -> bool {
+    fn preloads<'c>(&self, var: &str, name: &str, expiry: &dyn Fn(&ast::ExprCall) -> Option<Expiry<'c>>) -> bool {
         let refreshes = self.calls.iter().filter(|c| {
-            let names = c.arguments.find_keyword("attribute_names").map(|k| &k.value).or(c.arguments.args.get(1));
-            let named = match names {
-                Some(Expr::List(ast::ExprList { elts, .. }))
-                | Some(Expr::Tuple(ast::ExprTuple { elts, .. }))
-                | Some(Expr::Set(ast::ExprSet { elts, .. })) => {
+            let Some(Expiry::Reload(slots)) = expiry(c) else { return false };
+            let named = slot_arguments(c, slots, &[]).into_iter().any(|names| match names {
+                Expr::List(ast::ExprList { elts, .. })
+                | Expr::Tuple(ast::ExprTuple { elts, .. })
+                | Expr::Set(ast::ExprSet { elts, .. }) => {
                     elts.iter().any(|e| matches!(e, Expr::StringLiteral(s) if s.value.to_str() == name))
                 }
                 _ => false,
-            };
-            called_name(c) == Some("refresh") && named && first_argument_is(c, var)
+            });
+            named && first_argument_is(c, var)
         });
         let loaded = self
             .reads
@@ -3311,7 +3361,7 @@ impl ScopeItems<'_> {
         let unloaded = self
             .calls
             .iter()
-            .filter(|c| expires(c, var))
+            .filter(|c| expires(c, var, expiry(c)))
             .map(|c| c.start().to_u32())
             .chain(self.stores.iter().filter(|(v, _)| *v == var).map(|(_, at)| *at))
             .max();
@@ -3319,19 +3369,15 @@ impl ScopeItems<'_> {
     }
 }
 
-/// Whether a call may expire the loaded attributes of the instance in variable `var`:
-/// `commit()` (`expire_on_commit`), `rollback()`, `expire_all()`, `expire(var)`, and
-/// `refresh(var)` without `attribute_names` (which leaves lazy relationships unloaded).
-fn expires(call: &ast::ExprCall, var: &str) -> bool {
-    match called_name(call) {
-        Some("commit" | "rollback" | "expire_all") => true,
-        Some("expire") => call.arguments.args.is_empty() || first_argument_is(call, var),
-        Some("refresh") => {
-            first_argument_is(call, var)
-                && call.arguments.args.len() < 2
-                && call.arguments.find_keyword("attribute_names").is_none()
-        }
-        _ => false,
+/// Whether a call (doing `expiry`) may expire the loaded attributes of the instance in variable
+/// `var`: `commit()` (`expire_on_commit`), `expire(var)`, and `refresh(var)` without names
+/// (which leaves lazy relationships unloaded).
+fn expires(call: &ast::ExprCall, var: &str, expiry: Option<Expiry<'_>>) -> bool {
+    match expiry {
+        Some(Expiry::All) => true,
+        Some(Expiry::Given) => call.arguments.args.is_empty() || first_argument_is(call, var),
+        Some(Expiry::Reload(slots)) => first_argument_is(call, var) && slot_arguments(call, slots, &[]).is_empty(),
+        None => false,
     }
 }
 
