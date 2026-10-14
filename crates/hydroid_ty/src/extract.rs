@@ -1,6 +1,6 @@
 //! Walks function bodies and records calls (with their resolved callees) and callable flows.
 
-use hydroid_core::catalog::{ArgumentSlot, Arguments, Catalog, Hook, HookFields, HookPhase, KeywordValues, RunsHooks};
+use hydroid_core::catalog::{ArgumentSlot, Arguments, Catalog, Entry, Hook, HookFields, HookPhase, KeywordValues, RunsHooks};
 use hydroid_core::facts::{Accessor, Dump, Location, LoggerName, Origin};
 use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
@@ -22,7 +22,7 @@ use ty_python_semantic::{
 use crate::db::HydroidDb;
 use crate::index::{
     FileIndex, Key, MODULE_KEY, StateOwner, annotation_classes, class_method, class_of, class_qualname, describe, inherits,
-    inherits_from, instance_class, is_class_object, is_class_variable, state_owner, yield_values, yields,
+    instance_class, is_class_object, is_class_variable, state_owner, yield_values, yields,
 };
 
 pub struct RawCall {
@@ -163,7 +163,7 @@ pub struct RawSignature {
     pub annotation: Vec<Key>,
     pub returned: Vec<Key>,
     pub returns_unknown: bool,
-    pub returns_response: bool,
+    pub always_returns: Vec<String>,
 }
 
 /// See [`hydroid_core::facts::ModelField`].
@@ -237,6 +237,10 @@ pub struct CatalogKeys<'c> {
     pub hooks: FxHashMap<Key, &'c Hook>,
     /// `[[runs_hooks]]`: operations running the hooks of the class they are called on.
     pub operations: FxHashMap<Key, &'c RunsHooks>,
+    /// `[[entry]]` functions taking response options (`response_model`, `response_exclude`).
+    pub entries: FxHashMap<Key, &'c Entry>,
+    /// `[[entry]]` `passthrough` classes, with their catalog names.
+    pub passthrough: Vec<(Key, &'c str)>,
 }
 
 /// Extracts the bodies of `wanted` functions (every function and the module body when `None`).
@@ -1569,8 +1573,8 @@ impl<'a, 'db> Extractor<'a, 'db> {
                 }
                 _ => self.value_of(argument).map(|v| (v, self.called_instance(argument))).into_iter().collect(),
             };
-            // `response_model=list[Item]`: the classes it names.
-            let values = if values.is_empty() && matches!(&slot, RawSlot::Keyword(k) if k == "response_model") {
+            // A response model keyword (`response_model=list[Item]`): the classes it names.
+            let values = if values.is_empty() && matches!(&slot, RawSlot::Keyword(k) if self.response_model_keyword(&resolution) == Some(k)) {
                 let mut classes = Vec::new();
                 annotation_classes(self.model, argument, &mut classes, &mut |_| {});
                 classes.into_iter().map(|c| (RawValue::Class(c), None)).collect()
@@ -1606,6 +1610,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
         let operation = self.operation(&resolution);
         let dump = operation.filter(|o| o.runs == HookPhase::Dump).map(|o| dump(o, call));
         let validates = operation.is_some_and(|o| o.runs == HookPhase::Validation);
+        self.response_options(call, &location, &resolution);
         let unresolved =
             (resolution.targets.is_empty() && param.is_none()).then_some(resolution.reason);
         // The declarative constructor sets each keyword argument on the new instance.
@@ -1635,7 +1640,6 @@ impl<'a, 'db> Extractor<'a, 'db> {
         } else {
             Vec::new()
         };
-        self.response_options(call, &location);
         let level = self.level_argument(call);
         let logging = self.log_use(call, resolution.constructs.is_some());
         self.out.calls.push(RawCall {
@@ -1714,11 +1718,23 @@ impl<'a, 'db> Extractor<'a, 'db> {
         }
     }
 
-    /// `response_model=None` and `response_model_exclude={...}` (see [`excluded_fields`]) given
-    /// to a call.
-    fn response_options(&mut self, call: &ast::ExprCall, location: &Location) {
-        let no_model = call.arguments.find_keyword("response_model").is_some_and(|k| k.value.is_none_literal_expr());
-        let exclude = excluded_fields(call, "response_model_exclude");
+    /// The `[[entry]]` a call registers with, when it takes response options.
+    fn response_entry(&self, resolution: &Resolution) -> Option<&'a Entry> {
+        resolution.targets.iter().find_map(|(key, _)| self.keys.entries.get(key).copied())
+    }
+
+    /// The keyword of the call giving the response model (catalog `[[entry]]` `response_model`).
+    fn response_model_keyword(&self, resolution: &Resolution) -> Option<&'a String> {
+        self.response_entry(resolution)?.response_model.as_ref()
+    }
+
+    /// The response model keyword given `None` and the fields its `response_exclude` keyword
+    /// names (see [`excluded_fields`]), at a call to an `[[entry]]` function.
+    fn response_options(&mut self, call: &ast::ExprCall, location: &Location, resolution: &Resolution) {
+        let Some(entry) = self.response_entry(resolution) else { return };
+        let given = |keyword: &Option<String>| keyword.as_deref().and_then(|k| call.arguments.find_keyword(k));
+        let no_model = given(&entry.response_model).is_some_and(|k| k.value.is_none_literal_expr());
+        let exclude = entry.response_exclude.as_deref().map(|k| excluded_fields(call, k)).unwrap_or_default();
         if no_model || !exclude.is_empty() {
             let (caller, location) = (self.current, location.clone());
             self.out.response_options.push(RawResponseOptions { caller, location, no_model, exclude });
@@ -1976,7 +1992,8 @@ impl<'a, 'db> Extractor<'a, 'db> {
         self.out.decorators.push((key, decorators));
     }
 
-    /// What FastAPI validates and serializes around `def` if it is an endpoint or a dependency.
+    /// What a framework validates and serializes around `def` if it is registered with an
+    /// `[[entry]]` (see [`hydroid_core::facts::Signature`]).
     fn signature(&mut self, def: &ast::StmtFunctionDef) {
         let key = def.name.start().to_u32();
         let parameters = &def.parameters;
@@ -2008,7 +2025,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
             }
         }
         let (mut annotation, mut returned, mut returns_unknown) = (Vec::new(), Vec::new(), false);
-        let mut returns_response = false;
+        let mut always_returns = Vec::new();
         if !yields(&def.body) {
             if let Some(returns) = def.returns.as_deref() {
                 annotation_classes(self.model, returns, &mut annotation, &mut |_| {});
@@ -2021,10 +2038,10 @@ impl<'a, 'db> Extractor<'a, 'db> {
                 Some(ty) => matches!(ty, Type::Dynamic(_)),
                 None => true,
             });
-            returns_response = self.returns_response(&def.body);
+            always_returns = self.always_returns(&def.body);
         }
-        if !params.is_empty() || !annotation.is_empty() || !returned.is_empty() || returns_unknown || returns_response {
-            let signature = RawSignature { function: key, params, annotation, returned, returns_unknown, returns_response };
+        if !params.is_empty() || !annotation.is_empty() || !returned.is_empty() || returns_unknown || !always_returns.is_empty() {
+            let signature = RawSignature { function: key, params, annotation, returned, returns_unknown, always_returns };
             self.out.signatures.push(signature);
         }
     }
@@ -2038,24 +2055,32 @@ impl<'a, 'db> Extractor<'a, 'db> {
             .is_some_and(|name| name == "starlette.responses.StreamingResponse")
     }
 
-    /// Whether a function body always returns a Starlette `Response` (every `return` gives an
-    /// instance of one, and the body cannot end without returning).
-    fn returns_response(&self, body: &[Stmt]) -> bool {
+    /// The `[[entry]]` `passthrough` classes a function body always returns instances of (every
+    /// `return` gives one, and the body cannot end without returning).
+    fn always_returns(&self, body: &[Stmt]) -> Vec<String> {
+        if self.keys.passthrough.is_empty() {
+            return Vec::new();
+        }
         let db = self.model.db();
         let values = return_values(body);
-        !values.is_empty()
-            && ends_in_return(body)
-            && values.iter().all(|value| {
-                let types = match value.inferred_type(self.model) {
-                    Some(Type::Union(union)) => union.elements(db).to_vec(),
-                    Some(ty) => vec![ty],
-                    None => return false,
-                };
-                types.iter().all(|ty| {
-                    matches!(ty, Type::NominalInstance(_))
-                        && self.class_key(ty).is_some_and(|c| inherits_from(self.db, c, "starlette.responses.Response"))
-                })
-            })
+        if values.is_empty() || !ends_in_return(body) {
+            return Vec::new();
+        }
+        let mut classes = Vec::new();
+        for value in &values {
+            let types = match value.inferred_type(self.model) {
+                Some(Type::Union(union)) => union.elements(db).to_vec(),
+                Some(ty) => vec![ty],
+                None => return Vec::new(),
+            };
+            for ty in &types {
+                let class = matches!(ty, Type::NominalInstance(_)).then(|| self.class_key(ty)).flatten();
+                let Some(class) = class else { return Vec::new() };
+                classes.push(class);
+            }
+        }
+        let returned = |&&(base, _): &&(Key, &str)| classes.iter().all(|&c| inherits(self.db, c, base));
+        self.keys.passthrough.iter().filter(returned).map(|&(_, name)| name.to_string()).collect()
     }
 
     /// Implicit SQLAlchemy work on an attribute of a mapped instance: `obj.email = ...` runs the

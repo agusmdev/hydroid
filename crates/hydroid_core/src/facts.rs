@@ -150,9 +150,8 @@ pub struct ModelField {
     pub json_serializers: Vec<FnId>,
 }
 
-/// What FastAPI validates and serializes around a function when it is an endpoint or a
-/// dependency (see `fastapi.dependencies.utils.solve_dependencies` and
-/// `fastapi.routing.serialize_response`).
+/// What a framework validates and serializes around a function registered with an `[[entry]]`
+/// (catalog `validates_params`, `serializes_return`, `validates_return`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Signature {
     pub function: FnId,
@@ -167,19 +166,21 @@ pub struct Signature {
     pub returned: Vec<ClassId>,
     /// Some value it returns has a type ty does not know (it may be a model instance).
     pub returns_unknown: bool,
-    /// Every value it returns is a Starlette `Response`, which FastAPI sends as is (no response
-    /// validation, serialization or `response_class`).
-    pub returns_response: bool,
+    /// The catalog `[[entry]]` `passthrough` classes every value it returns is an instance of
+    /// (frameworks send these as they are).
+    pub always_returns: Vec<String>,
 }
 
-/// Response options of a route registration (`@app.get(..., response_model=None)`) at a call.
+/// Response options given to an `[[entry]]` function at a call (its `response_model` keyword
+/// given `None`, its `response_exclude` keyword).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResponseOptions {
     pub caller: FnId,
     pub location: Location,
-    /// `response_model=None`: no response model, not even the return annotation.
+    /// The response model keyword given `None`: no response model, not even the return
+    /// annotation.
     pub no_model: bool,
-    /// `response_model_exclude={"a", "b"}`: the top-level fields left out of the response.
+    /// The top-level fields left out of the response (`{"a", "b"}` at the exclude keyword).
     pub exclude: Vec<String>,
 }
 

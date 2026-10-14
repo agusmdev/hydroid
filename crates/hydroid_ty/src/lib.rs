@@ -109,6 +109,16 @@ fn catalog_keys<'c>(db: &HydroidDb, indexes: &Indexes, catalog: &'c Catalog) -> 
             keys.operations.insert(key, operation);
         }
     }
+    for (name, entry) in catalog.entry_entries() {
+        if entry.response_model.is_some() || entry.response_exclude.is_some() {
+            for key in catalog_definitions(db, indexes, &name) {
+                keys.entries.insert(key, entry);
+            }
+        }
+    }
+    for name in catalog.passthrough() {
+        keys.passthrough.extend(catalog_definitions(db, indexes, name).into_iter().map(|key| (key, name)));
+    }
     for (name, raises) in catalog.loop_probes() {
         let raised = catalog_definitions(db, indexes, raises);
         for key in catalog_definitions(db, indexes, name) {
@@ -776,8 +786,8 @@ impl<'a> Merger<'a> {
             let params = raw.params.into_iter().filter_map(|v| self.value(file, v)).collect();
             let annotation = raw.annotation.into_iter().filter_map(|k| self.class_id(k)).collect();
             let returned = raw.returned.into_iter().filter_map(|k| self.class_id(k)).collect();
-            let (returns_unknown, returns_response) = (raw.returns_unknown, raw.returns_response);
-            self.facts.signatures.push(Signature { function, params, annotation, returned, returns_unknown, returns_response });
+            let (returns_unknown, always_returns) = (raw.returns_unknown, raw.always_returns);
+            self.facts.signatures.push(Signature { function, params, annotation, returned, returns_unknown, always_returns });
         }
         for raw in file_facts.stores {
             let Some(class) = self.class_id(raw.class) else { continue };

@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::catalog::{Catalog, Roles};
+use crate::catalog::{Catalog, Entry, Roles};
 use crate::facts::{
     Call, ClassId, Dump, Facts, FnId, Flow, FunctionKind, Location, LoggerName, Origin, ResponseOptions, Signature, Slot,
     Value,
@@ -322,10 +322,14 @@ impl<'a> Graph<'a> {
         self.catalog.entry_kind_of(self.roles[f.0 as usize])
     }
 
+    fn entry(&self, f: FnId) -> Option<&'a Entry> {
+        self.catalog.entry_of(self.roles[f.0 as usize])
+    }
+
     /// Whether a flow into an entry function passes what it registers (catalog `[[entry]]`
     /// `slot`): what a decorator decorates, or an argument at one of the slots.
     fn registers(&self, flow: &Flow) -> bool {
-        let slots = self.catalog.entry_slots_of(self.roles[flow.into.0 as usize]);
+        let slots = self.entry(flow.into).map_or(&[][..], |e| &e.slot[..]);
         match &flow.slot {
             Slot::Decorated => true,
             Slot::Param(p) => slots.is_empty() || slots.contains(p),
@@ -1066,25 +1070,29 @@ impl<'a> Graph<'a> {
         constructed
     }
 
+    /// Whether what `signature` returns is sent as is when its function is registered with
+    /// `entry` (every value returned is an instance of one of the entry's `passthrough` classes).
+    fn passes_through(&self, signature: Option<&Signature>, entry: &Entry) -> bool {
+        signature.is_some_and(|s| s.always_returns.iter().any(|c| entry.passthrough.contains(c)))
+    }
+
     /// Whether `class` is `base` or a subclass of it.
     fn inherits(&self, class: ClassId, base: ClassId) -> bool {
         class == base || self.ancestors(class).contains(&base)
     }
 
-    /// Pydantic (and response class) code FastAPI runs on the loop around endpoints and dependencies, with what runs
-    /// it. `solve_dependencies` validates the request parameters of every endpoint and
-    /// dependency on the loop, sync ones included (only their bodies go to the threadpool).
-    /// `serialize_response` validates the return value against the response model on the loop
-    /// for `async def` endpoints only, then dumps it on the loop for every endpoint.
-    /// The response class is constructed on the loop for every endpoint. Endpoints returning
-    /// `Response` instances skip all three (`get_request_handler` sends them as is).
+    /// Model (and response class) code a framework runs on the loop around what is registered
+    /// with an `[[entry]]`, with what runs it: validating the parameters (`validates_params`),
+    /// validating the return value into the response model (`validates_return`, `async def`
+    /// only: a sync callable runs in a thread) and dumping it (`serializes_return`). Callables
+    /// always returning a `passthrough` class skip the last two (and the response class).
     fn framework_hooks(&self) -> Vec<(FnId, String)> {
         let signatures: HashMap<FnId, &Signature> = self.facts.signatures.iter().map(|s| (s.function, s)).collect();
         let mut response_models: HashMap<(FnId, &Location), Vec<ClassId>> = HashMap::default();
-        let mut endpoints: HashMap<(FnId, &Location), Vec<FnId>> = HashMap::default();
+        let mut endpoints: HashMap<(FnId, &Location), Vec<bool>> = HashMap::default();
         for flow in &self.facts.flows {
             if let (Value::Class(class), Slot::Param(slot)) = (&flow.value, &flow.slot)
-                && slot == "response_model"
+                && self.entry(flow.into).and_then(|e| e.response_model.as_ref()) == Some(slot)
             {
                 response_models.entry((flow.caller, &flow.location)).or_default().push(*class);
             }
@@ -1092,12 +1100,12 @@ impl<'a> Graph<'a> {
                 && self.registers(flow)
                 && self.entry_kind(flow.into) == Some("route")
             {
-                endpoints.entry((flow.caller, &flow.location)).or_default().push(f);
+                let passes = self.entry(flow.into).is_some_and(|e| self.passes_through(signatures.get(&f).copied(), e));
+                endpoints.entry((flow.caller, &flow.location)).or_default().push(passes);
             }
         }
         let options: HashMap<(FnId, &Location), &ResponseOptions> =
             self.facts.response_options.iter().map(|o| ((o.caller, &o.location), o)).collect();
-        let returns_response = |f: &FnId| signatures.get(f).is_some_and(|s| s.returns_response);
         let mut hooks = Vec::new();
         for flow in &self.facts.flows {
             let into = &self.facts.function(flow.into).qualname;
@@ -1112,7 +1120,7 @@ impl<'a> Graph<'a> {
                 && (slot("response_class") || slot("default_response_class"))
             {
                 if slot("response_class")
-                    && endpoints.get(&(flow.caller, &flow.location)).is_some_and(|e| e.iter().all(returns_response))
+                    && endpoints.get(&(flow.caller, &flow.location)).is_some_and(|e| e.iter().all(|&passes| passes))
                 {
                     continue;
                 }
@@ -1140,34 +1148,34 @@ impl<'a> Graph<'a> {
                 hooks.extend(factory.map(|f| (f, format!("{label} (construction)"))));
                 continue;
             }
-            let is_route = matches!(kind, Some("route" | "websocket")) && self.registers(flow);
-            let is_dependency = kind == Some("dependency") && self.registers(flow);
-            // Starlette routes neither validate nor serialize.
-            if !into.starts_with("fastapi.") || (!is_route && !is_dependency) {
+            let Some(entry) = self.entry(flow.into) else { continue };
+            if !(entry.validates_params || entry.serializes_return || entry.validates_return) || !self.registers(flow) {
                 continue;
             }
             let function = match flow.value {
                 Value::Function(f) => f,
-                // A class dependency: FastAPI fills the parameters of its `__init__`.
-                Value::Class(class) if is_dependency => {
+                // A class: the framework fills the parameters of its `__init__`.
+                Value::Class(class) => {
                     let Some(init) = Hierarchy::lookup(self.facts, class, "__init__") else { continue };
                     init
                 }
-                _ => continue,
+                Value::Param(..) => continue,
             };
             let none =
-                Signature { function, params: Vec::new(), annotation: Vec::new(), returned: Vec::new(), returns_unknown: false, returns_response: false };
+                Signature { function, params: Vec::new(), annotation: Vec::new(), returned: Vec::new(), returns_unknown: false, always_returns: Vec::new() };
             let signature = signatures.get(&function).copied().unwrap_or(&none);
-            let label = entry_label(kind.unwrap_or_default(), into, flow);
+            let label = entry_label(&entry.kind, into, flow);
             let mut add = |found: Vec<FnId>, what: &str| hooks.extend(found.into_iter().map(|h| (h, format!("{label} ({what})"))));
-            for value in &signature.params {
-                match value {
-                    Value::Class(class) => add(self.validation_hooks(*class).to_vec(), "request validation"),
-                    Value::Function(f) => add(vec![*f], "request validation"),
-                    Value::Param(..) => {}
+            if entry.validates_params {
+                for value in &signature.params {
+                    match value {
+                        Value::Class(class) => add(self.validation_hooks(*class).to_vec(), "request validation"),
+                        Value::Function(f) => add(vec![*f], "request validation"),
+                        Value::Param(..) => {}
+                    }
                 }
             }
-            if kind != Some("route") || signature.returns_response {
+            if matches!(flow.value, Value::Class(_)) || self.passes_through(Some(signature), entry) {
                 continue;
             }
             let options = options.get(&(flow.caller, &flow.location));
@@ -1183,11 +1191,11 @@ impl<'a> Graph<'a> {
             let exclude = options.map(|o| o.exclude.clone()).filter(|_| !models.is_empty()).unwrap_or_default();
             let dump = Dump { json: true, exclude, include: None };
             let dumped = if models.is_empty() { &signature.returned[..] } else { models };
-            for &class in dumped {
+            for &class in dumped.iter().filter(|_| entry.serializes_return) {
                 add(self.serialization_hooks(class, &dump), "response serialization");
             }
             // Validating an instance of the model (or of a subclass) keeps it as is.
-            if self.facts.function(function).is_async && !signature.returns_unknown {
+            if entry.validates_return && self.facts.function(function).is_async && !signature.returns_unknown {
                 let validated = models.iter().filter(|&&m| !signature.returned.iter().any(|&r| self.inherits(r, m)));
                 for &class in validated {
                     add(self.validation_hooks(class).to_vec(), "response validation");

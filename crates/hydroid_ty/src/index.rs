@@ -470,22 +470,6 @@ pub fn inherits(db: &HydroidDb, class: Key, base: Key) -> bool {
     false
 }
 
-/// Whether `class` is the top-level class `qualname` or inherits from it.
-pub fn inherits_from(db: &HydroidDb, class: Key, qualname: &str) -> bool {
-    let (mut queue, mut seen) = (vec![class], rustc_hash::FxHashSet::default());
-    while let Some(class) = queue.pop() {
-        if !seen.insert(class) || seen.len() > 32 {
-            continue;
-        }
-        let Some((name, bases)) = qualname_and_bases(db, class) else { continue };
-        if name == qualname {
-            return true;
-        }
-        queue.extend(bases);
-    }
-    false
-}
-
 /// The fully qualified name (`module.Class`) of a top-level class, and its bases.
 fn qualname_and_bases(db: &HydroidDb, class: Key) -> Option<(String, Vec<Key>)> {
     Some((class_qualname(db, class)?, class_bases(db, class)))

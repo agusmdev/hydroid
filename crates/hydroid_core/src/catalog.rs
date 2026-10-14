@@ -1,5 +1,5 @@
 //! What hydroid knows about functions it does not analyze: which block, which move work off the
-//! event loop, which schedule callbacks on it, and which register FastAPI entry points.
+//! event loop, which schedule callbacks on it, and which register framework entry points.
 
 use anyhow::Context;
 use rustc_hash::FxHashMap as HashMap;
@@ -230,7 +230,47 @@ struct EntryGroup {
     /// decorates. Without it, any argument.
     #[serde(default)]
     slot: Vec<String>,
+    #[serde(default)]
+    validates_params: bool,
+    #[serde(default)]
+    serializes_return: bool,
+    #[serde(default)]
+    validates_return: bool,
+    #[serde(default)]
+    response_model: Option<String>,
+    #[serde(default)]
+    response_exclude: Option<String>,
+    #[serde(default)]
+    passthrough: Vec<String>,
     functions: Vec<String>,
+}
+
+/// What registering a callable (or a class) with an `[[entry]]` function means.
+#[derive(Clone, Debug, Default)]
+pub struct Entry {
+    /// What is registered (`route`, `middleware`, ...): labels which entry reaches a diagnostic.
+    pub kind: String,
+    /// The parameters taking what is registered; a decorator registers what it decorates.
+    /// Empty: any argument.
+    pub slot: Vec<String>,
+    /// The framework validates, on the loop, the annotated parameters of what is registered
+    /// (of its `__init__`, for a class) from the data it calls it with.
+    pub validates_params: bool,
+    /// The framework dumps what the callable returns (against its response model), on the loop,
+    /// whether the callable itself runs on the loop or in a thread.
+    pub serializes_return: bool,
+    /// The framework validates what the callable returns into its response model in the thread
+    /// the callable runs in (the loop, for an `async def`); an instance of the model is kept as
+    /// is.
+    pub validates_return: bool,
+    /// The keyword giving the response model (given `None`: no model). The return annotation
+    /// otherwise.
+    pub response_model: Option<String>,
+    /// The keyword naming, in a literal set or dict, top-level fields left out of the dump.
+    pub response_exclude: Option<String>,
+    /// Classes sent as they are: a callable always returning instances of them (or of
+    /// subclasses) has its return value neither validated nor dumped.
+    pub passthrough: Vec<String>,
 }
 
 /// Qualified-name patterns: exact names in a map, `*` patterns scanned.
@@ -369,9 +409,7 @@ pub struct Catalog {
     /// `[[runs_hooks]]` names (or patterns).
     operations: Vec<(String, RunsHooks)>,
     entries: Patterns<usize>,
-    entry_kinds: Vec<String>,
-    /// The `slot` of each entry group, by index.
-    entry_slots: Vec<Vec<String>>,
+    entry_groups: Vec<Entry>,
 }
 
 impl Catalog {
@@ -433,10 +471,29 @@ impl Catalog {
             self.loop_probes.extend(group.functions.into_iter().map(|f| (f, group.raises.clone())));
         }
         for group in file.entry {
-            let index = self.entry_kinds.len();
-            self.entry_kinds.push(group.kind);
-            self.entry_slots.push(group.slot);
-            for name in &group.functions {
+            let EntryGroup {
+                kind,
+                slot,
+                validates_params,
+                serializes_return,
+                validates_return,
+                response_model,
+                response_exclude,
+                passthrough,
+                functions,
+            } = group;
+            let index = self.entry_groups.len();
+            self.entry_groups.push(Entry {
+                kind,
+                slot,
+                validates_params,
+                serializes_return,
+                validates_return,
+                response_model,
+                response_exclude,
+                passthrough,
+            });
+            for name in &functions {
                 self.entries.insert(name, index);
             }
         }
@@ -480,15 +537,27 @@ impl Catalog {
         roles.sink.map_or(&[], |index| &self.unless_given[index])
     }
 
-    /// The parameters an entry function takes what it registers in (empty: any), for a function
-    /// whose roles are known.
-    pub fn entry_slots_of(&self, roles: Roles) -> &[String] {
-        roles.entry.map_or(&[], |i| &self.entry_slots[i])
+    /// What registering with an entry function means, for a function whose roles are known.
+    pub fn entry_of(&self, roles: Roles) -> Option<&Entry> {
+        roles.entry.map(|i| &self.entry_groups[i])
     }
 
     /// [`Catalog::entry_kind`] for a function whose roles are known.
     pub fn entry_kind_of(&self, roles: Roles) -> Option<&str> {
-        roles.entry.map(|i| self.entry_kinds[i].as_str())
+        roles.entry.map(|i| self.entry_groups[i].kind.as_str())
+    }
+
+    /// Every `[[entry]]` name (or pattern), with what registering there means.
+    pub fn entry_entries(&self) -> impl Iterator<Item = (String, &Entry)> + '_ {
+        self.entries.entries().map(|(name, &i)| (name, &self.entry_groups[i]))
+    }
+
+    /// The `passthrough` classes of every `[[entry]]`.
+    pub fn passthrough(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.entry_groups.iter().flat_map(|e| e.passthrough.iter().map(String::as_str)).collect();
+        names.sort_unstable();
+        names.dedup();
+        names
     }
 
     pub fn sink(&self, qualname: &str) -> Option<Sink> {
@@ -565,7 +634,7 @@ impl Catalog {
 
     /// The entry-point kind registered by passing a callable to `qualname`.
     pub fn entry_kind(&self, qualname: &str) -> Option<&str> {
-        self.entries.get(qualname).map(|&i| self.entry_kinds[i].as_str())
+        self.entries.get(qualname).map(|&i| self.entry_groups[i].kind.as_str())
     }
 
     /// Every name and pattern in the catalog.
@@ -583,6 +652,7 @@ impl Catalog {
             .chain(self.hooks.iter().map(|(f, _)| f.clone()))
             .chain(self.operations.iter().map(|(f, _)| f.clone()))
             .chain(self.entries.all())
+            .chain(self.entry_groups.iter().flat_map(|e| e.passthrough.iter().cloned()))
             .chain(self.blocks_in.iter().flatten().cloned())
             .collect();
         names.sort();
