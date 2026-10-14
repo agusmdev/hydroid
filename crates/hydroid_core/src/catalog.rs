@@ -242,6 +242,8 @@ struct EntryGroup {
     response_exclude: Option<String>,
     #[serde(default)]
     passthrough: Vec<String>,
+    #[serde(default)]
+    injects: bool,
     functions: Vec<String>,
 }
 
@@ -271,6 +273,10 @@ pub struct Entry {
     /// Classes sent as they are: a callable always returning instances of them (or of
     /// subclasses) has its return value neither validated nor dumped.
     pub passthrough: Vec<String>,
+    /// A parameter whose default (or `Annotated` metadata) is a call to the entry function is
+    /// injected: the framework fills it with what the callable registered at `slot` provides
+    /// (what it returns or yields; an instance, for a class), not from the request.
+    pub injects: bool,
 }
 
 /// Qualified-name patterns: exact names in a map, `*` patterns scanned.
@@ -480,6 +486,7 @@ impl Catalog {
                 response_model,
                 response_exclude,
                 passthrough,
+                injects,
                 functions,
             } = group;
             let index = self.entry_groups.len();
@@ -492,6 +499,7 @@ impl Catalog {
                 response_model,
                 response_exclude,
                 passthrough,
+                injects,
             });
             for name in &functions {
                 self.entries.insert(name, index);

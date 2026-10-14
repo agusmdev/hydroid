@@ -116,6 +116,17 @@ fn catalog_keys<'c>(db: &HydroidDb, indexes: &Indexes, catalog: &'c Catalog) -> 
             }
         }
     }
+    for (name, entry) in catalog.entry_entries().filter(|(_, e)| e.injects) {
+        let Some(slot) = entry.slot.first() else { continue };
+        for key in catalog_definitions(db, indexes, &name) {
+            let index = indexes.get(db, key.0);
+            let position = index.functions.get(&key.1).and_then(|f| {
+                let i = f.params[..f.positional].iter().position(|p| p == slot)?;
+                i.checked_sub(usize::from(f.class.is_some()))
+            });
+            keys.injects.insert(key, (position, slot.as_str()));
+        }
+    }
     for name in catalog.passthrough() {
         keys.passthrough.extend(catalog_definitions(db, indexes, name).into_iter().map(|key| (key, name)));
     }

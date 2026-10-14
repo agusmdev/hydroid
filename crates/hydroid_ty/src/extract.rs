@@ -241,6 +241,9 @@ pub struct CatalogKeys<'c> {
     pub entries: FxHashMap<Key, &'c Entry>,
     /// `[[entry]]` `passthrough` classes, with their catalog names.
     pub passthrough: Vec<(Key, &'c str)>,
+    /// `[[entry]]` functions with `injects`: where a call to them takes the provider (the
+    /// position, not counting `self`, and the keyword of the first `slot`).
+    pub injects: FxHashMap<Key, (Option<usize>, &'c str)>,
 }
 
 /// Extracts the bodies of `wanted` functions (every function and the module body when `None`).
@@ -397,8 +400,6 @@ fn excluded_fields(call: &ast::ExprCall, keyword: &str) -> Vec<String> {
     exclude
 }
 
-/// Parameter markers whose value FastAPI gets by calling a dependency, not from the request.
-const DEPENDENCY_MARKERS: &[&str] = &["Depends", "Security"];
 
 /// Logger methods logging a record.
 const LOGS: &[&str] = &["debug", "info", "warning", "warn", "error", "exception", "critical", "fatal", "log"];
@@ -1224,9 +1225,10 @@ impl<'a, 'db> Extractor<'a, 'db> {
         classes
     }
 
-    /// The classes of an unannotated parameter's value when its default is `Depends(provider)`
-    /// (or `Security(provider)`): FastAPI passes what the provider returns (yields, for generator
-    /// dependencies), or an instance of a class used as a dependency.
+    /// The classes of an unannotated parameter's value when its default injects it
+    /// (`Depends(provider)`, catalog `[[entry]]` `injects`): the framework passes what the
+    /// provider returns (yields, for generator dependencies), or an instance of a class used as
+    /// a dependency.
     fn dependency_classes(&self, receiver: &Expr) -> Vec<Key> {
         let Some((owner, name)) = self.param_of(receiver) else { return Vec::new() };
         let db = self.model.db();
@@ -1243,11 +1245,10 @@ impl<'a, 'db> Extractor<'a, 'db> {
             return Vec::new();
         };
         let Some(Expr::Call(call)) = parameter.default.as_deref() else { return Vec::new() };
-        if parameter.parameter.annotation.is_some() || !called_name(call).is_some_and(|n| DEPENDENCY_MARKERS.contains(&n))
-        {
+        if parameter.parameter.annotation.is_some() {
             return Vec::new();
         }
-        let provider = call.arguments.args.first().or_else(|| call.arguments.find_keyword("dependency").map(|k| &k.value));
+        let Some(provider) = self.injection(call) else { return Vec::new() };
         match provider.and_then(|p| self.value_of(p)) {
             Some(RawValue::Function(function)) => self.provided_classes(function),
             Some(RawValue::Class(class)) => vec![class],
@@ -1255,7 +1256,19 @@ impl<'a, 'db> Extractor<'a, 'db> {
         }
     }
 
-    /// Classes of what a dependency provider gives FastAPI: its declared return type (the yield
+    /// When `call` injects the parameter it is the default (or `Annotated` metadata) of (catalog
+    /// `[[entry]]` `injects`), the argument giving the provider, if any.
+    fn injection<'e>(&self, call: &'e ast::ExprCall) -> Option<Option<&'e Expr>> {
+        if self.keys.injects.is_empty() {
+            return None;
+        }
+        let resolution = self.resolve(&call.func, Some(call));
+        let &(position, keyword) = resolution.targets.iter().find_map(|(key, _)| self.keys.injects.get(key))?;
+        let positional = position.and_then(|i| call.arguments.args.iter().take_while(|a| !a.is_starred_expr()).nth(i));
+        Some(positional.or_else(|| call.arguments.find_keyword(keyword).map(|k| &k.value)))
+    }
+
+    /// Classes of what a dependency provider gives the framework: its declared return type (the yield
     /// type of a generator), else the classes of its `return` (`yield`) values.
     fn provided_classes(&self, function: Key) -> Vec<Key> {
         let db = self.model.db();
@@ -2001,8 +2014,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
         for parameter in parameters.posonlyargs.iter().chain(&parameters.args).chain(&parameters.kwonlyargs) {
             let name = parameter.parameter.name.as_str();
             let Some(annotation) = parameter.parameter.annotation.as_deref() else { continue };
-            let is_dependency =
-                |call: &ast::ExprCall| called_name(call).is_some_and(|n| DEPENDENCY_MARKERS.contains(&n));
+            let is_dependency = |call: &ast::ExprCall| self.injection(call).is_some();
             let default_dependency = matches!(parameter.default.as_deref(), Some(Expr::Call(c)) if is_dependency(c));
             if name == "self" || name == "cls" || default_dependency {
                 continue;

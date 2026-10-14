@@ -754,6 +754,8 @@ functions = [
 #   response_exclude   the keyword naming top-level fields left out of the dump
 #   passthrough        classes sent as they are: a callable always returning instances of them
 #                      has its return value neither validated nor dumped
+#   injects            a parameter whose default (or `Annotated` metadata) is a call to these is
+#                      filled with what the callable at `slot` provides, not from the request
 # ---------------------------------------------------------------------------------------------
 [[entry]]
 kind = "route"
@@ -830,7 +832,23 @@ functions = ["starlette.routing.WebSocketRoute.__init__"]
 kind = "dependency"
 slot = ["dependency"]
 validates_params = true
+injects = true
 functions = ["fastapi.param_functions.Depends", "fastapi.param_functions.Security"]
+
+# FastStream (not built in; works through `[tool.hydroid]` as is): fast_depends validates the
+# message into the annotated parameters of a subscriber on the loop, and fills `Depends(...)`
+# parameters from the dependency instead.
+# [[entry]]
+# kind = "subscriber"
+# validates_params = true
+# functions = ["faststream.redis.broker.registrator.RedisRegistrator.subscriber"]
+#
+# [[entry]]
+# kind = "dependency"
+# slot = ["dependency"]
+# validates_params = true
+# injects = true
+# functions = ["fast_depends.use.Depends"]
 
 [[entry]]
 kind = "middleware"
