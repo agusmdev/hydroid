@@ -741,9 +741,13 @@ functions = [
 
 # ---------------------------------------------------------------------------------------------
 # FastAPI / Starlette entry points: used to show which endpoint reaches a diagnostic.
+#   kind   what is registered ("route", "dependency", "middleware", ...)
+#   slot   the parameters taking the callable (or class) registered; a decorator registers what
+#          it decorates. Without it, any argument.
 # ---------------------------------------------------------------------------------------------
 [[entry]]
 kind = "route"
+slot = ["endpoint"]
 functions = [
     "fastapi.applications.FastAPI.get",
     "fastapi.applications.FastAPI.put",
@@ -772,6 +776,7 @@ functions = [
 
 [[entry]]
 kind = "websocket"
+slot = ["endpoint"]
 functions = [
     "fastapi.applications.FastAPI.websocket",
     "fastapi.applications.FastAPI.add_api_websocket_route",
@@ -782,6 +787,7 @@ functions = [
 
 [[entry]]
 kind = "dependency"
+slot = ["dependency"]
 functions = ["fastapi.param_functions.Depends", "fastapi.param_functions.Security"]
 
 [[entry]]

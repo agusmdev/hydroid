@@ -322,6 +322,17 @@ impl<'a> Graph<'a> {
         self.catalog.entry_kind_of(self.roles[f.0 as usize])
     }
 
+    /// Whether a flow into an entry function passes what it registers (catalog `[[entry]]`
+    /// `slot`): what a decorator decorates, or an argument at one of the slots.
+    fn registers(&self, flow: &Flow) -> bool {
+        let slots = self.catalog.entry_slots_of(self.roles[flow.into.0 as usize]);
+        match &flow.slot {
+            Slot::Decorated => true,
+            Slot::Param(p) => slots.is_empty() || slots.contains(p),
+            Slot::Unknown => slots.is_empty(),
+        }
+    }
+
     fn is_offload(&self, f: FnId) -> bool {
         self.offload[f.0 as usize]
     }
@@ -1078,7 +1089,7 @@ impl<'a> Graph<'a> {
                 response_models.entry((flow.caller, &flow.location)).or_default().push(*class);
             }
             if let Value::Function(f) = flow.value
-                && (flow.slot == Slot::Decorated || matches!(&flow.slot, Slot::Param(p) if p == "endpoint"))
+                && self.registers(flow)
                 && self.entry_kind(flow.into) == Some("route")
             {
                 endpoints.entry((flow.caller, &flow.location)).or_default().push(f);
@@ -1129,9 +1140,8 @@ impl<'a> Graph<'a> {
                 hooks.extend(factory.map(|f| (f, format!("{label} (construction)"))));
                 continue;
             }
-            let is_route =
-                matches!(kind, Some("route" | "websocket")) && (flow.slot == Slot::Decorated || slot("endpoint"));
-            let is_dependency = kind == Some("dependency") && slot("dependency");
+            let is_route = matches!(kind, Some("route" | "websocket")) && self.registers(flow);
+            let is_dependency = kind == Some("dependency") && self.registers(flow);
             // Starlette routes neither validate nor serialize.
             if !into.starts_with("fastapi.") || (!is_route && !is_dependency) {
                 continue;
@@ -1190,13 +1200,7 @@ impl<'a> Graph<'a> {
             let (Value::Function(method), Some(receiver)) = (flow.value.clone(), flow.receiver) else { continue };
             let into = &self.facts.function(flow.into).qualname;
             let Some(kind) = self.entry_kind(flow.into) else { continue };
-            let slot = |name: &str| matches!(&flow.slot, Slot::Param(p) if p == name);
-            let applies = match kind {
-                "dependency" => slot("dependency"),
-                "route" | "websocket" => flow.slot == Slot::Decorated || slot("endpoint"),
-                _ => true,
-            };
-            if !applies {
+            if !self.registers(flow) {
                 continue;
             }
             let found = self.template_hooks(method, receiver);

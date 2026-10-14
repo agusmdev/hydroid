@@ -226,6 +226,10 @@ pub enum ArgumentSlot {
 #[serde(deny_unknown_fields)]
 struct EntryGroup {
     kind: String,
+    /// The parameters taking the callable (or class) registered; a decorator registers what it
+    /// decorates. Without it, any argument.
+    #[serde(default)]
+    slot: Vec<String>,
     functions: Vec<String>,
 }
 
@@ -366,6 +370,8 @@ pub struct Catalog {
     operations: Vec<(String, RunsHooks)>,
     entries: Patterns<usize>,
     entry_kinds: Vec<String>,
+    /// The `slot` of each entry group, by index.
+    entry_slots: Vec<Vec<String>>,
 }
 
 impl Catalog {
@@ -429,6 +435,7 @@ impl Catalog {
         for group in file.entry {
             let index = self.entry_kinds.len();
             self.entry_kinds.push(group.kind);
+            self.entry_slots.push(group.slot);
             for name in &group.functions {
                 self.entries.insert(name, index);
             }
@@ -471,6 +478,12 @@ impl Catalog {
     /// [`Catalog::unless_given`] for a function whose roles are known.
     pub fn unless_given_of(&self, roles: Roles) -> &[String] {
         roles.sink.map_or(&[], |index| &self.unless_given[index])
+    }
+
+    /// The parameters an entry function takes what it registers in (empty: any), for a function
+    /// whose roles are known.
+    pub fn entry_slots_of(&self, roles: Roles) -> &[String] {
+        roles.entry.map_or(&[], |i| &self.entry_slots[i])
     }
 
     /// [`Catalog::entry_kind`] for a function whose roles are known.

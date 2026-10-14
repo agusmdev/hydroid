@@ -168,7 +168,7 @@ a class name stands for constructing the class.
 | `[[hook]]` | these decorators make the method they decorate a hook its class runs when validated (`runs = "validation"`: constructing it, or validating data into it) or dumped (`runs = "dump"`); with `callable`, these classes or functions, called in the `Annotated[...]` metadata of a field, attach the callable given at that slot to the field | `runs`, `functions`; `callable`, `fields` (`"arguments"`: the fields the decorator's call names, `"name"`: the field named like the decorated function), `json_only` (`{ keyword, values }`: a dump hook only runs for JSON dumps when its call gives the keyword one of these values) |
 | `[[runs_hooks]]` | these operations run the `runs` hooks of the class they are called on (a class object or an instance) | `runs`, `functions`; for dumps `json`, `json_unless` (`{ keyword, values }`: given, the dump is to JSON unless the value is one of these), `exclude` and `include` (keywords naming top-level fields left out, or the only ones dumped) |
 | `[[loop_probe]]` | these functions raise `raises` (a class) when no event loop runs in the calling thread: the handlers catching it (or a base) of a `try` doing nothing but call them never run on the loop | `raises`, `functions` |
-| `[[entry]]` | callables passed to these are framework entry points | `kind`, `functions` |
+| `[[entry]]` | callables passed to these are framework entry points | `kind`, `functions`; `slot` (the parameters taking what is registered; a decorator registers what it decorates; default: any argument) |
 
 Argument slots (`calls`, `iterates`, `enters`) are positions (`0` is the first argument after
 `self`), keyword names, or `"*"` (every positional argument not in `calls`). For example, a
