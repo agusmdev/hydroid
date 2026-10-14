@@ -405,14 +405,17 @@ impl Indexes {
     }
 
     /// What the project's SQLAlchemy models run implicitly: see [`Orm`].
-    fn orm(&self, db: &HydroidDb) -> Orm {
+    fn orm(&self, db: &HydroidDb, keys: &CatalogKeys) -> Orm {
         let mut orm = Orm::default();
         let mut lazy_classes: Vec<Key> = Vec::new();
         {
             let map = self.0.lock();
             let projects = || map.values().filter(|i| i.origin == Origin::Project);
             for index in projects() {
-                orm.validated.extend(index.functions.values().flat_map(|f| f.validates.iter().cloned()));
+                // The attributes `[[hook]]`s run on set name (`@validates("email")`).
+                let sets = |(callee, _): &&(Key, Vec<String>)| keys.hooks.get(callee).is_some_and(|h| h.runs == HookPhase::Set);
+                let named = index.functions.values().flat_map(|f| f.naming_decorators.iter().filter(sets));
+                orm.validated.extend(named.flat_map(|(_, names)| names.iter().cloned()));
                 for (&function, names) in &index.eager_loads {
                     orm.eager.insert((index.file, function), names.clone());
                 }
@@ -580,7 +583,7 @@ fn run(
 ) -> Vec<FileFacts> {
     let implicit = (!all_implicit).then(|| indexes.implicit());
     let state = indexes.app_state();
-    let orm = indexes.orm(db);
+    let orm = indexes.orm(db, keys);
     let instances = indexes.instances();
     let shared = Mutex::new(db.clone());
     units
@@ -648,7 +651,7 @@ impl<'a> Merger<'a> {
             is_serializer: false,
             serializes: Vec::new(),
             json_only: false,
-            validates: entry.validates.clone(),
+            validates: Vec::new(),
             params: entry.params.clone(),
             self_calls: entry.self_calls.clone(),
             closure_self_calls: entry.closure_self_calls.clone(),
@@ -778,6 +781,7 @@ impl<'a> Merger<'a> {
             let function = &mut self.facts.functions[id.0 as usize];
             match hook.runs {
                 HookPhase::Validation => function.is_validator = true,
+                HookPhase::Set => function.validates = hook.fields,
                 HookPhase::Dump => {
                     function.is_serializer = true;
                     function.serializes = hook.fields;

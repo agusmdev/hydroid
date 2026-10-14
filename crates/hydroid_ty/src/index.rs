@@ -31,8 +31,9 @@ pub struct FnEntry {
     pub is_async: bool,
     pub property: Option<Accessor>,
     pub is_generator: bool,
-    /// See [`hydroid_core::facts::Function::validates`] (project files only).
-    pub validates: Vec<String>,
+    /// The decorator calls of a project method giving string literals (`@validates("a", "b")`):
+    /// the function called, and the strings. See [`crate::extract::Orm::validated`].
+    pub naming_decorators: Vec<(Key, Vec<String>)>,
     pub params: Vec<String>,
     /// How many of `params` can be passed positionally.
     pub positional: usize,
@@ -149,7 +150,7 @@ impl FileIndex {
             is_async: false,
             property: None,
             is_generator: false,
-            validates: Vec::new(),
+            naming_decorators: Vec::new(),
             params: Vec::new(),
             positional: 0,
             parent: None,
@@ -574,21 +575,24 @@ fn defined_in_sqlalchemy(model: &SemanticModel<'_>, func: &Expr) -> bool {
     path.contains("/sqlalchemy/")
 }
 
-/// The attributes a SQLAlchemy `@validates("a", "b")` decorator names.
-fn orm_validates(model: &SemanticModel<'_>, def: &ast::StmtFunctionDef) -> Vec<String> {
-    let mut names = Vec::new();
+/// See [`FnEntry::naming_decorators`].
+fn naming_decorators(model: &SemanticModel<'_>, def: &ast::StmtFunctionDef) -> Vec<(Key, Vec<String>)> {
+    let db = model.db();
+    let mut found = Vec::new();
     for decorator in &def.decorator_list {
         let Expr::Call(call) = &decorator.expression else { continue };
-        if callee_name(&call.func) != Some("validates") || !defined_in_sqlalchemy(model, &call.func) {
+        let names: Vec<String> =
+            call.arguments.args.iter().filter_map(|a| Some(a.as_string_literal_expr()?.value.to_str().to_string())).collect();
+        if names.is_empty() {
             continue;
         }
-        for argument in &call.arguments.args {
-            if let Expr::StringLiteral(s) = argument {
-                names.push(s.value.to_str().to_string());
-            }
-        }
+        let Some(ty @ Type::FunctionLiteral(_)) = call.func.inferred_type(model) else { continue };
+        let Some(TypeDefinition::Function(function)) = ty.definition(db, &model.program_environment()) else { continue };
+        let module = parsed_module(db, function.python_file(db)).load(db);
+        let range = function.focus_range(db, &module);
+        found.push(((range.file(), range.start().to_u32()), names));
     }
-    names
+    found
 }
 
 fn accessor(def: &ast::StmtFunctionDef) -> Option<Accessor> {
@@ -1015,8 +1019,8 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                         // A decorated generator is called through its decorator, which decides
                         // when the body runs (see `Call::deferred_body`).
                         is_generator: !def.is_async && def.decorator_list.is_empty() && yields(&def.body),
-                        validates: if self.index.origin == Origin::Project && class.is_some() {
-                            orm_validates(self.model, def)
+                        naming_decorators: if self.index.origin == Origin::Project && class.is_some() {
+                            naming_decorators(self.model, def)
                         } else {
                             Vec::new()
                         },
@@ -1132,7 +1136,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     is_async: false,
                     property: None,
                     is_generator: false,
-                    validates: Vec::new(),
+                    naming_decorators: Vec::new(),
                     params,
                     positional,
                     parent: self.enclosing_function(),

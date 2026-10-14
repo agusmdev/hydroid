@@ -595,8 +595,9 @@ functions = ["dataclasses.field"]
 #   [[hook]]        what makes a function a hook of its class: a decorator; or (with `callable`)
 #                   a class or function whose call in the `Annotated[...]` metadata of a field
 #                   attaches the callable given at that slot to the field
-#     runs          "validation" (constructing an instance or validating data into the class) or
-#                   "dump"
+#     runs          "validation" (constructing an instance or validating data into the class),
+#                   "dump", or "set" (setting the fields it names on an instance, constructor
+#                   keyword arguments included)
 #     fields        "arguments" (the fields the decorator's call names; "*": every field) or
 #                   "name" (the field named like the decorated function); default: every field
 #     json_only     { keyword, values }: a dump hook only runs for JSON dumps when its call gives
@@ -634,6 +635,19 @@ functions = ["pydantic.functional_serializers.model_serializer"]
 runs = "dump"
 fields = "name"
 functions = ["pydantic.fields.computed_field"]
+
+# SQLAlchemy's `@validates("email")` runs when `email` is set on an instance of the mapped class.
+[[hook]]
+runs = "set"
+fields = "arguments"
+functions = ["sqlalchemy.orm.mapper.validates"]
+
+# The same for another library, traitlets (not built in; works through `[tool.hydroid]` as is):
+# `@observe("count")` and `@validate("count")` run when `count` is set.
+# [[hook]]
+# runs = "set"
+# fields = "arguments"
+# functions = ["traitlets.traitlets.observe", "traitlets.traitlets.validate"]
 
 # `Annotated[T, AfterValidator(f)]`; annotated-types' `Predicate(f)` and `Not(f)`, which pydantic
 # runs as validators too.

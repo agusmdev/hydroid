@@ -197,6 +197,9 @@ pub enum HookPhase {
     Validation,
     /// Dumping an instance of the class.
     Dump,
+    /// Setting the attributes it names on an instance (`obj.name = value`, the constructor's
+    /// keyword arguments included).
+    Set,
 }
 
 /// Which fields a decorator hook is for.
