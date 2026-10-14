@@ -318,7 +318,63 @@
       "protocol": "holdout baseline after promoting this round's cases (incl. 12 backlog holdout misses from earlier rounds), before any fix (same protocol as round 6).",
       "holdout_recall": "4/34",
       "holdout_fp": 0
+    },
+    {
+      "round": 16,
+      "lever": "library knowledge to the catalog (phase B)",
+      "change": "Phase B: library-specific rules moved to catalog.toml or derived from library source (AUDIT.md items F, P, I, A, C, S, O, L, G1); file_bytesio_binaryio false positive fixed by exact argument classes; new catalog concepts arguments, loop_probe, hook, runs_hooks, builds_on_loop, state_namespace, lazy_attribute, observer, each tested with a second library",
+      "train_recall": "161/161",
+      "train_fp": 0,
+      "holdout_recall": "4/34",
+      "holdout_fp": 0,
+      "holdout_set": "48ec61bf2a43",
+      "holdout_baseline": "4/34 with the binary at 3093ac1",
+      "results": ".claude/hillclimb/recall/v15",
+      "ratcheted_to_train": [
+        "fp5_iter_generator_dunder_offloaded",
+        "fp5_lazy_iter_to_thread_consumer",
+        "http_tenacity_wraps",
+        "lib_pymysql_cursor_with",
+        "lib_sqlmodel_session_execute",
+        "mw_route_handler_per_request",
+        "rc_route_hook_queue_override"
+      ],
+      "polar_cold_ms_median": 11478,
+      "polar_warm_ms_median": 378
     }
   ],
-  "ground_truth": "scripts/hillclimb/oracle_runtime.py via check.py: a case is promoted only when the runtime proves every line where hydroid disagrees (verdict BREAKS), or with a reviewer's note"
+  "ground_truth": "scripts/hillclimb/oracle_runtime.py via check.py: a case is promoted only when the runtime proves every line where hydroid disagrees (verdict BREAKS), or with a reviewer's note",
+  "holdout_sets": {
+    "48ec61bf2a43": [
+      "auth_request_user_method",
+      "bg_datagram_protocol",
+      "bg_from_thread_run_sync",
+      "cache_singleton_class",
+      "conc_thread_run_inline",
+      "di_wraps_sync_wrapper",
+      "file_archive_helpers",
+      "file_spooled_export",
+      "flow_event_bus_hooks",
+      "flow_global_hook_rebind",
+      "lib_sqlmodel_create_all_lifespan",
+      "log_dictconfig_rotating_file",
+      "log_webhook_alert_handler",
+      "mod_importlib_plugins",
+      "mod_lazy_package_getattr",
+      "orm_hybrid_property_query",
+      "pyd_annotated_field_validator",
+      "route_endpoint_custom_dispatch",
+      "route_path_convertor",
+      "std_backoff_default_sleep",
+      "std_logging_smtp_handler",
+      "svc_dev_inline_job_queue",
+      "svc_settings_conditional_base",
+      "svc_uow_event_handler_lists",
+      "typ_callable_protocol_factory",
+      "typ_protocol_callable_attribute",
+      "ws_endpoint_class_init",
+      "ws_stream_iterable_iter",
+      "ws_stream_sync_aiter"
+    ]
+  }
 }
