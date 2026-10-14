@@ -41,9 +41,40 @@ struct CatalogFile {
     runs_hooks: Vec<RunsHooksGroup>,
     #[serde(default)]
     entry: Vec<EntryGroup>,
+    /// Functions taking a class (or a factory) the library calls later, on the loop.
+    #[serde(default)]
+    builds_on_loop: Vec<BuildsOnLoopGroup>,
     /// Objects whose attributes hold what project code stores on them.
     #[serde(default)]
     state_namespace: Vec<StateNamespace>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildsOnLoopGroup {
+    kind: String,
+    slot: Vec<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    unless_passthrough: bool,
+    functions: Vec<String>,
+}
+
+/// A class (or a factory) given to the function at `slot` is constructed (called) by the
+/// library later, on the loop: its `__init__` runs there, with the project overrides of what
+/// the library `__init__` it inherits calls on `self`.
+#[derive(Clone, Debug)]
+pub struct BuildsOnLoop {
+    /// What running it is called in diagnostics (`construction`).
+    pub kind: String,
+    /// The parameters taking the class (or factory).
+    pub slot: Vec<String>,
+    /// How diagnostics name what reaches it; by default, the `[[entry]]` of the function.
+    pub label: Option<String>,
+    /// Not when every callable the same call registers always returns one of its entry's
+    /// `passthrough` classes (sent as they are).
+    pub unless_passthrough: bool,
 }
 
 /// An attribute namespace the library types as `Any` (`app.state`): reading `<namespace>.name`
@@ -416,6 +447,8 @@ pub struct Roles {
     pub log_dispatch: bool,
     /// The entry-point kind it registers.
     entry: Option<usize>,
+    /// The `[[builds_on_loop]]` group it belongs to.
+    builds: Option<usize>,
 }
 
 impl Roles {
@@ -455,6 +488,8 @@ pub struct Catalog {
     operations: Vec<(String, RunsHooks)>,
     entries: Patterns<usize>,
     entry_groups: Vec<Entry>,
+    builds_on_loop: Patterns<usize>,
+    builders: Vec<BuildsOnLoop>,
     state_namespaces: Vec<StateNamespace>,
 }
 
@@ -517,6 +552,13 @@ impl Catalog {
             self.loop_probes.extend(group.functions.into_iter().map(|f| (f, group.raises.clone())));
         }
         self.state_namespaces.extend(file.state_namespace);
+        for BuildsOnLoopGroup { kind, slot, label, unless_passthrough, functions } in file.builds_on_loop {
+            let index = self.builders.len();
+            self.builders.push(BuildsOnLoop { kind, slot, label, unless_passthrough });
+            for name in &functions {
+                self.builds_on_loop.insert(name, index);
+            }
+        }
         for group in file.entry {
             let EntryGroup {
                 kind,
@@ -559,6 +601,7 @@ impl Catalog {
             inspector: self.inspectors.get(qualname).is_some(),
             log_dispatch: self.log_dispatch.get(qualname).is_some(),
             entry: self.entries.get(qualname).copied(),
+            builds: self.builds_on_loop.get(qualname).copied(),
         }
     }
 
@@ -589,6 +632,11 @@ impl Catalog {
     /// What registering with an entry function means, for a function whose roles are known.
     pub fn entry_of(&self, roles: Roles) -> Option<&Entry> {
         roles.entry.map(|i| &self.entry_groups[i])
+    }
+
+    /// What the function (with known roles) constructs on the loop later (`[[builds_on_loop]]`).
+    pub fn builds_on_loop_of(&self, roles: Roles) -> Option<&BuildsOnLoop> {
+        roles.builds.map(|i| &self.builders[i])
     }
 
     /// [`Catalog::entry_kind`] for a function whose roles are known.
@@ -706,6 +754,7 @@ impl Catalog {
             .chain(self.hooks.iter().map(|(f, _)| f.clone()))
             .chain(self.operations.iter().map(|(f, _)| f.clone()))
             .chain(self.entries.all())
+            .chain(self.builds_on_loop.all())
             .chain(self.entry_groups.iter().flat_map(|e| e.passthrough.iter().cloned()))
             .chain(self.state_namespaces.iter().flat_map(|n| {
                 let app = n.app.iter().flat_map(|a| a.owners.iter());

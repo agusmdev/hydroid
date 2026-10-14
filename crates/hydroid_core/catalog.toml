@@ -885,6 +885,79 @@ functions = [
 ]
 
 # ---------------------------------------------------------------------------------------------
+# Classes (or factories) given to these functions are constructed (called) by the library later,
+# on the loop: their `__init__` runs there, with the project overrides of what the library
+# `__init__` they inherit calls on `self`.
+#   kind                what running them is called in diagnostics
+#   slot                the parameters taking the class (or factory)
+#   label               how diagnostics name what reaches it (default: the function's `[[entry]]`)
+#   unless_passthrough  not when every callable the same call registers always returns one of its
+#                       entry's `passthrough` classes
+# ---------------------------------------------------------------------------------------------
+# FastAPI's `get_request_handler` constructs the response class after the endpoint returns, sync
+# endpoints included; a returned `Response` is sent as is. Starlette's `Response.__init__` calls
+# `render` and `init_headers`.
+[[builds_on_loop]]
+kind = "response rendering"
+slot = ["response_class"]
+unless_passthrough = true
+functions = [
+    "fastapi.applications.FastAPI.get",
+    "fastapi.applications.FastAPI.put",
+    "fastapi.applications.FastAPI.post",
+    "fastapi.applications.FastAPI.delete",
+    "fastapi.applications.FastAPI.options",
+    "fastapi.applications.FastAPI.head",
+    "fastapi.applications.FastAPI.patch",
+    "fastapi.applications.FastAPI.trace",
+    "fastapi.applications.FastAPI.api_route",
+    "fastapi.applications.FastAPI.add_api_route",
+    "fastapi.routing.APIRouter.get",
+    "fastapi.routing.APIRouter.put",
+    "fastapi.routing.APIRouter.post",
+    "fastapi.routing.APIRouter.delete",
+    "fastapi.routing.APIRouter.options",
+    "fastapi.routing.APIRouter.head",
+    "fastapi.routing.APIRouter.patch",
+    "fastapi.routing.APIRouter.trace",
+    "fastapi.routing.APIRouter.api_route",
+    "fastapi.routing.APIRouter.add_api_route",
+    "fastapi.routing.APIRoute.__init__",
+]
+
+[[builds_on_loop]]
+kind = "response rendering"
+label = "default response class"
+slot = ["default_response_class"]
+functions = [
+    "fastapi.applications.FastAPI.__init__",
+    "fastapi.applications.FastAPI.include_router",
+    "fastapi.routing.APIRouter.__init__",
+    "fastapi.routing.APIRouter.include_router",
+]
+
+# Starlette's `build_middleware_stack` calls the middleware factories lazily, in
+# `Starlette.__call__` on the first lifespan or request event.
+[[builds_on_loop]]
+kind = "construction"
+slot = ["middleware_class", "cls"]
+functions = ["starlette.applications.Starlette.add_middleware", "starlette.middleware.Middleware.__init__"]
+
+# Litestar (not built in; works through `[tool.hydroid]` as is): it constructs the response class
+# on the loop after the handler returns, `sync_to_thread=True` handlers included.
+# [[builds_on_loop]]
+# kind = "response rendering"
+# slot = ["response_class"]
+# functions = [
+#     "litestar.handlers.http_handlers.decorators.get.__init__",
+#     "litestar.handlers.http_handlers.decorators.post.__init__",
+#     "litestar.handlers.http_handlers.decorators.put.__init__",
+#     "litestar.handlers.http_handlers.decorators.patch.__init__",
+#     "litestar.handlers.http_handlers.decorators.delete.__init__",
+#     "litestar.handlers.http_handlers.decorators.head.__init__",
+# ]
+
+# ---------------------------------------------------------------------------------------------
 # Attribute namespaces the library types as `Any`: a read gets the class of what the project
 # stores under that name (when every store agrees).
 #   owners     classes whose instances (and subclasses') own one

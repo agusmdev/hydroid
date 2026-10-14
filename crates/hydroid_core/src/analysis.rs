@@ -1098,9 +1098,9 @@ impl<'a> Graph<'a> {
             }
             if let Value::Function(f) = flow.value
                 && self.registers(flow)
-                && self.entry_kind(flow.into) == Some("route")
+                && let Some(entry) = self.entry(flow.into)
             {
-                let passes = self.entry(flow.into).is_some_and(|e| self.passes_through(signatures.get(&f).copied(), e));
+                let passes = self.passes_through(signatures.get(&f).copied(), entry);
                 endpoints.entry((flow.caller, &flow.location)).or_default().push(passes);
             }
         }
@@ -1109,43 +1109,27 @@ impl<'a> Graph<'a> {
         let mut hooks = Vec::new();
         for flow in &self.facts.flows {
             let into = &self.facts.function(flow.into).qualname;
-            let kind = self.entry_kind(flow.into);
-            let slot = |name: &str| matches!(&flow.slot, Slot::Param(p) if p == name);
-            // `response_class=` on a route (or `default_response_class=` on the app, a router or
-            // `include_router`): `get_request_handler` constructs it on the loop after the
-            // endpoint returns, sync endpoints included, and Starlette's `Response.__init__`
-            // calls `render` and `init_headers` synchronously.
-            if let Value::Class(class) = flow.value
-                && into.starts_with("fastapi.")
-                && (slot("response_class") || slot("default_response_class"))
+            // A class (or factory) the library constructs later, on the loop (catalog
+            // `[[builds_on_loop]]`: FastAPI's `response_class`, Starlette's middleware).
+            if let Some(builds) = self.catalog.builds_on_loop_of(self.roles[flow.into.0 as usize])
+                && matches!(&flow.slot, Slot::Param(p) if builds.slot.contains(p))
             {
-                if slot("response_class")
+                if builds.unless_passthrough
                     && endpoints.get(&(flow.caller, &flow.location)).is_some_and(|e| e.iter().all(|&passes| passes))
                 {
                     continue;
                 }
-                let label = match kind {
-                    Some(kind @ "route") => entry_label(kind, into, flow),
-                    _ => "default response class".to_string(),
+                let label = match &builds.label {
+                    Some(label) => label.clone(),
+                    None => entry_label(self.entry_kind(flow.into).unwrap_or_default(), into, flow),
                 };
-                let methods = ["__init__", "render", "init_headers"].map(|m| Hierarchy::lookup(self.facts, class, m));
-                hooks.extend(methods.into_iter().flatten().map(|h| (h, format!("{label} (response rendering)"))));
-                continue;
-            }
-            // `add_middleware(cls, ...)` and `Middleware(cls, ...)` only record the factory:
-            // `build_middleware_stack` calls `cls(app, ...)` lazily, in `Starlette.__call__` on
-            // the first lifespan or request event, on the loop.
-            if kind == Some("middleware")
-                && into.starts_with("starlette.")
-                && (slot("middleware_class") || slot("cls"))
-            {
-                let factory = match flow.value {
-                    Value::Class(class) => Hierarchy::lookup(self.facts, class, "__init__"),
-                    Value::Function(f) => Some(f),
-                    Value::Param(..) => None,
+                let label = format!("{label} ({})", builds.kind);
+                let run = match flow.value {
+                    Value::Class(class) => self.construction(class),
+                    Value::Function(f) => vec![f],
+                    Value::Param(..) => Vec::new(),
                 };
-                let label = entry_label("middleware", into, flow);
-                hooks.extend(factory.map(|f| (f, format!("{label} (construction)"))));
+                hooks.extend(run.into_iter().map(|h| (h, label.clone())));
                 continue;
             }
             let Some(entry) = self.entry(flow.into) else { continue };
@@ -1376,13 +1360,39 @@ impl<'a> Graph<'a> {
         found
     }
 
+    /// What constructing `class` runs: its `__init__`, and the project overrides of what the
+    /// library `__init__`s in its MRO call on `self` (Starlette's `Response.__init__`, reached
+    /// through `JSONResponse.__init__`'s `super().__init__(...)`, calls `self.render(...)`).
+    fn construction(&self, class: ClassId) -> Vec<FnId> {
+        let mut run: Vec<FnId> = Hierarchy::lookup(self.facts, class, "__init__").into_iter().collect();
+        for c in std::iter::once(class).chain(self.ancestors(class).iter().copied()) {
+            let Some(&(_, init)) = self.facts.class(c).methods.iter().find(|(name, _)| name == "__init__") else {
+                continue;
+            };
+            if self.facts.function(init).origin != Origin::Project {
+                run.extend(self.overrides_called(init, class).iter().copied());
+            }
+        }
+        run.sort_unstable();
+        run.dedup();
+        run
+    }
+
     /// What a library `async def` method runs of the project when it runs on an instance of
     /// `receiver` (template methods: `APIKeyHeader.__call__` calls `self.check_api_key(...)`):
-    /// the project overrides, in `receiver`'s MRO, of the library methods it calls on `self`,
-    /// directly or through other library methods it calls on `self`.
+    /// see [`Graph::overrides_called`].
     fn template_hooks(&self, method: FnId, receiver: ClassId) -> Rc<[FnId]> {
+        if !self.facts.function(method).is_async {
+            return Rc::from([]);
+        }
+        self.overrides_called(method, receiver)
+    }
+
+    /// The project overrides, in `receiver`'s MRO, of the library methods a library method calls
+    /// on `self`, directly or through other library methods it calls on `self`.
+    fn overrides_called(&self, method: FnId, receiver: ClassId) -> Rc<[FnId]> {
         let f = self.facts.function(method);
-        let Some(owner) = f.class.filter(|_| f.is_async && !f.analyzed && f.origin != Origin::Project) else {
+        let Some(owner) = f.class.filter(|_| !f.analyzed && f.origin != Origin::Project) else {
             return Rc::from([]);
         };
         if let Some(found) = self.templates.borrow().get(&(method, receiver)) {
