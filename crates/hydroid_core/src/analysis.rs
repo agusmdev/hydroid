@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::catalog::{Catalog, Entry, Roles};
+use crate::catalog::{Catalog, Entry, Observer, ObserverClass, Roles};
 use crate::facts::{
     Call, ClassId, Dump, Facts, FnId, Flow, FunctionKind, Location, LoggerName, Origin, ResponseOptions, Signature, Slot,
     Value,
@@ -123,11 +123,13 @@ struct Graph<'a> {
     hooks: Vec<(FnId, String)>,
     /// See [`Graph::logging_hooks`].
     log_hooks: Vec<LogHook>,
-    /// Catalog logging calls running them, by function (empty without hooks): what they log,
-    /// and at which level (`None`: the level is an argument, `Logger.log`).
-    log_dispatch: Vec<Option<(LogCall, Option<u32>)>>,
-    /// The lowest level the project sets on a logger (see [`Graph::logger_threshold`]).
-    log_threshold: u32,
+    /// Catalog `[[observer]]` dispatches running them, by function (empty without hooks): the
+    /// group, what they dispatch, and at which level (`None`: the level is an argument,
+    /// `Logger.log`).
+    log_dispatch: Vec<Option<(usize, LogCall, Option<u32>)>>,
+    /// The lowest level the project sets on a registry, by group (see
+    /// [`Graph::logger_threshold`]).
+    log_threshold: Vec<u32>,
     /// See [`Graph::logger_stops`].
     log_stops: Vec<String>,
     /// Memoized [`Graph::validation_hooks`].
@@ -212,7 +214,7 @@ impl<'a> Graph<'a> {
             hooks: Vec::new(),
             log_hooks: Vec::new(),
             log_dispatch: Vec::new(),
-            log_threshold: 0,
+            log_threshold: Vec::new(),
             log_stops: Vec::new(),
             validated: RefCell::default(),
             ancestry: RefCell::default(),
@@ -272,21 +274,22 @@ impl<'a> Graph<'a> {
         };
         graph.log_hooks = graph.logging_hooks();
         if !graph.log_hooks.is_empty() {
-            let kind = |q: &str| {
+            let observers = catalog.observers();
+            // What a dispatch dispatches, by its last name (`levels`, `exception`).
+            let kind = |group: usize, q: &str| {
+                let observer = &observers[group];
                 let method = q.rsplit('.').next().unwrap_or_default();
-                let call = if method == "exception" { LogCall::Exception } else { LogCall::Record };
-                let level = match method {
-                    "info" => Some(20),
-                    "warning" | "warn" => Some(30),
-                    "error" | "exception" => Some(40),
-                    "critical" => Some(50),
-                    _ => None,
-                };
-                (call, level)
+                let exception = observer.exception.iter().any(|e| e == method);
+                let call = if exception { LogCall::Exception } else { LogCall::Record };
+                (group, call, observer.levels.get(method).copied())
             };
-            graph.log_dispatch =
-                facts.functions.iter().zip(&graph.roles).map(|(f, r)| r.log_dispatch.then(|| kind(&f.qualname))).collect();
-            graph.log_threshold = graph.logger_threshold();
+            graph.log_dispatch = facts
+                .functions
+                .iter()
+                .zip(&graph.roles)
+                .map(|(f, &r)| catalog.dispatch_of(r).map(|group| kind(group, &f.qualname)))
+                .collect();
+            graph.log_threshold = observers.iter().map(|o| graph.logger_threshold(o)).collect();
             graph.log_stops = graph.logger_stops();
         }
         let offloading: HashSet<(FnId, u32, u32)> = facts
@@ -499,19 +502,20 @@ impl<'a> Graph<'a> {
                 out.extend(hierarchy.super_chain(self.facts, receiver, original));
             }
         }
-        // A logging call runs the attached filters and handlers.
+        // A dispatch runs the observers attached (logging: the filters and handlers).
         let logs = call.targets.iter().find_map(|t| self.log_dispatch.get(t.0 as usize).copied().flatten());
-        if let Some((logs, fixed)) = logs {
+        if let Some((group, logs, fixed)) = logs {
             // A level that is not known counts as high enough.
             let level = fixed.or_else(|| call.level.as_ref()?.value).unwrap_or(u32::MAX);
             let in_tests = self.in_tests[call.caller.0 as usize];
             let logger = call.logging.as_ref().and_then(|l| l.logger.as_ref());
-            if level >= self.log_threshold {
+            if level >= self.log_threshold[group] {
                 out.extend(
                     self.log_hooks
                         .iter()
+                        .filter(|h| h.group == group)
                         .filter(|h| (h.outside_tests || in_tests) && h.runs_for <= logs && h.level <= level)
-                        .filter(|h| self.log_reaches(&h.scope, logger))
+                        .filter(|h| self.log_reaches(group, &h.scope, logger))
                         .map(|h| h.function),
                 );
             }
@@ -775,19 +779,32 @@ impl<'a> Graph<'a> {
         hooks
     }
 
-    /// What a logging call (catalog `log_dispatch`) runs on the calling thread besides stdlib code:
-    /// `Logger.handle` runs the logger's filters, then `Handler.handle` of every handler (its
-    /// filters, then `emit`, which formats the record). Handlers, filters and formatters count once
+    /// What the dispatches of each catalog `[[observer]]` run on the calling thread besides
+    /// library code (logging: `Logger.handle` runs the logger's filters, then `Handler.handle` of
+    /// every handler: its filters, then `emit`, which formats the record). Observers count once
     /// project code attaches them, which constructing them (or passing the class) stands for. Each
-    /// hook comes with whether it is attached outside test code (test doubles only stand in for
-    /// test code's logging), and the loggers it runs for (see [`Graph::log_scopes`]).
+    /// hook comes with its group, whether it is attached outside test code (test doubles only
+    /// stand in for test code's dispatches), and the registries it runs for (see
+    /// [`Graph::log_scopes`]).
     fn logging_hooks(&self) -> Vec<LogHook> {
+        let mut hooks: Vec<LogHook> = Vec::new();
+        for (group, observer) in self.catalog.observers().iter().enumerate() {
+            hooks.extend(self.observer_hooks(group, observer));
+        }
+        hooks
+    }
+
+    /// See [`Graph::logging_hooks`].
+    fn observer_hooks(&self, group: usize, observer: &Observer) -> Vec<LogHook> {
         let find = |name: &str| self.facts.classes.iter().position(|c| c.qualname == name).map(|i| ClassId(i as u32));
-        let (handler, filter, formatter) = (find("logging.Handler"), find("logging.Filter"), find("logging.Formatter"));
-        if handler.is_none() && filter.is_none() && formatter.is_none() {
+        let classes: Vec<(ClassId, &ObserverClass)> =
+            observer.classes.iter().filter_map(|c| Some((find(&c.base)?, c))).collect();
+        let callable: HashSet<&str> =
+            observer.attach.iter().filter(|a| a.callable).flat_map(|a| a.functions.iter().map(String::as_str)).collect();
+        if classes.is_empty() && callable.is_empty() {
             return Vec::new();
         }
-        let scopes = self.log_scopes(handler);
+        let scopes = self.log_scopes(observer, &classes);
         let mut attached: HashMap<ClassId, bool> = HashMap::default();
         let mut hooks: Vec<LogHook> = Vec::new();
         let mut attach = |class: ClassId, caller: FnId| {
@@ -807,84 +824,51 @@ impl<'a> Graph<'a> {
             }
             match flow.value {
                 Value::Class(class) => attach(class, flow.caller),
-                // A plain callable as a filter (`handler.addFilter(drop_health_checks)`).
-                Value::Function(f) if self.facts.function(flow.into).qualname == "logging.Filterer.addFilter" => {
+                // A plain callable attached (`handler.addFilter(drop_health_checks)`).
+                Value::Function(f) if callable.contains(self.facts.function(flow.into).qualname.as_str()) => {
                     let outside_tests = !self.in_tests[flow.caller.0 as usize];
                     let call = self.facts.calls.iter().find(|c| {
                         c.caller == flow.caller && c.location == flow.location && c.targets.contains(&flow.into)
                     });
                     let scope = match call {
-                        Some(call) => self.attachment_scope(call, &scopes, handler),
+                        Some(call) => self.attachment_scope(call, &scopes, observer, &classes),
                         None => None,
                     };
-                    hooks.push(LogHook { function: f, outside_tests, runs_for: LogCall::Record, level: 0, scope });
+                    hooks.push(LogHook { function: f, group, outside_tests, runs_for: LogCall::Record, level: 0, scope });
                 }
                 _ => {}
             }
         }
-        // Handlers given to a `QueueListener` emit from its thread; which ones are is not tracked.
-        let queued = attached.keys().any(|&c| self.facts.class(c).qualname == "logging.handlers.QueueListener");
-        let handler_levels = self.handler_levels();
-        let is = |class: ClassId, base: Option<ClassId>| base.is_some_and(|b| self.inherits(class, b));
-        let lookup = |class: ClassId, name: &str| Hierarchy::lookup(self.facts, class, name);
-        let analyzed = |f: &Option<FnId>| f.is_some_and(|f| self.facts.function(f).analyzed);
+        let levels = self.handler_levels(observer);
+        let is = |class: ClassId, base: ClassId| self.inherits(class, base);
         for (&class, &outside_tests) in &attached {
             let scope = scopes.get(&class).cloned().flatten();
-            let mut methods: Vec<(Option<FnId>, LogCall, u32)> = Vec::new();
-            // `Logger.callHandlers` skips handlers whose level is above the record's.
-            let level = handler_levels.get(&class).copied().unwrap_or(0);
-            let mut push = |m: Option<FnId>| methods.push((m, LogCall::Record, level));
-            if is(class, handler) && !queued {
-                let handle = lookup(class, "handle");
-                if analyzed(&handle) {
-                    push(handle);
-                } else {
-                    push(lookup(class, "filter"));
-                    let emit = lookup(class, "emit");
-                    if analyzed(&emit) {
-                        push(emit);
-                    } else {
-                        // The stdlib `emit`s format the record, and the file and socket ones do
-                        // I/O through these (catalog sinks).
-                        for m in ["format", "shouldRollover", "reopenIfNeeded", "send"] {
-                            push(lookup(class, m));
-                        }
-                    }
+            for &(base, config) in classes.iter().filter(|&&(base, _)| is(class, base)) {
+                // Observers given to an `offloaded_by` instance (`QueueListener`) run in its thread;
+                // which ones are is not tracked.
+                if attached.keys().any(|&c| config.offloaded_by.contains(&self.facts.class(c).qualname)) {
+                    continue;
                 }
+                // The registry skips an observer whose level is above the record's.
+                let level = if config.level.is_empty() { 0 } else { levels.get(&class).copied().unwrap_or(0) };
+                let _ = base;
+                hooks.extend(
+                    self.observer_methods(class, config)
+                        .into_iter()
+                        .filter(|&(m, _)| self.facts.function(m).analyzed || self.sink[m.0 as usize].is_some())
+                        .map(|(function, runs_for)| LogHook {
+                            function,
+                            group,
+                            outside_tests,
+                            runs_for,
+                            level,
+                            scope: scope.clone(),
+                        }),
+                );
             }
-            if is(class, filter) {
-                methods.push((lookup(class, "filter"), LogCall::Record, 0));
-            }
-            if is(class, formatter) {
-                let format = lookup(class, "format");
-                if analyzed(&format) {
-                    methods.push((format, LogCall::Record, 0));
-                } else {
-                    for m in ["usesTime", "formatMessage", "formatTime"] {
-                        methods.push((lookup(class, m), LogCall::Record, 0));
-                    }
-                    // `Formatter.format` formats a traceback only for records carrying one.
-                    for m in ["formatException", "formatStack"] {
-                        methods.push((lookup(class, m), LogCall::Exception, 0));
-                    }
-                }
-            }
-            hooks.extend(
-                methods
-                    .into_iter()
-                    .filter_map(|(m, runs_for, level)| Some((m?, runs_for, level)))
-                    .filter(|&(m, _, _)| self.facts.function(m).analyzed || self.sink[m.0 as usize].is_some())
-                    .map(|(function, runs_for, level)| LogHook {
-                        function,
-                        outside_tests,
-                        runs_for,
-                        level,
-                        scope: scope.clone(),
-                    }),
-            );
         }
         hooks.sort_unstable_by_key(|h| (h.function, h.outside_tests, h.runs_for, h.level));
-        // The same method attached through several classes runs for the loggers of each.
+        // The same method attached through several classes runs for the registries of each.
         hooks.dedup_by(|h, kept| {
             let same = (h.function, h.outside_tests, h.runs_for, h.level)
                 == (kept.function, kept.outside_tests, kept.runs_for, kept.level);
@@ -902,11 +886,37 @@ impl<'a> Graph<'a> {
         hooks
     }
 
-    /// The loggers the hooks of each class attached in project code run for (`None`: any). A
-    /// class counts as attached only where project code attaches it when every instance it
-    /// constructs is only attached ([`crate::facts::LogUse::attach_only`]) and the class itself is not passed
-    /// on (`dictConfig`, `handlers=[...]` lists and the like attach it anywhere).
-    fn log_scopes(&self, handler: Option<ClassId>) -> HashMap<ClassId, LogScope> {
+    /// What a dispatch runs on an observer of `class` (catalog `[[observer]]` `classes`): its
+    /// `runs` method if the project overrides it, else what the library's method calls on `self`
+    /// (`calls`), recursively; methods with nothing listed run as they are (the library ones
+    /// count only as sinks).
+    fn observer_methods(&self, class: ClassId, config: &ObserverClass) -> Vec<(FnId, LogCall)> {
+        let mut found = Vec::new();
+        let mut stack = vec![config.runs.as_str()];
+        let mut seen: HashSet<&str> = HashSet::default();
+        while let Some(name) = stack.pop() {
+            if !seen.insert(name) {
+                continue;
+            }
+            let method = Hierarchy::lookup(self.facts, class, name);
+            let overridden = method.is_some_and(|m| self.facts.function(m).analyzed);
+            match config.calls.get(name) {
+                Some(calls) if !overridden => stack.extend(calls.iter().rev().map(String::as_str)),
+                _ => {
+                    let runs_for =
+                        if config.exception_only.iter().any(|e| e == name) { LogCall::Exception } else { LogCall::Record };
+                    found.extend(method.map(|m| (m, runs_for)));
+                }
+            }
+        }
+        found
+    }
+
+    /// The registries the observers of each class attached in project code run for (`None`:
+    /// any). A class counts as attached only where project code attaches it when every instance
+    /// it constructs is only attached ([`crate::facts::LogUse::attach_only`]) and the class itself
+    /// is not passed on (`dictConfig`, `handlers=[...]` lists and the like attach it anywhere).
+    fn log_scopes(&self, observer: &Observer, classes: &[(ClassId, &ObserverClass)]) -> HashMap<ClassId, LogScope> {
         let project = |call: &Call| self.facts.function(call.caller).origin == Origin::Project;
         let mut anywhere: HashSet<ClassId> = HashSet::default();
         for call in self.facts.calls.iter().filter(|c| project(c)) {
@@ -930,62 +940,73 @@ impl<'a> Graph<'a> {
             }
         }
         let mut scopes: HashMap<ClassId, LogScope> = HashMap::default();
-        // Formatters and filters on a handler run for the loggers of the handler: handlers first.
-        let mut classes: Vec<ClassId> = attachments.keys().copied().collect();
-        classes.sort_unstable_by_key(|&c| (!handler.is_some_and(|h| self.inherits(c, h)), c));
-        for class in classes {
-            let scope = if anywhere.contains(&class) {
-                None
-            } else {
-                let mut loggers = Vec::new();
-                for call in &attachments[&class] {
-                    match self.attachment_scope(call, &scopes, handler) {
-                        Some(on) => loggers.extend(on),
-                        None => {
-                            loggers.clear();
-                            break;
+        let mut ordered: Vec<ClassId> = attachments.keys().copied().collect();
+        ordered.sort_unstable();
+        // Observers attached to an observer (a formatter on a handler) run where that one runs:
+        // a second pass sees the scopes of the first.
+        for _ in 0..2 {
+            for &class in &ordered {
+                let scope = if anywhere.contains(&class) {
+                    None
+                } else {
+                    let mut registries = Vec::new();
+                    for call in &attachments[&class] {
+                        match self.attachment_scope(call, &scopes, observer, classes) {
+                            Some(on) => registries.extend(on),
+                            None => {
+                                registries.clear();
+                                break;
+                            }
                         }
                     }
-                }
-                (!loggers.is_empty()).then_some(loggers)
-            };
-            scopes.insert(class, scope);
+                    (!registries.is_empty()).then_some(registries)
+                };
+                scopes.insert(class, scope);
+            }
         }
         scopes
     }
 
-    /// The loggers what an `addHandler(...)`, `addFilter(...)` or `setFormatter(...)` call
-    /// attaches runs for: a handler runs for its logger's records and those propagating to it, a
-    /// logger's filter only for records logged on that logger, a handler's filter or formatter
-    /// where the handler runs.
-    fn attachment_scope(&self, call: &Call, scopes: &HashMap<ClassId, LogScope>, handler: Option<ClassId>) -> LogScope {
+    /// The registries what an attachment call (catalog `[[observer]]` `attach`) attaches runs
+    /// for: attached to a registry, its records (and those of the registries below, when the
+    /// attachment `propagates`); attached to an observer, where that observer runs.
+    fn attachment_scope(
+        &self,
+        call: &Call,
+        scopes: &HashMap<ClassId, LogScope>,
+        observer: &Observer,
+        classes: &[(ClassId, &ObserverClass)],
+    ) -> LogScope {
         let logging = call.logging.as_ref()?;
-        let method = call.targets.iter().map(|&t| self.facts.function(t).qualname.as_str()).next()?;
-        match (method, &logging.logger) {
-            ("logging.Logger.addHandler", Some(logger)) if logger.exact => Some(vec![(logger.name.clone(), true)]),
-            ("logging.Filterer.addFilter", Some(logger)) if logger.exact => Some(vec![(logger.name.clone(), false)]),
-            ("logging.Filterer.addFilter" | "logging.Handler.setFormatter", None) => {
-                let receiver = call.receiver.filter(|&r| handler.is_some_and(|h| self.inherits(r, h)))?;
+        let qualname = call.targets.iter().map(|&t| self.facts.function(t).qualname.as_str()).next()?;
+        let attach = observer.attach.iter().find(|a| a.functions.iter().any(|f| f == qualname))?;
+        match &logging.logger {
+            Some(registry) if registry.exact => Some(vec![(registry.name.clone(), attach.propagates)]),
+            Some(_) => None,
+            None => {
+                let receiver = call.receiver.filter(|&r| classes.iter().any(|&(base, _)| self.inherits(r, base)))?;
                 scopes.get(&receiver).cloned().flatten()
             }
-            _ => None,
         }
     }
 
-    /// Whether a hook attached for `scope` runs for a record logged on `logger` (`None`: not
-    /// known, any logger). See `Logger.callHandlers`: the handlers of the logger and of its
-    /// ancestors, up to the first logger that does not propagate.
-    fn log_reaches(&self, scope: &LogScope, logger: Option<&LoggerName>) -> bool {
+    /// Whether a hook of `group` attached for `scope` runs for a record dispatched on `logger`
+    /// (`None`: not known, any). With hierarchical names (`scope.separator`), as
+    /// `Logger.callHandlers`: the observers of the registry and of its ancestors, up to the first
+    /// one that does not propagate (`scope.stop`).
+    fn log_reaches(&self, group: usize, scope: &LogScope, logger: Option<&LoggerName>) -> bool {
         let (Some(scope), Some(logger)) = (scope, logger) else { return true };
+        let separator = self.catalog.observers()[group].scope.as_ref().and_then(|s| s.separator.as_deref());
+        let below = |rest: &str| separator.is_some_and(|s| rest.starts_with(s));
         let under = |name: &str, ancestor: &str| {
-            ancestor.is_empty() || name == ancestor || name.strip_prefix(ancestor).is_some_and(|r| r.starts_with('.'))
+            name == ancestor || (separator.is_some() && ancestor.is_empty()) || name.strip_prefix(ancestor).is_some_and(below)
         };
         // Whether the logger is (exactly or only maybe) `name` or below it.
         let surely_under = |name: &str| {
             if logger.exact {
                 under(&logger.name, name)
             } else {
-                name.is_empty() || logger.name.strip_prefix(name).is_some_and(|r| r.starts_with('.'))
+                (separator.is_some() && name.is_empty()) || logger.name.strip_prefix(name).is_some_and(below)
             }
         };
         let maybe_under = |name: &str| surely_under(name) || (!logger.exact && name.starts_with(&logger.name));
@@ -998,34 +1019,36 @@ impl<'a> Graph<'a> {
         })
     }
 
-    /// The lowest level project code (outside tests) sets on a logger: `setLevel(...)`,
-    /// `basicConfig(level=...)`, anything for a level that is not known or for `dictConfig` /
-    /// `fileConfig`. Without any, the root logger's default, `WARNING`.
-    fn logger_threshold(&self) -> u32 {
+    /// The lowest level project code (outside tests) sets on a registry of `observer`: with its
+    /// `threshold` calls (a level not known counts as any), or anything with its `any_level` ones.
+    /// Without any, its `default_level`.
+    fn logger_threshold(&self, observer: &Observer) -> u32 {
         let mut threshold: Option<u32> = None;
         for call in &self.facts.calls {
             if self.facts.function(call.caller).origin != Origin::Project || self.in_tests[call.caller.0 as usize] {
                 continue;
             }
             for &t in &call.targets {
-                let given = call.level.as_ref().map(|l| l.value.unwrap_or(0));
-                let level = match self.facts.function(t).qualname.as_str() {
-                    "logging.Logger.setLevel" | "logging.LoggerAdapter.setLevel" => given.unwrap_or(0),
-                    "logging.basicConfig" => match given {
-                        Some(level) => level,
+                let qualname = &self.facts.function(t).qualname;
+                let level = if observer.any_level.contains(qualname) {
+                    0
+                } else if observer.threshold.contains(qualname) {
+                    // A call not giving the level leaves it.
+                    match &call.level {
+                        Some(level) => level.value.unwrap_or(0),
                         None => continue,
-                    },
-                    "logging.config.dictConfig" | "logging.config.fileConfig" => 0,
-                    _ => continue,
+                    }
+                } else {
+                    continue;
                 };
                 threshold = Some(threshold.map_or(level, |t| t.min(level)));
             }
         }
-        threshold.unwrap_or(30)
+        threshold.unwrap_or(observer.default_level.unwrap_or(0))
     }
 
-    /// The loggers that do not propagate their records to their ancestors' handlers: `propagate`
-    /// is only ever set false on them.
+    /// The registries that do not propagate their records to their ancestors' observers: the
+    /// `scope.stop` attribute is only ever set false on them.
     fn logger_stops(&self) -> Vec<String> {
         let mut stops: Vec<String> = Vec::new();
         for (name, _) in self.facts.stops_propagation.iter().filter(|(_, stops)| *stops) {
@@ -1036,10 +1059,13 @@ impl<'a> Graph<'a> {
         stops
     }
 
-    /// The level of the handlers of each class, when the project gives it: `setLevel(...)` on an
-    /// instance of the class (`self.setLevel(...)` included) or the level its constructor passes
-    /// to `Handler.__init__`, else the `level=` it is constructed with; the lowest when several.
-    fn handler_levels(&self) -> HashMap<ClassId, u32> {
+    /// The level of the observers of each class, when the project gives it (catalog
+    /// `[[observer]]` `classes.level`): a level call on an instance of the class
+    /// (`self.setLevel(...)` included) or in its own constructor (`super().__init__(level)`),
+    /// else the level it is constructed with; the lowest when several.
+    fn handler_levels(&self, observer: &Observer) -> HashMap<ClassId, u32> {
+        let setters: HashSet<&str> =
+            observer.classes.iter().flat_map(|c| c.level.iter().map(String::as_str)).collect();
         let (mut set, mut constructed): (HashMap<ClassId, u32>, HashMap<ClassId, u32>) = Default::default();
         let lower = |map: &mut HashMap<ClassId, u32>, class: ClassId, level: u32| {
             map.entry(class).and_modify(|l| *l = (*l).min(level)).or_insert(level);
@@ -1049,21 +1075,15 @@ impl<'a> Graph<'a> {
             if let Some(class) = call.constructs {
                 lower(&mut constructed, class, value);
             }
-            for &t in &call.targets {
-                match self.facts.function(t).qualname.as_str() {
-                    "logging.Handler.setLevel" => {
-                        if let Some(class) = call.level.as_ref().and_then(|l| l.receiver) {
-                            lower(&mut set, class, value);
-                        }
-                    }
-                    // `super().__init__(level=...)` in the handler's own constructor.
-                    "logging.Handler.__init__" if call.constructs.is_none() && call.level.is_some() => {
-                        if let Some(class) = self.facts.function(call.caller).class {
-                            lower(&mut set, class, value);
-                        }
-                    }
-                    _ => {}
-                }
+            if call.constructs.is_some()
+                || call.level.is_none()
+                || !call.targets.iter().any(|&t| setters.contains(self.facts.function(t).qualname.as_str()))
+            {
+                continue;
+            }
+            let receiver = call.level.as_ref().and_then(|l| l.receiver);
+            if let Some(class) = receiver.or(self.facts.function(call.caller).class) {
+                lower(&mut set, class, value);
             }
         }
         constructed.extend(set);
@@ -1734,6 +1754,8 @@ enum LogCall {
 /// See [`Graph::logging_hooks`].
 struct LogHook {
     function: FnId,
+    /// The `[[observer]]` group.
+    group: usize,
     /// Attached outside test code.
     outside_tests: bool,
     runs_for: LogCall,

@@ -24,9 +24,9 @@ struct CatalogFile {
     /// Functions that only inspect the callables passed to them (`functools.wraps(func)`).
     #[serde(default)]
     inspects: Group,
-    /// Logging calls that run the attached filters and handlers on the calling thread.
+    /// Registries running the observers attached to them on the calling thread.
     #[serde(default)]
-    log_dispatch: Group,
+    observer: Vec<Observer>,
     /// What library functions do with their arguments during the call.
     #[serde(default)]
     arguments: Vec<ArgumentGroup>,
@@ -127,6 +127,107 @@ pub struct BuildsOnLoop {
     /// Not when every callable the same call registers always returns one of its entry's
     /// `passthrough` classes (sent as they are).
     pub unless_passthrough: bool,
+}
+
+/// A registry: calls attach observers (objects of `classes`, or callables) to it, and its
+/// `dispatch` calls run them on the calling thread (stdlib `logging`: handlers, filters and
+/// formatters attached to loggers; blinker: receivers connected to signals).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Observer {
+    /// Calls running the observers attached (to the registry they are called on, or to the
+    /// root one for a module-level function).
+    pub dispatch: Vec<String>,
+    /// Calls attaching what they are given first to the registry (or observer) they are called
+    /// on.
+    #[serde(default)]
+    pub attach: Vec<Attach>,
+    /// Observer classes, and what a dispatch runs on their instances.
+    #[serde(default)]
+    pub classes: Vec<ObserverClass>,
+    /// How registries are named: an observer runs for the records of the registries it is
+    /// attached to (any, when not known).
+    #[serde(default)]
+    pub scope: Option<ObserverScope>,
+    /// The level of what each dispatch (by its last name) dispatches; the others take it as
+    /// their first argument (or at `level_keyword`).
+    #[serde(default)]
+    pub levels: HashMap<String, u32>,
+    /// Dispatches (by last name) whose records carry an exception.
+    #[serde(default)]
+    pub exception: Vec<String>,
+    /// Level names, as strings or module attributes (`logging.ERROR`).
+    #[serde(default)]
+    pub level_names: HashMap<String, u32>,
+    /// The keyword giving a level.
+    #[serde(default)]
+    pub level_keyword: Option<String>,
+    /// The level below which dispatches run nothing, unless the project sets a lower one.
+    #[serde(default)]
+    pub default_level: Option<u32>,
+    /// Calls setting that level (their first argument, or `level_keyword`).
+    #[serde(default)]
+    pub threshold: Vec<String>,
+    /// Calls that may set it to anything (configuration files).
+    #[serde(default)]
+    pub any_level: Vec<String>,
+}
+
+/// Calls attaching an observer.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Attach {
+    pub functions: Vec<String>,
+    /// Attached to a registry, it also runs for the registries below it (see
+    /// [`ObserverScope::separator`]).
+    #[serde(default)]
+    pub propagates: bool,
+    /// A plain callable may be attached: dispatches call it.
+    #[serde(default)]
+    pub callable: bool,
+}
+
+/// Observers of a class (and its subclasses): what a dispatch runs on them.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObserverClass {
+    pub base: String,
+    /// The method the registry calls.
+    pub runs: String,
+    /// What the library's methods call on `self` (the stdlib is stub-only): a method the
+    /// project does not override runs these instead.
+    #[serde(default)]
+    pub calls: HashMap<String, Vec<String>>,
+    /// Methods only run for records carrying an exception.
+    #[serde(default)]
+    pub exception_only: Vec<String>,
+    /// Calls setting the level of an observer (on it, or in its own constructor), below which
+    /// it is skipped.
+    #[serde(default)]
+    pub level: Vec<String>,
+    /// Classes whose instances, once constructed, run these observers in their own thread.
+    #[serde(default)]
+    pub offloaded_by: Vec<String>,
+}
+
+/// How registries are named (`logging.getLogger("audit")`).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObserverScope {
+    /// Calls returning the registry named by their first argument (or `keyword`); with no
+    /// name, the root.
+    pub naming: Vec<String>,
+    #[serde(default)]
+    pub keyword: Option<String>,
+    /// A name (and a module attribute) standing for the root registry.
+    #[serde(default)]
+    pub root: Option<String>,
+    /// Names are hierarchical: `a.b` is below `a`, and everything is below the root.
+    #[serde(default)]
+    pub separator: Option<String>,
+    /// An attribute that, set `False` on a registry, keeps records from going up from it.
+    #[serde(default)]
+    pub stop: Option<String>,
 }
 
 /// An attribute namespace the library types as `Any` (`app.state`): reading `<namespace>.name`
@@ -499,7 +600,8 @@ pub struct Roles {
     pub offload: bool,
     pub loop_callback: bool,
     pub inspector: bool,
-    pub log_dispatch: bool,
+    /// The `[[observer]]` group it dispatches for.
+    dispatch: Option<usize>,
     /// The entry-point kind it registers.
     entry: Option<usize>,
     /// The `[[builds_on_loop]]` group it belongs to.
@@ -530,7 +632,8 @@ pub struct Catalog {
     offload: Patterns<()>,
     loop_callbacks: Patterns<()>,
     inspectors: Patterns<()>,
-    log_dispatch: Patterns<()>,
+    dispatches: Patterns<usize>,
+    observers: Vec<Observer>,
     arguments: Patterns<usize>,
     argument_effects: Vec<Arguments>,
     /// The last segment of every `arguments` name (`None`: a pattern ends in `*`).
@@ -585,8 +688,12 @@ impl Catalog {
         for name in &file.inspects.functions {
             self.inspectors.insert(name, ());
         }
-        for name in &file.log_dispatch.functions {
-            self.log_dispatch.insert(name, ());
+        for observer in file.observer {
+            let index = self.observers.len();
+            for name in &observer.dispatch {
+                self.dispatches.insert(name, index);
+            }
+            self.observers.push(observer);
         }
         for ArgumentGroup { calls, iterates, enters, methods, lazy, factory, names, functions } in file.arguments {
             let index = self.argument_effects.len();
@@ -656,7 +763,7 @@ impl Catalog {
             offload: self.offload.get(qualname).is_some(),
             loop_callback: self.loop_callbacks.get(qualname).is_some(),
             inspector: self.inspectors.get(qualname).is_some(),
-            log_dispatch: self.log_dispatch.get(qualname).is_some(),
+            dispatch: self.dispatches.get(qualname).copied(),
             entry: self.entries.get(qualname).copied(),
             builds: self.builds_on_loop.get(qualname).copied(),
         }
@@ -756,9 +863,14 @@ impl Catalog {
         self.inspectors.get(qualname).is_some()
     }
 
-    /// Whether calling `qualname` runs the filters and handlers attached to the loggers.
-    pub fn is_log_dispatch(&self, qualname: &str) -> bool {
-        self.log_dispatch.get(qualname).is_some()
+    /// The `[[observer]]` groups, in order (their index identifies them).
+    pub fn observers(&self) -> &[Observer] {
+        &self.observers
+    }
+
+    /// The `[[observer]]` a function (with known roles) dispatches for, by index.
+    pub fn dispatch_of(&self, roles: Roles) -> Option<usize> {
+        roles.dispatch
     }
 
     /// What `qualname` does with its arguments.
@@ -815,7 +927,14 @@ impl Catalog {
             .chain(self.offload.all())
             .chain(self.loop_callbacks.all())
             .chain(self.inspectors.all())
-            .chain(self.log_dispatch.all())
+            .chain(self.observers.iter().flat_map(|o| {
+                let attach = o.attach.iter().flat_map(|a| a.functions.iter());
+                let classes = o.classes.iter().flat_map(|c| {
+                    std::iter::once(&c.base).chain(&c.level).chain(&c.offloaded_by)
+                });
+                let naming = o.scope.iter().flat_map(|s| s.naming.iter());
+                o.dispatch.iter().chain(attach).chain(classes).chain(naming).chain(&o.threshold).chain(&o.any_level).cloned()
+            }))
             .chain(self.arguments.all())
             .chain(self.loop_probes.iter().flat_map(|(f, raises)| [f.clone(), raises.clone()]))
             .chain(self.hooks.iter().map(|(f, _)| f.clone()))

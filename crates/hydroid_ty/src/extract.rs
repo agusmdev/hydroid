@@ -1,6 +1,8 @@
 //! Walks function bodies and records calls (with their resolved callees) and callable flows.
 
-use hydroid_core::catalog::{ArgumentSlot, Arguments, Catalog, Entry, Hook, HookFields, HookPhase, KeywordValues, RunsHooks};
+use hydroid_core::catalog::{
+    ArgumentSlot, Arguments, Catalog, Entry, Hook, HookFields, HookPhase, KeywordValues, ObserverScope, RunsHooks,
+};
 use hydroid_core::facts::{Accessor, Dump, Location, LoggerName, Origin};
 use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
@@ -261,6 +263,20 @@ pub struct CatalogKeys<'c> {
     pub expiry: FxHashMap<Key, Expiry<'c>>,
     /// `[[lazy_attribute]]` `raises_under` classes.
     pub raises_under: Vec<Key>,
+    /// `[[observer]]` dispatches and attachments.
+    pub dispatches: FxHashSet<Key>,
+    pub attaches: FxHashSet<Key>,
+    /// The last names of `[[observer]]` attachments (a file without them attaches nothing).
+    pub attach_names: FxHashSet<&'c str>,
+    /// `[[observer]]` calls naming registries, with how.
+    pub naming: FxHashMap<Key, &'c ObserverScope>,
+    /// `[[observer]]` calls taking a level as their first argument.
+    pub level_first: FxHashSet<Key>,
+    /// `[[observer]]` `level_keyword`s, `level_names`, and the `root` and `stop` names.
+    pub level_keywords: Vec<&'c str>,
+    pub level_names: FxHashMap<&'c str, u32>,
+    pub roots: Vec<&'c str>,
+    pub stops: Vec<&'c str>,
     /// `[[entry]]` `passthrough` classes, with their catalog names.
     pub passthrough: Vec<(Key, &'c str)>,
     /// `[[entry]]` functions with `injects`: where a call to them takes the provider (the
@@ -299,8 +315,8 @@ pub fn extract_file(
         iterated: FxHashSet::default(),
         returned_classes: RefCell::default(),
         callees: FxHashSet::default(),
-        attach_only: if ATTACHES.iter().any(|m| index.text(parsed.syntax().range()).contains(m)) {
-            attach_only(&parsed.syntax().body)
+        attach_only: if shared.keys.attach_names.iter().any(|m| index.text(parsed.syntax().range()).contains(m)) {
+            attach_only(&parsed.syntax().body, &shared.keys.attach_names)
         } else {
             FxHashSet::default()
         },
@@ -422,12 +438,6 @@ fn excluded_fields(call: &ast::ExprCall, keyword: &str) -> Vec<String> {
     exclude
 }
 
-
-/// Logger methods logging a record.
-const LOGS: &[&str] = &["debug", "info", "warning", "warn", "error", "exception", "critical", "fatal", "log"];
-
-/// Methods attaching a handler, filter or formatter to a logger or handler.
-const ATTACHES: &[&str] = &["addHandler", "addFilter", "setFormatter"];
 
 /// A parameter a function hands on: its position (if it can be passed positionally) and name.
 type HandedParam = (Option<usize>, String);
@@ -1681,8 +1691,8 @@ impl<'a, 'db> Extractor<'a, 'db> {
         } else {
             Vec::new()
         };
-        let level = self.level_argument(call);
-        let logging = self.log_use(call, resolution.constructs.is_some());
+        let level = self.level_argument(call, &resolution.targets);
+        let logging = self.log_use(call, resolution.constructs.is_some(), &resolution.targets);
         self.out.calls.push(RawCall {
             caller: self.current,
             location,
@@ -1819,17 +1829,22 @@ impl<'a, 'db> Extractor<'a, 'db> {
         self.keys.hooks.get(&key).copied().filter(|h| !h.callable.is_empty())
     }
 
-    fn log_use(&self, call: &ast::ExprCall, constructs: bool) -> Option<(Option<LoggerName>, Option<Key>, bool)> {
+    fn log_use(
+        &self,
+        call: &ast::ExprCall,
+        constructs: bool,
+        targets: &[(Key, bool)],
+    ) -> Option<(Option<LoggerName>, Option<Key>, bool)> {
         if constructs {
             return self.attach_only.contains(&call.start().to_u32()).then_some((None, None, true));
         }
         let Expr::Attribute(attr) = &*call.func else { return None };
-        let attaching = ATTACHES.contains(&attr.attr.as_str());
-        if !attaching && !LOGS.contains(&attr.attr.as_str()) {
+        let attaching = targets.iter().any(|(k, _)| self.keys.attaches.contains(k));
+        if !attaching && !targets.iter().any(|(k, _)| self.keys.dispatches.contains(k)) {
             return None;
         }
         let logger = if matches!(attr.value.inferred_type(self.model), Some(Type::ModuleLiteral(_))) {
-            // `logging.info(...)` logs on the root logger.
+            // A module-level dispatch (`logging.info(...)`) dispatches on the root registry.
             Some(LoggerName { name: String::new(), exact: true })
         } else {
             self.logger_name(self.model, &attr.value, 0)
@@ -1843,23 +1858,28 @@ impl<'a, 'db> Extractor<'a, 'db> {
         Some((logger, attaches, false))
     }
 
-    /// The name of the logger an expression (in the file of `model`) evaluates to:
-    /// `logging.getLogger("audit")`, `getLogger(__name__)`, `getLogger(f"svc.{name}")` (only the
-    /// start known), `logging.root`, a variable assigned one, or the call of a function returning
-    /// one. `None` when not known.
+    /// The name of the registry an expression (in the file of `model`) evaluates to (catalog
+    /// `[[observer]]` `scope`): `logging.getLogger("audit")`, `getLogger(__name__)` (the module),
+    /// `getLogger(f"svc.{name}")` (only the start known), the root (`logging.root`), a variable
+    /// assigned one, or the call of a function returning one. `None` when not known.
     fn logger_name(&self, model: &SemanticModel<'db>, expr: &Expr, depth: u8) -> Option<LoggerName> {
         if depth > 4 {
             return None;
         }
         let db = model.db();
-        let exact = |name: &str| {
-            // `getLogger("root")` is the root logger too.
-            let name = if name == "root" { "" } else { name };
-            Some(LoggerName { name: name.to_string(), exact: true })
+        let naming = |call: &ast::ExprCall| {
+            let key = crate::index::callee_key(model, &call.func)?;
+            self.keys.naming.get(&key).copied()
         };
         match expr {
-            Expr::Call(call) if called_name(call) == Some("getLogger") => {
-                let argument = call.arguments.args.first().or(call.arguments.find_keyword("name").map(|k| &k.value));
+            Expr::Call(call) if let Some(scope) = naming(call) => {
+                let exact = |name: &str| {
+                    // `getLogger("root")` is the root logger too.
+                    let name = if scope.root.as_deref() == Some(name) { "" } else { name };
+                    Some(LoggerName { name: name.to_string(), exact: true })
+                };
+                let keyword = scope.keyword.as_deref().and_then(|k| call.arguments.find_keyword(k));
+                let argument = call.arguments.args.first().or(keyword.map(|k| &k.value));
                 match argument {
                     None | Some(Expr::NoneLiteral(_)) => exact(""),
                     Some(Expr::StringLiteral(s)) => exact(s.value.to_str()),
@@ -1884,8 +1904,9 @@ impl<'a, 'db> Extractor<'a, 'db> {
                     _ => None,
                 }
             }
-            Expr::Attribute(attr) if attr.attr.as_str() == "root" => {
-                matches!(attr.value.inferred_type(model), Some(Type::ModuleLiteral(_))).then(|| exact(""))?
+            Expr::Attribute(attr) if self.keys.roots.contains(&attr.attr.as_str()) => {
+                let root = LoggerName { name: String::new(), exact: true };
+                matches!(attr.value.inferred_type(model), Some(Type::ModuleLiteral(_))).then_some(root)
             }
             Expr::Name(name) => {
                 let mut found: Option<LoggerName> = None;
@@ -1933,10 +1954,11 @@ impl<'a, 'db> Extractor<'a, 'db> {
         }
     }
 
-    /// `logger.propagate = value` (see [`hydroid_core::facts::Facts::stops_propagation`]).
+    /// `logger.propagate = value`, for an `[[observer]]` `scope` `stop` attribute (see
+    /// [`hydroid_core::facts::Facts::stops_propagation`]).
     fn propagation(&mut self, target: &Expr, value: &Expr) {
         let Expr::Attribute(attr) = target else { return };
-        if attr.attr.as_str() != "propagate" {
+        if !self.keys.stops.contains(&attr.attr.as_str()) {
             return;
         }
         if let Some(LoggerName { name, exact: true }) = self.logger_name(self.model, &attr.value, 0) {
@@ -1944,38 +1966,33 @@ impl<'a, 'db> Extractor<'a, 'db> {
         }
     }
 
-    /// The logging level a call passes: its `level=` keyword, or the first argument of
-    /// `setLevel(...)` (with the class of the receiver), `log(...)` and `__init__(...)`. See
+    /// The level a call passes (catalog `[[observer]]`): at a `level_keyword`, or as the first
+    /// argument of the calls taking one there (`setLevel(...)`, with the class of the receiver;
+    /// `log(...)`; `super().__init__(logging.ERROR)` in a handler). See
     /// [`hydroid_core::facts::Call::level`].
-    fn level_argument(&self, call: &ast::ExprCall) -> Option<(Option<u32>, Option<Key>)> {
-        if let Some(keyword) = call.arguments.find_keyword("level") {
+    fn level_argument(&self, call: &ast::ExprCall, targets: &[(Key, bool)]) -> Option<(Option<u32>, Option<Key>)> {
+        if let Some(keyword) = self.keys.level_keywords.iter().find_map(|k| call.arguments.find_keyword(k)) {
             return Some((self.level_value(&keyword.value), None));
         }
-        let Expr::Attribute(attr) = &*call.func else { return None };
-        let first = call.arguments.args.first().filter(|a| !a.is_starred_expr())?;
-        match attr.attr.as_str() {
-            "setLevel" => Some((self.level_value(first), self.receiver_class(&attr.value))),
-            // `super().__init__(logging.ERROR)` in a `logging.Handler` subclass.
-            "log" | "__init__" => Some((self.level_value(first), None)),
-            _ => None,
+        if !targets.iter().any(|(k, _)| self.keys.level_first.contains(k)) {
+            return None;
         }
-    }
-
-    /// `logging.ERROR`, `ERROR`, `40`, `"ERROR"`, or a name ty knows the literal value of.
-    fn level_value(&self, expr: &Expr) -> Option<u32> {
-        let named = |name: &str| match name {
-            "NOTSET" => Some(0),
-            "DEBUG" => Some(10),
-            "INFO" => Some(20),
-            "WARN" | "WARNING" => Some(30),
-            "ERROR" => Some(40),
-            "FATAL" | "CRITICAL" => Some(50),
+        let first = call.arguments.args.first().filter(|a| !a.is_starred_expr())?;
+        let receiver = match &*call.func {
+            Expr::Attribute(attr) => self.receiver_class(&attr.value),
             _ => None,
         };
+        Some((self.level_value(first), receiver))
+    }
+
+    /// A level: a name in `[[observer]]` `level_names` (a string, or an attribute of a module:
+    /// `logging.ERROR`), a number, or a name ty knows the literal value of.
+    fn level_value(&self, expr: &Expr) -> Option<u32> {
+        let named = |name: &str| self.keys.level_names.get(name).copied();
         match expr {
             Expr::StringLiteral(s) => named(s.value.to_str()),
             Expr::NumberLiteral(n) => n.value.as_int().and_then(|i| i.as_u16()).map(u32::from),
-            Expr::Attribute(attr) if matches!(&*attr.value, Expr::Name(n) if n.id.as_str() == "logging") => {
+            Expr::Attribute(attr) if matches!(attr.value.inferred_type(self.model), Some(Type::ModuleLiteral(_))) => {
                 named(attr.attr.as_str())
             }
             _ => {
@@ -3200,13 +3217,14 @@ fn contains_await(expr: &Expr) -> bool {
     finder.0
 }
 
-/// Constructions whose instance is only attached to a logger or handler (see
-/// [`hydroid_core::facts::LogUse::attach_only`]): the argument of `addHandler(...)`,
-/// `addFilter(...)` or `setFormatter(...)`, or assigned to a function's variable that is only
-/// passed to those or has methods called on it (`handler.setLevel(...)`).
-fn attach_only(body: &[Stmt]) -> FxHashSet<u32> {
-    #[derive(Default)]
-    struct Uses<'a> {
+/// Constructions whose instance is only attached to a registry or an observer (see
+/// [`hydroid_core::facts::LogUse::attach_only`]): the argument of a call named like an
+/// `[[observer]]` attachment (`addHandler(...)`, `addFilter(...)`, `setFormatter(...)`), or
+/// assigned to a function's variable that is only passed to those or has methods called on it
+/// (`handler.setLevel(...)`).
+fn attach_only(body: &[Stmt], attaches: &FxHashSet<&str>) -> FxHashSet<u32> {
+    struct Uses<'a, 'n> {
+        attaches: &'n FxHashSet<&'n str>,
         functions: Vec<&'a ast::StmtFunctionDef>,
         assigned: Vec<(&'a str, u32)>,
         stores: Vec<&'a str>,
@@ -3215,7 +3233,7 @@ fn attach_only(body: &[Stmt]) -> FxHashSet<u32> {
         direct: FxHashSet<u32>,
         attached: FxHashSet<u32>,
     }
-    impl<'a> SourceOrderVisitor<'a> for Uses<'a> {
+    impl<'a> SourceOrderVisitor<'a> for Uses<'a, '_> {
         fn visit_stmt(&mut self, stmt: &'a Stmt) {
             if let Stmt::FunctionDef(def) = stmt {
                 self.functions.push(def);
@@ -3234,7 +3252,7 @@ fn attach_only(body: &[Stmt]) -> FxHashSet<u32> {
                         if let Expr::Name(name) = &*attr.value {
                             self.attached.insert(name.start().to_u32());
                         }
-                        if ATTACHES.contains(&attr.attr.as_str()) {
+                        if self.attaches.contains(attr.attr.as_str()) {
                             match call.arguments.args.first() {
                                 Some(Expr::Call(argument)) => {
                                     self.direct.insert(argument.start().to_u32());
@@ -3256,11 +3274,20 @@ fn attach_only(body: &[Stmt]) -> FxHashSet<u32> {
             walk_expr(self, expr);
         }
     }
-    let mut module = Uses::default();
+    let new = || Uses {
+        attaches,
+        functions: Vec::new(),
+        assigned: Vec::new(),
+        stores: Vec::new(),
+        loads: Vec::new(),
+        direct: FxHashSet::default(),
+        attached: FxHashSet::default(),
+    };
+    let mut module = new();
     module.visit_body(body);
     let mut found = std::mem::take(&mut module.direct);
     for def in module.functions {
-        let mut uses = Uses::default();
+        let mut uses = new();
         uses.visit_body(&def.body);
         for (name, call) in &uses.assigned {
             let assigned_once = uses.stores.iter().filter(|s| *s == name).count() == 1;

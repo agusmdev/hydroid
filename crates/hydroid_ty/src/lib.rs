@@ -109,6 +109,32 @@ fn catalog_keys<'c>(db: &HydroidDb, indexes: &Indexes, catalog: &'c Catalog) -> 
             keys.operations.insert(key, operation);
         }
     }
+    for observer in catalog.observers() {
+        let definitions = |names: &[String]| -> Vec<Key> {
+            names.iter().flat_map(|n| catalog_definitions(db, indexes, n)).collect()
+        };
+        keys.dispatches.extend(definitions(&observer.dispatch));
+        for attach in &observer.attach {
+            keys.attaches.extend(definitions(&attach.functions));
+            keys.attach_names.extend(attach.functions.iter().filter_map(|f| f.rsplit('.').next()));
+        }
+        if let Some(scope) = &observer.scope {
+            keys.naming.extend(definitions(&scope.naming).into_iter().map(|k| (k, scope)));
+            keys.roots.extend(scope.root.as_deref());
+            keys.stops.extend(scope.stop.as_deref());
+        }
+        // Dispatches without a level of their own take it as their first argument.
+        let unleveled: Vec<String> = observer
+            .dispatch
+            .iter()
+            .filter(|d| !d.rsplit('.').next().is_some_and(|m| observer.levels.contains_key(m)))
+            .cloned()
+            .collect();
+        let setters = observer.classes.iter().flat_map(|c| c.level.iter()).chain(&observer.threshold).cloned();
+        keys.level_first.extend(definitions(&setters.chain(unleveled).collect::<Vec<_>>()));
+        keys.level_keywords.extend(observer.level_keyword.as_deref());
+        keys.level_names.extend(observer.level_names.iter().map(|(n, &l)| (n.as_str(), l)));
+    }
     for name in catalog.offloads() {
         keys.offloads.extend(catalog_definitions(db, indexes, &name));
     }

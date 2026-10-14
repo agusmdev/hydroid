@@ -208,9 +208,9 @@ functions = [
     "shutil._RmtreeType.__call__",
 ]
 
-# Stdlib handlers doing I/O in `emit`, which a logging call runs on the calling thread (see
-# `[log_dispatch]`). Typeshed declares no `emit` on them: these are the methods their `emit`
-# calls on every record.
+# Stdlib handlers doing I/O in `emit`, which a logging call runs on the calling thread (see the
+# logging `[[observer]]`). Typeshed declares no `emit` on them: these are the methods their
+# `emit` calls on every record.
 [[sink]]
 category = "file"
 advice = "log through a `logging.handlers.QueueHandler` and attach the handler to a `QueueListener`, which emits from its own thread"
@@ -426,15 +426,36 @@ functions = [
 ]
 
 # ---------------------------------------------------------------------------------------------
-# Logging calls that hand the record to the filters and handlers attached to the loggers, on the
-# calling thread (`Logger._log -> handle -> callHandlers -> Handler.handle -> filter / emit`).
-# The `filter`, `emit` and `format` overrides of the project's `logging.Filter`,
-# `logging.Handler` and `logging.Formatter` subclasses (and the I/O of the stdlib handlers above)
-# run there, for records at or above the logger and handler levels the project sets. `debug` is
-# left out: below the levels applications run with, it returns before any filter or handler runs.
+# Registries running the observers attached to them on the calling thread.
+#   dispatch       calls running the observers attached (to the registry they are called on, or
+#                  to the root one for a module-level function)
+#   attach         { functions, propagates, callable }: calls attaching what they are given
+#                  first to the registry (or observer) they are called on; `propagates`: it also
+#                  runs for the registries below; `callable`: a plain callable may be attached
+#   classes        { base, runs, calls, exception_only, level, offloaded_by }: what a dispatch
+#                  runs on an attached instance of `base`: `runs`, or, where the project does not
+#                  override it, what the library's method calls on `self` (`calls`, by method);
+#                  `exception_only` methods only for records with an exception; `level`: calls
+#                  setting the observer's level; `offloaded_by`: classes whose instances, once
+#                  constructed, run these observers in their own thread
+#   scope          { naming, keyword, root, separator, stop }: calls naming registries (first
+#                  argument, or `keyword`; none: the root), a name (and module attribute) for the
+#                  root, the separator of hierarchical names, and the attribute that, set
+#                  `False`, keeps records from going up
+#   levels         the level each dispatch (by last name) gives; the others take it as an
+#                  argument (first, or `level_keyword`)
+#   exception      dispatches (by last name) whose records carry an exception
+#   level_names    level names, as strings or module attributes
+#   default_level  dispatches below it run nothing, unless the project sets a lower `threshold`
+#   threshold      calls setting that level; `any_level`: calls that may set it to anything
 # ---------------------------------------------------------------------------------------------
-[log_dispatch]
-functions = [
+# stdlib logging (`Logger._log -> handle -> callHandlers -> Handler.handle -> filter / emit`):
+# the `filter`, `emit` and `format` overrides of the project's handlers, filters and formatters
+# (and the I/O of the stdlib handlers above) run there, for records at or above the logger and
+# handler levels the project sets. `debug` is left out: below the levels applications run with,
+# it returns before any filter or handler runs.
+[[observer]]
+dispatch = [
     "logging.Logger.info",
     "logging.Logger.warning",
     "logging.Logger.warn",
@@ -457,6 +478,31 @@ functions = [
     "logging.critical",
     "logging.log",
 ]
+attach = [
+    { functions = ["logging.Logger.addHandler"], propagates = true },
+    { functions = ["logging.Filterer.addFilter"], callable = true },
+    { functions = ["logging.Handler.setFormatter"] },
+]
+classes = [
+    { base = "logging.Handler", runs = "handle", calls = { handle = ["filter", "emit"], emit = ["format", "shouldRollover", "reopenIfNeeded", "send"] }, level = ["logging.Handler.setLevel", "logging.Handler.__init__"], offloaded_by = ["logging.handlers.QueueListener"] },
+    { base = "logging.Filter", runs = "filter" },
+    { base = "logging.Formatter", runs = "format", calls = { format = ["usesTime", "formatMessage", "formatTime", "formatException", "formatStack"] }, exception_only = ["formatException", "formatStack"] },
+]
+scope = { naming = ["logging.getLogger"], keyword = "name", root = "root", separator = ".", stop = "propagate" }
+levels = { info = 20, warning = 30, warn = 30, error = 40, exception = 40, critical = 50 }
+exception = ["exception"]
+level_names = { NOTSET = 0, DEBUG = 10, INFO = 20, WARN = 30, WARNING = 30, ERROR = 40, FATAL = 50, CRITICAL = 50 }
+level_keyword = "level"
+default_level = 30
+threshold = ["logging.Logger.setLevel", "logging.LoggerAdapter.setLevel", "logging.basicConfig"]
+any_level = ["logging.config.dictConfig", "logging.config.fileConfig"]
+
+# blinker (not built in; works through `[tool.hydroid]` as is): `Signal.send` calls the receivers
+# connected to the signal, in the sending thread; `signal("name")` names it.
+# [[observer]]
+# dispatch = ["blinker.base.Signal.send"]
+# attach = [{ functions = ["blinker.base.Signal.connect"], callable = true }]
+# scope = { naming = ["blinker.base.Namespace.signal"], keyword = "name" }
 
 # ---------------------------------------------------------------------------------------------
 # What functions do with their arguments, in the thread calling them (stub and library bodies are
