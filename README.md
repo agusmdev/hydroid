@@ -111,95 +111,34 @@ drop it and the upload step to fail the build instead.
 ## How it works
 
 1. **Facts** (`crates/hydroid_ty`, the only crate that touches ty): every function body is walked
-   in parallel; each call is resolved to its definitions through ty (types, then
-   go-to-definition), including implicit calls (`with`, `for` and comprehensions, properties
-   and their setters, descriptors, operators like `x[k]` and `k in x` on user classes,
-   `__getattr__`, iterators' `__next__`, constructors with `__post_init__`, pydantic
-   validators and the `default_factory` of fields the call does not give, builtins and
-   `contextlib` helpers that iterate, enter or call their arguments like `sorted(xs, key=f)`,
-   `stack.enter_context(cm)` or `copy_context().run(f)`, `singledispatch` implementations, SQLAlchemy
-   `@validates` validators run by `Model(field=...)` and `obj.field = ...`, and reads of lazily
-   loaded `relationship()` attributes, which query through `Session.execute` unless the
-   relationship is eager (`lazy="selectin"`, ...) or the function loads it with an eager option
-   like `selectinload(Model.attr)`, or it was already loaded off the loop: the instance was
-   returned by (or passed to) an awaited offloaded helper that reads the relationship or
-   refreshes it by name, with no `commit()`/`expire` in between). Callables passed as arguments are recorded as flows
-   (`to_thread(f)`, `Depends(dep)`, `on_startup=[f]`, decorators), and so are callables stored
-   on `self` and returned by functions. Calls through dispatch tables (`TABLE[key](...)`, or
-   `send = TABLE[key]; send(...)`, where `TABLE` is a dict, list or tuple literal) resolve to the
-   callables stored there, only the one under `key` when the key is a literal. When ty does not know a value's type because it comes
-   from an unannotated function, the class that function returns is used; an unannotated
-   `client=Depends(provider)` parameter holds what the provider returns (or yields). Objects read
-   back from state, which Starlette types as `Any`, get the class the project stores under that
-   name (`app.state.x = ...` for `request.app.state.x`; a lifespan's `yield {"x": ...}` or
-   `request.state.x = ...` for `request.state.x`) when every store agrees on it, and
-   `request.app` is the project's one `FastAPI` subclass, if it defines one. Signatures record
-   what FastAPI validates and serializes: the models (and `AfterValidator`-style callables) in
-   parameter annotations, the return annotation, the classes returned, whether every return
-   gives a `Response` (sent as is); model fields record their nested models and their
-   `Annotated` validators and serializers (through type aliases), which constructions giving
-   the field data and `model_dump()` calls run. The facts of an unchanged project are reused from `.hydroid_cache/` (keyed by the
-   binary, the options, the installed packages and every source file's contents).
-2. **Analysis** (`crates/hydroid_core`, plain graph code): where code runs is a property of the
-   call, so "does calling `f` block?" is computed once per function by a backwards BFS from
-   blocking functions — shortest witness chains, no recursion, any depth. Diagnostics are the
-   call sites inside loop code (`async def` bodies, sync callbacks scheduled on the loop) whose
-   callee blocks. Pydantic code FastAPI runs on the loop is loop code too: validators of request
-   parameters and bodies (of `def` endpoints and dependencies as well: only their bodies go to
-   the threadpool), computed fields and serializers of the response, and response-model
-   validators of `async def` endpoints, and the `render`/`__init__` of a `response_class=` (or
-   `default_response_class=`) FastAPI constructs after every endpoint. A logging call
-   (`logger.info(...)` and above; `debug` is below the levels applications run with) runs the
-   `filter`/`emit`/`format` overrides of the `logging.Filter`, `logging.Handler` and
-   `logging.Formatter` subclasses the project constructs, and the file and socket I/O of the
-   stdlib rotating, watched and socket handlers, when the record's level reaches the lowest
-   logger level the project sets (`WARNING` when it sets none) and the handler's level. A hook
-   the project only attaches with `addHandler`/`addFilter`/`setFormatter` runs only for the
-   loggers it is attached to: a handler for records of its logger and the loggers below it (by
-   dotted name, up to one with `propagate = False`), a logger's filter only for that logger's
-   own records; logger names come from `getLogger("x")`, `getLogger(__name__)`, the literal start
-   of an f-string, and `logging.info(...)` logs on the root logger. Records of a logger whose
-   name is not known may reach any hook. Offload APIs cut the graph; callbacks are attributed to the call site passing
-   them; overrides are found by class-hierarchy analysis (test doubles only stand in for real
-   classes in test code), narrowed by what is known about the instance: a construction
-   (`Model().refresh()`, or a variable only ever assigned constructions) runs the methods its
-   class's MRO finds, and the type arguments of a generic class (`TagService(BaseService[TagRepo])`,
-   `service: BaseService[TagRepo]`) pick the implementation behind its type-variable attributes
-   (`self.repo.list_ids()`), also for the `self.name(...)` calls of the methods it runs (methods
-   are analyzed once per such instance); a library `async def` method running on an instance of a project
-   subclass (`Security(scheme)`, `await scheme(request)`) runs the project's overrides of the
-   library methods it calls on `self` (`APIKeyHeader.__call__` calling `self.check_api_key(...)`),
-   without `--follow-libs`, and so does a project callable assigned over a library method on an
-   instance (`app.openapi = custom_openapi`, which FastAPI's `/openapi.json` route calls); calling
-   a generator function (or a generator `__iter__` through `iter(obj)`, or a `@contextmanager`
-   function) runs nothing until the generator is iterated (or the context manager entered),
-   also through a variable (`rows = iter(export)` ... `for row in rows`), and the elements of a
-   generator expression or `map`/`filter` given to a `StreamingResponse`, or to an offload API
-   with the consumer pulling them (`to_thread(list, map(f, xs))`), are computed in the
-   threadpool; a decorated function is reached through its decorator's wrappers only when they call
-   it (not when they only hand it to an offload API, or to `functools.wraps`), and calling what
-   a blocking decorator returns when applied by hand (`safe = retrying.wraps(fetch); safe()`)
-   blocks like a decorated function. A sync library method overriding a catalog function of a
-   library base class (`sqlmodel`'s `Session.execute`) blocks like it, and the target of
-   `with conn.cursor() as cur:` is typed as the context manager's class when its unannotated
-   `__enter__` returns `self` (PyMySQL). Starting an event
-   loop (`asyncio.run`) is only reported when loop code does it directly: sync bridges reaching
-   it almost always check for a running loop first. Code in the `except RuntimeError:` of a `try`
-   that only calls `asyncio.get_running_loop()` runs only when no loop is running: it is skipped.
-3. **Catalog** (`crates/hydroid_core/catalog.toml`): blocking functions, offload APIs, loop
-   callback APIs, functions that only inspect callables (`functools.wraps`) and FastAPI entry
-   points, by defining qualified name. A test checks every name
-   exists in a real environment.
+   in parallel, and each call is resolved through ty to the functions it can run, implicit calls
+   included (`with`, `for`, properties, descriptors, operators, constructors). Callables passed
+   as arguments, stored on instances or returned are recorded as flows. What a library does
+   that its source does not show (stub-only stdlib, frameworks calling project code later) comes
+   from the catalog. The facts of an unchanged project are reused from `.hydroid_cache/`.
+2. **Analysis** (`crates/hydroid_core`, plain graph code): "does calling `f` block?" is computed
+   once per function by a backwards search from blocking functions, giving shortest witness
+   chains. Diagnostics are the call sites in loop code (`async def` bodies, callbacks the loop
+   runs, code a framework runs on the loop around an entry point) whose callee blocks. Offload
+   APIs cut the graph. Overrides are found by class hierarchy, narrowed by what is known about
+   the instance (or argument). Generators run when iterated, not when called.
+3. **Catalog** (`crates/hydroid_core/catalog.toml`): library knowledge as data, by defining
+   qualified name. It covers:
+   - what blocks, and what offloads or schedules on the loop;
+   - what functions do with their arguments;
+   - framework entry points and what the framework runs around them;
+   - model hooks, observers (logging), lazily loaded attributes, and state namespaces.
+   Library knowledge goes here, not in the Rust code. Every table can be extended from
+   `pyproject.toml`, and a test checks that every name exists in a real environment.
 
-Sync `def` endpoints and dependencies are not reported: FastAPI runs them in a threadpool.
+Sync `def` endpoints and dependencies are not reported: FastAPI runs them in a threadpool. The
+details, and what hydroid knowingly misses: [docs/GUIDE.md](docs/GUIDE.md#12-how-it-works).
 
 ## Limits
 
 Python is dynamic: calls through `getattr`, untyped parameters, or containers of callables cannot
-always be resolved. They are never silently dropped — `--strict` lists every one reachable on the
-loop. Not modeled yet: `getattr(obj, "name")`, containers of callables (`HANDLERS[kind]()`),
-metaclasses, and `.pyi`-only libraries under `--follow-libs`. A change to any source file re-extracts the whole
-project (no per-file incremental cache yet).
+always be resolved. They are never silently dropped: `--strict` lists every one reachable on the
+loop. What hydroid knowingly misses, and why: [docs/GUIDE.md](docs/GUIDE.md#known-limits).
 
 ## Development
 

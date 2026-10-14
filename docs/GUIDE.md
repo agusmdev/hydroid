@@ -165,7 +165,7 @@ a class name stands for constructing the class.
 | `[loop_callback]` | callables passed to these run on the event loop later | `functions` |
 | `[inspects]` | callables passed to these are only inspected, never called | `functions` |
 | `[[arguments]]` | what these functions do with their arguments, in the calling thread | `functions`, and any of: `calls` (callables given there are called), `iterates` (iterables given there are iterated), `enters` (context managers given there are entered and exited), `methods` (methods called on the first positional argument), `lazy` (the call returns a lazy iterator: iterating it iterates what `iterates` names, and what `calls` names runs where it is consumed); for calls declaring a field in a class body, `factory` (constructing the class without the field calls the callable given there) and `names` (string literals giving other names of the field) |
-| `[[hook]]` | these decorators make the method they decorate a hook its class runs when validated (`runs = "validation"`: constructing it, or validating data into it) or dumped (`runs = "dump"`); with `callable`, these classes or functions, called in the `Annotated[...]` metadata of a field, attach the callable given at that slot to the field | `runs`, `functions`; `callable`, `fields` (`"arguments"`: the fields the decorator's call names, `"name"`: the field named like the decorated function), `json_only` (`{ keyword, values }`: a dump hook only runs for JSON dumps when its call gives the keyword one of these values) |
+| `[[hook]]` | these decorators make the method they decorate a hook its class runs when validated (`runs = "validation"`: constructing it, or validating data into it), dumped (`runs = "dump"`), or when the fields it names are set on an instance (`runs = "set"`: `obj.email = ...`, constructor keywords included); with `callable`, these classes or functions, called in the `Annotated[...]` metadata of a field, attach the callable given at that slot to the field | `runs`, `functions`; `callable`, `fields` (`"arguments"`: the fields the decorator's call names, `"name"`: the field named like the decorated function), `json_only` (`{ keyword, values }`: a dump hook only runs for JSON dumps when its call gives the keyword one of these values) |
 | `[[runs_hooks]]` | these operations run the `runs` hooks of the class they are called on (a class object or an instance) | `runs`, `functions`; for dumps `json`, `json_unless` (`{ keyword, values }`: given, the dump is to JSON unless the value is one of these), `exclude` and `include` (keywords naming top-level fields left out, or the only ones dumped) |
 | `[[loop_probe]]` | these functions raise `raises` (a class) when no event loop runs in the calling thread: the handlers catching it (or a base) of a `try` doing nothing but call them never run on the loop | `raises`, `functions` |
 | `[[entry]]` | callables passed to these are framework entry points | `kind`, `functions`; `slot` (the parameters taking what is registered; a decorator registers what it decorates; default: any argument); what the framework runs on the loop around it: `validates_params` (validates its annotated parameters, or those of a class's `__init__`), `serializes_return` (dumps what it returns, sync callables included), `validates_return` (validates what it returns into the response model, in the thread it runs in: only `async def` ones on the loop); `response_model` (the keyword giving the response model, `None` for none; default: the return annotation), `response_exclude` (the keyword naming top-level fields left out of the dump), `passthrough` (classes sent as is: a callable always returning them skips the return hooks); `injects` (a parameter whose default, or `Annotated` metadata, is a call to these is filled with what the callable at the first `slot` provides, and not validated from the request) |
@@ -234,3 +234,104 @@ has a coding agent set all of this up for you: [AGENT_SETUP.md](AGENT_SETUP.md).
 
 `--format json` prints the full report: `diagnostics` (location, function, chain, sink,
 reached_from), `unresolved`, and `stats` (files, functions, call sites resolved, timings).
+
+## 12. How it works
+
+### Facts
+
+Every function body is walked in parallel, and each call is resolved through ty (types, then
+go-to-definition) to the functions it can run. Implicit calls are included:
+- `with`, `for` and comprehensions;
+- properties and their setters, descriptors, `__getattr__`;
+- operators like `x[k]` and `k in x` on project classes, and iterators' `__next__`;
+- constructors, with `__post_init__`, model validators and the default factories of fields the
+  call does not give (`[[arguments]]` `factory`).
+
+The catalog adds what library code does with its arguments (`[[arguments]]`), such as
+`sorted(xs, key=f)`, `stack.enter_context(cm)` or `copy_context().run(f)`. Callables passed as
+arguments are recorded as flows (`to_thread(f)`, `Depends(dep)`, `on_startup=[f]`,
+decorators), and so are callables stored on instances and returned by functions. Calls through
+dispatch tables (`TABLE[key](...)` on a dict, list or tuple literal) resolve to the callables
+stored there, only the one under `key` when the key is a literal. When ty does not know a
+value's type because it comes from an unannotated function, the class that function returns is
+used.
+
+Objects read back from a namespace the library types as `Any` (`[[state_namespace]]`:
+`app.state.x`, `request.state.x`, a lifespan's `yield {"x": ...}`) get the class the project
+stores under that name, when every store agrees. Signatures record what a framework validates
+and serializes around an entry point (`[[entry]]`): the models in parameter annotations, the
+response model or return annotation, the classes returned, and whether every return gives a
+`passthrough` class. Model fields record their nested models and their `Annotated` validators
+and serializers (`[[hook]]`).
+
+The facts of an unchanged project are reused from `.hydroid_cache/`, keyed by the binary, the
+options, the installed packages and every source file's contents.
+
+### Analysis
+
+Where code runs is a property of the call, so "does calling `f` block?" is computed once per
+function by a backwards search from blocking functions: shortest witness chains, no recursion,
+any depth. Diagnostics are the call sites inside loop code whose callee blocks. Loop code is:
+- `async def` bodies;
+- sync callbacks scheduled on the loop (`[loop_callback]`);
+- what a framework runs on the loop around what is registered with an `[[entry]]`: validating
+  the parameters (sync endpoints included, only their bodies go to the threadpool), validating
+  and dumping the return value, and constructing the classes it builds later
+  (`[[builds_on_loop]]`, like a `response_class` and the self-calls of its `__init__`).
+
+Offload APIs cut the graph, and callbacks are attributed to the call site passing them. A lazy
+iterable handed to a library function that passes it on to an offload API is consumed in the
+worker (Starlette's `StreamingResponse(content)`), as is one given to an offload API with its
+consumer (`to_thread(list, map(f, xs))`).
+
+Overrides are found by class-hierarchy analysis (test doubles only stand in for real classes in
+test code), narrowed by what is known:
+- a construction (`Model().refresh()`, or a variable only ever assigned constructions) runs the
+  methods its class's MRO finds;
+- a function given such an instance as an argument (`checksum(io.BytesIO(data))`) is analyzed
+  for it, so `stream.read()` in it is `BytesIO.read`;
+- the type arguments of a generic class (`TagService(BaseService[TagRepo])`) pick the
+  implementation behind its type-variable attributes.
+Methods are analyzed once per such instance.
+
+A library `async def` method running on an instance of a project subclass
+(`Security(scheme)`) runs the project's overrides of the library methods it calls on `self`,
+without `--follow-libs`. So does a project callable assigned over a library method on an
+instance (`app.openapi = custom_openapi`).
+
+Calling a generator function (or a decorated one whose call ty types as a context manager or an
+iterator) runs nothing until it is iterated (entered). A decorated function is reached through
+its decorator's wrappers only when they call it.
+
+Some library code is described in the catalog, because its source does not show it:
+- Observers (`[[observer]]`): a logging call runs the handlers, filters and formatters the
+  project attaches, only for the loggers they are attached to and the records their levels let
+  through.
+- Lazily loaded attributes (`[[lazy_attribute]]`): reading a lazy SQLAlchemy relationship
+  queries, unless an eager option loaded it, an async session holds it, or it was already
+  loaded off the loop.
+- Hooks run on attribute set (`[[hook]]`, `runs = "set"`): SQLAlchemy's `@validates`.
+
+Code in the `except RuntimeError:` of a `try` that only probes for a running loop
+(`[[loop_probe]]`) runs only when no loop is running: it is skipped. Starting an event loop
+(`asyncio.run`) is only reported when loop code does it directly.
+
+### Known limits
+
+Python is dynamic: calls through `getattr`, untyped parameters, or containers of callables cannot
+always be resolved. They are never silently dropped: `--strict` lists every unresolved call
+reachable on the loop. Not modeled yet:
+- `getattr(obj, "name")` and containers of callables (`HANDLERS[kind]()`);
+- metaclasses;
+- `.pyi`-only libraries under `--follow-libs`.
+
+Classes never instantiated: a virtual call on a base class only dispatches to the overrides of
+subclasses that can have instances. A class can have instances if:
+- project code names it;
+- it is decorated or given class keywords (a registry may create it);
+- it is a `Protocol`;
+- an ancestor defines `__init_subclass__`.
+A class created only by name lookup (`getattr(module, name)()`, `importlib`, a string registry)
+looks never instantiated, and its overrides are missed: a recall limit, not a false positive.
+
+A change to any source file re-extracts the whole project (no per-file incremental cache yet).
