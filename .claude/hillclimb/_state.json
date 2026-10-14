@@ -341,6 +341,21 @@
       ],
       "polar_cold_ms_median": 11478,
       "polar_warm_ms_median": 378
+    },
+    {
+      "round": 17,
+      "lever": "stub packages; level literals",
+      "change": "PEP 561 <pkg>-stubs packages name the module <pkg> (catalog names match with stubs installed; --follow-libs follows the implementation behind a stub); logging levels read from where ty finds them defined instead of ty's type display (AUDIT L17)",
+      "train_recall": "161/161",
+      "train_fp": 0,
+      "holdout_recall": "4/34",
+      "holdout_fp": 0,
+      "holdout_set": "48ec61bf2a43",
+      "holdout_baseline": "4/34 recorded in round 16",
+      "results": ".claude/hillclimb/recall/v16",
+      "ratcheted_to_train": [],
+      "polar_cold_ms_median": 10009,
+      "polar_warm_ms_median": 348
     }
   ],
   "ground_truth": "scripts/hillclimb/oracle_runtime.py via check.py: a case is promoted only when the runtime proves every line where hydroid disagrees (verdict BREAKS), or with a reviewer's note",
