@@ -247,6 +247,10 @@ pub struct Call {
     /// See [`Instance`]: set on `obj.name(...)` calls whose dispatch depends on more than the
     /// declared class of `obj`.
     pub instance: Option<Box<Instance>>,
+    /// `(parameter, class)`: arguments that are exactly an instance of a class (`io.BytesIO()`,
+    /// or a variable only ever assigned such constructions), by the callee's parameter.
+    #[serde(default)]
+    pub exact_args: Vec<(String, ClassId)>,
     /// The callees are decorated generator functions, and what the call returns is a context
     /// manager or an iterator (`@contextmanager`): their bodies run when it is entered or
     /// iterated (`iterates`), not now.
@@ -280,6 +284,10 @@ pub struct Instance {
     /// type specializes each to (`TagService(BaseService[TagRepository])`: `repo`,
     /// `TagRepository`).
     pub binds: Vec<(String, ClassId)>,
+    /// `obj` is this parameter of the calling function (not its receiver, never assigned in
+    /// it): which `name` runs depends on what each caller passes (see [`Call::exact_args`]).
+    #[serde(default)]
+    pub param: Option<String>,
 }
 
 /// The arguments of a pydantic dump that decide which serializers run.

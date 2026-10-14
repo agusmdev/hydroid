@@ -767,9 +767,16 @@ impl<'a> Merger<'a> {
     fn instance(&mut self, raw: RawInstance) -> Option<Instance> {
         let exact: Option<Vec<ClassId>> = raw.exact.iter().map(|&k| self.class_id(k)).collect();
         let binds = raw.binds.into_iter().filter_map(|(name, k)| Some((name, self.class_id(k)?))).collect();
-        let instance = Instance { name: raw.name, is_self: raw.is_self, generic: raw.generic, exact: exact.unwrap_or_default(), binds };
-        (instance.is_self || instance.generic.is_some() || !instance.exact.is_empty() || !instance.binds.is_empty())
-            .then_some(instance)
+        let instance = Instance {
+            name: raw.name,
+            is_self: raw.is_self,
+            generic: raw.generic,
+            exact: exact.unwrap_or_default(),
+            binds,
+            param: raw.param,
+        };
+        let narrows = instance.is_self || instance.generic.is_some() || !instance.exact.is_empty();
+        (narrows || !instance.binds.is_empty() || instance.param.is_some()).then_some(instance)
     }
 
     fn merge(&mut self, file_facts: FileFacts) {
@@ -796,6 +803,23 @@ impl<'a> Merger<'a> {
             let level = raw.level.map(|(value, receiver)| Level { value, receiver: receiver.and_then(|k| self.class_id(k)) });
             let receiver = raw.receiver.and_then(|k| self.class_id(k));
             let instance = raw.instance.and_then(|i| self.instance(i));
+            // Positional arguments land on the parameter at their position (after the receiver).
+            let exact_args = match raw.targets[..] {
+                [(key, bound)] => {
+                    let index = self.index(key.0);
+                    let entry = &index.functions[&key.1];
+                    let skip = usize::from(bound && entry.class.is_some());
+                    let named = |slot: RawSlot| match slot {
+                        RawSlot::Keyword(name) => Some(name),
+                        RawSlot::Positional(i) => (i + skip < entry.positional).then(|| entry.params[i + skip].clone()),
+                        RawSlot::Decorated => None,
+                    };
+                    let found: Vec<(String, Key)> =
+                        raw.exact_args.into_iter().filter_map(|(slot, class)| Some((named(slot)?, class))).collect();
+                    found.into_iter().filter_map(|(name, class)| Some((name, self.class_id(class)?))).collect()
+                }
+                _ => Vec::new(),
+            };
             let logging = raw.logging.map(|(logger, attaches, attach_only)| LogUse {
                 logger,
                 attaches: attaches.and_then(|k| self.class_id(k)),
@@ -828,6 +852,7 @@ impl<'a> Merger<'a> {
                 super_name: raw.super_name,
                 logging: logging.map(Box::new),
                 instance: instance.map(Box::new),
+                exact_args,
                 lazy_in: raw.lazy_in,
                 deferred_body: raw.deferred_body,
             });

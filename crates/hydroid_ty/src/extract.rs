@@ -69,6 +69,8 @@ pub struct RawCall {
     pub instance: Option<RawInstance>,
     /// See [`hydroid_core::facts::Call::lazy_in`].
     pub lazy_in: Option<(u32, u32)>,
+    /// See [`hydroid_core::facts::Call::exact_args`].
+    pub exact_args: Vec<(RawSlot, Key)>,
     pub deferred_body: bool,
 }
 
@@ -79,6 +81,7 @@ pub struct RawInstance {
     pub generic: Option<String>,
     pub exact: Vec<Key>,
     pub binds: Vec<(String, Key)>,
+    pub param: Option<String>,
 }
 
 /// What code can run implicitly, from the definitions indexed so far.
@@ -305,6 +308,7 @@ pub fn extract_file(
         keys,
         call_arguments: RefCell::default(),
         offloaded_params: RefCell::default(),
+        assigned: RefCell::default(),
         lazy_reads: Vec::new(),
         model: &model,
         index,
@@ -451,6 +455,8 @@ struct Extractor<'a, 'db> {
     keys: &'a CatalogKeys<'a>,
     /// Memoized [`Extractor::call_arguments`], by call offset.
     call_arguments: RefCell<FxHashMap<u32, Option<&'a Arguments>>>,
+    /// Memoized [`Extractor::assigned_names`].
+    assigned: RefCell<FxHashMap<u32, std::rc::Rc<FxHashSet<String>>>>,
     /// Memoized [`Extractor::offloaded_params`].
     offloaded_params: RefCell<FxHashMap<Key, Vec<HandedParam>>>,
     /// Lazy relationship reads recorded: `(function, location, relationship)`.
@@ -648,7 +654,66 @@ impl<'a, 'db> Extractor<'a, 'db> {
                 }
             }
         }
-        Some(RawInstance { name: attr.attr.to_string(), is_self, generic, exact, binds })
+        // A parameter of this function the body never assigns.
+        let param = match receiver {
+            Expr::Name(name) if !is_self && self.param_of(receiver).is_some_and(|(owner, _)| owner == self.current) => {
+                (!self.assigned_names(self.current).contains(name.id.as_str())).then(|| name.id.to_string())
+            }
+            _ => None,
+        };
+        Some(RawInstance { name: attr.attr.to_string(), is_self, generic, exact, binds, param })
+    }
+
+    /// The names a function assigns in its own scope. Memoized.
+    fn assigned_names(&self, function: u32) -> std::rc::Rc<FxHashSet<String>> {
+        if let Some(found) = self.assigned.borrow().get(&function) {
+            return found.clone();
+        }
+        struct Stores(FxHashSet<String>);
+        impl<'b> SourceOrderVisitor<'b> for Stores {
+            fn visit_stmt(&mut self, stmt: &'b Stmt) {
+                if !matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                    walk_stmt(self, stmt);
+                }
+            }
+            fn visit_expr(&mut self, expr: &'b Expr) {
+                if let Expr::Name(name) = expr
+                    && name.ctx == ExprContext::Store
+                {
+                    self.0.insert(name.id.to_string());
+                }
+                walk_expr(self, expr);
+            }
+        }
+        let db = self.model.db();
+        let parsed = parsed_module(db, self.model.python_file()).load(db);
+        let mut stores = Stores(FxHashSet::default());
+        if let Some(def) = find_function(parsed.syntax(), function) {
+            stores.visit_body(&def.body);
+        }
+        let found = std::rc::Rc::new(stores.0);
+        self.assigned.borrow_mut().insert(function, found.clone());
+        found
+    }
+
+    /// See [`hydroid_core::facts::Call::exact_args`]: for calls of project functions only (the
+    /// others are not specialized).
+    fn exact_args(&self, call: &ast::ExprCall, resolution: &Resolution) -> Vec<(RawSlot, Key)> {
+        let [(target, _)] = resolution.targets[..] else { return Vec::new() };
+        if resolution.constructs.is_some() || describe(self.db, target.0).1 != Origin::Project {
+            return Vec::new();
+        }
+        let positional = call.arguments.args.iter().take_while(|a| !a.is_starred_expr()).enumerate();
+        let keywords = call.arguments.keywords.iter().filter_map(|k| Some((RawSlot::Keyword(k.arg.as_ref()?.to_string()), &k.value)));
+        positional
+            .map(|(i, a)| (RawSlot::Positional(i), a))
+            .chain(keywords)
+            .filter(|(_, a)| matches!(a, Expr::Call(_) | Expr::Name(_)))
+            .filter_map(|(slot, a)| match self.exact_classes(self.model, a, 0)[..] {
+                [class] => Some((slot, class)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The classes `expr` is exactly an instance of: a construction (`Model()`), or a variable
@@ -1038,6 +1103,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
             instance: None,
             lazy_in: None,
             deferred_body: false,
+            exact_args: Vec::new(),
         });
     }
 
@@ -1408,6 +1474,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
                 instance: None,
                 lazy_in: None,
                 deferred_body: false,
+                exact_args: Vec::new(),
             });
         }
     }
@@ -1594,6 +1661,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
             instance: None,
             lazy_in: None,
             deferred_body: false,
+            exact_args: Vec::new(),
         });
     }
 
@@ -1661,6 +1729,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
         let dump = operation.filter(|o| o.runs == HookPhase::Dump).map(|o| dump(o, call));
         let validates = operation.is_some_and(|o| o.runs == HookPhase::Validation);
         self.response_options(call, &location, &resolution);
+        let exact_args = self.exact_args(call, &resolution);
         let unresolved =
             (resolution.targets.is_empty() && param.is_none()).then_some(resolution.reason);
         // The declarative constructor sets each keyword argument on the new instance.
@@ -1719,6 +1788,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
             instance,
             lazy_in: None,
             deferred_body,
+            exact_args,
         });
     }
 
@@ -2262,6 +2332,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
             instance: None,
             lazy_in: None,
             deferred_body: false,
+            exact_args: Vec::new(),
         });
     }
 
@@ -2953,6 +3024,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Extractor<'_, '_> {
                         instance: None,
                         lazy_in: None,
                         deferred_body: false,
+                        exact_args: Vec::new(),
                     });
                 }
                 walk_expr(self, expr);
