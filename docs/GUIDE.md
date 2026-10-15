@@ -50,7 +50,8 @@ hydroid .                      # the project root (where your package lives)
 hydroid backend --python .venv # project in a subdirectory, venv elsewhere
 ```
 
-Exit status: `0` nothing found, `1` blocking calls found, `2` hydroid could not run.
+Exit status: `0` nothing found, `1` blocking calls found (only critical ones with
+`--fail-on critical`), `2` hydroid could not run.
 
 ## 4. Read a finding
 
@@ -70,6 +71,27 @@ error[blocking-http]: `requests.api.get` blocks the event loop
 - `reached from` is the FastAPI entry point (route, dependency, middleware, …) that gets there.
 - `blocking chain` walks from that call down to the function that blocks.
 - `help` suggests the non-blocking alternative.
+
+### Severity: `error` or `warning`
+
+Every finding blocks the event loop. While the loop is blocked, **every** request on that worker
+waits, not only the one making the call. What differs is how long, and how often:
+
+| Shown as | Severity | The call | Examples |
+|---|---|---|---|
+| `error[...]` | critical | can block for a long or unknown time: it waits on the network, another process or thread, a timer or a person; or it is slow by design, or raises on the loop | HTTP clients, database drivers, `subprocess`, locks, `Future.result()`, `time.sleep`, retry loops, `input()`, `bcrypt` (with `--cpu`), `asyncio.run` |
+| `warning[...]` | warn | blocks for a short, bounded time on the local machine | `Path.exists`, `os.stat`, small `open()` / `read_text()` / `write_text()`, `mkdir`, temporary files, rotating log files |
+
+A critical call that only runs while the server starts or stops (`lifespan`, startup and
+shutdown handlers) is shown as a warning, with a note: it slows the start, not the traffic. A
+task the lifespan starts (`asyncio.create_task(poll())`) runs while the server serves requests
+and keeps its severity, and so does code that requests reach too.
+
+When a call reaches several blocking functions, the chain shows the worst one: a helper that
+checks a file and then makes an HTTP request is critical, and its chain leads to the request.
+
+Fix the errors first. Warnings matter under heavy load, and on network file systems where a
+`stat` is a network round trip. To fail CI only on errors, use `--fail-on critical`.
 
 Typical fixes:
 
@@ -116,6 +138,7 @@ Awaiting an API is never blocking: `await redis.asyncio.Redis().get(k)` is fine,
 | `--follow-libs` | `follow-libs` | also analyze installed libraries' code (finds blocking inside dependencies) |
 | `--cpu` | `cpu` | also report CPU-heavy calls (bcrypt, pbkdf2, scrypt) |
 | `--strict` | `strict` | list calls hydroid could not resolve, and fail on them |
+| `--fail-on warn\|critical` | `fail-on` | the lowest severity that makes hydroid exit `1` (default `warn`: any finding) |
 | `--exclude GLOB` | `exclude` | skip files, e.g. `migrations/**` (repeatable) |
 | `--no-cache` | | do not reuse or save extracted facts in `.hydroid_cache/` |
 | `--format human\|json\|sarif` | | output format |
@@ -128,6 +151,7 @@ python = ".venv"
 exclude = ["migrations/**", "scripts/**"]
 follow-libs = false
 strict = false
+fail-on = "warn"
 ```
 
 ## 7. Teach it about your own blocking functions
@@ -138,6 +162,7 @@ Add sinks (by the **defining** module path of the function) in `pyproject.toml`:
 [[tool.hydroid.sink]]
 category = "sdk"
 advice = "use AcmeAsyncClient"
+severity = "critical"              # default; "warn" for short, local work
 functions = [
     "acme.client.Client.fetch",
     "acme.client.Client.*",       # `*` matches within one dotted segment
@@ -159,7 +184,7 @@ a class name stands for constructing the class.
 
 | Table | Says | Fields |
 |---|---|---|
-| `[[sink]]` | these functions block | `category`, `advice`, `functions`; `direct` (only calls made directly from loop code count), `opt_in` (only with `--cpu`), `unless_given` (keyword arguments that make a call skip the blocking work), `blocks_in` (the function to name in diagnostics) |
+| `[[sink]]` | these functions block | `category`, `advice`, `functions`; `direct` (only calls made directly from loop code count), `opt_in` (only with `--cpu`), `unless_given` (keyword arguments that make a call skip the blocking work), `blocks_in` (the function to name in diagnostics), `severity` (`"critical"`, the default, or `"warn"`; see [Severity](#severity-error-or-warning)) |
 | `[[blocking_decorator]]` | sync functions decorated with these block | as `[[sink]]` |
 | `[offload]` | callables passed to these run in a worker thread | `functions`; `copies` (those that may run it in another process, on a pickled copy: an exit stack's `close` handed there leaves the original full) |
 | `[loop_callback]` | callables passed to these run on the event loop later | `functions` |
@@ -168,7 +193,7 @@ a class name stands for constructing the class.
 | `[[hook]]` | these decorators make the method they decorate a hook its class runs when validated (`runs = "validation"`: constructing it, or validating data into it), dumped (`runs = "dump"`), or when the fields it names are set on an instance (`runs = "set"`: `obj.email = ...`, constructor keywords included); with `callable`, these classes or functions, called in the `Annotated[...]` metadata of a field, attach the callable given at that slot to the field | `runs`, `functions`; `callable`, `fields` (`"arguments"`: the fields the decorator's call names, `"name"`: the field named like the decorated function), `json_only` (`{ keyword, values }`: a dump hook only runs for JSON dumps when its call gives the keyword one of these values) |
 | `[[runs_hooks]]` | these operations run the `runs` hooks of the class they are called on (a class object or an instance) | `runs`, `functions`; for dumps `json`, `json_unless` (`{ keyword, values }`: given, the dump is to JSON unless the value is one of these), `exclude` and `include` (keywords naming top-level fields left out, or the only ones dumped) |
 | `[[loop_probe]]` | these functions raise `raises` (a class) when no event loop runs in the calling thread: the handlers catching it (or a base) of a `try` doing nothing but call them never run on the loop | `raises`, `functions` |
-| `[[entry]]` | callables passed to these are framework entry points | `kind`, `functions`; `slot` (the parameters taking what is registered; a decorator registers what it decorates; default: any argument); what the framework runs on the loop around it: `validates_params` (validates its annotated parameters, or those of a class's `__init__`), `serializes_return` (dumps what it returns, sync callables included), `validates_return` (validates what it returns into the response model, in the thread it runs in: only `async def` ones on the loop); `response_model` (the keyword giving the response model, `None` for none; default: the return annotation), `response_exclude` (the keyword naming top-level fields left out of the dump), `passthrough` (classes sent as is: a callable always returning them skips the return hooks); `injects` (a parameter whose default, or `Annotated` metadata, is a call to these is filled with what the callable at the first `slot` provides, and not validated from the request) |
+| `[[entry]]` | callables passed to these are framework entry points | `kind`, `functions`; `slot` (the parameters taking what is registered; a decorator registers what it decorates; default: any argument); what the framework runs on the loop around it: `validates_params` (validates its annotated parameters, or those of a class's `__init__`), `serializes_return` (dumps what it returns, sync callables included), `validates_return` (validates what it returns into the response model, in the thread it runs in: only `async def` ones on the loop); `response_model` (the keyword giving the response model, `None` for none; default: the return annotation), `response_exclude` (the keyword naming top-level fields left out of the dump), `passthrough` (classes sent as is: a callable always returning them skips the return hooks); `injects` (a parameter whose default, or `Annotated` metadata, is a call to these is filled with what the callable at the first `slot` provides, and not validated from the request); `runs_once` (`true`, or the parameters taking it: what is registered only runs while the server starts or stops, so the critical findings it alone reaches are shown as warnings) |
 | `[[builds_on_loop]]` | a class (or a factory) given to these at `slot` is constructed (called) by the library later, on the loop: its `__init__` runs there, with the project overrides of what the library `__init__` it inherits calls on `self` (`Response.__init__` calls `self.render`) | `kind` (what running it is called in diagnostics), `slot`, `functions`; `label` (how diagnostics name what reaches it; default: the function's `[[entry]]`), `unless_passthrough` (not when every callable the same call registers always returns one of its entry's `passthrough` classes) |
 | `[[lazy_attribute]]` | `name = factory(...)` in a class body makes reading `instance.name` load it, running `loads`, unless it is already loaded (SQLAlchemy's `relationship()`) | `factories`, `loads`; `keyword` and `lazy` (the factory's keyword choosing how it loads, and its literal values that load on read; without the keyword, it does), `eager` (options loading the attributes they name up front), `expires_all` and `expires` (calls expiring every loaded attribute, or those of the instance given first), `reload` (`{ functions, names }`: calls loading the attributes named at `names` on the instance given first; given none, they expire it), `raises_under` (classes under which a load raises instead of blocking: a function naming one loads nothing) |
 | `[[observer]]` | a registry: `attach` calls attach observers (instances of `classes`, or callables) to the registry they are called on, and its `dispatch` calls run them on the calling thread (stdlib logging handlers, filters and formatters; blinker receivers through `[tool.hydroid]`, see the commented example in `catalog.toml`) | `dispatch`; `attach` (`{ functions, propagates, callable }`), `classes` (`{ base, runs, calls, exception_only, level, offloaded_by }`: what runs on an attached instance: `runs`, or what the library's methods call on `self` where the project does not override them), `scope` (`{ naming, keyword, root, separator, stop }`: how registries are named; observers only run for the registries they are attached to); logging only: `levels`, `exception`, `level_names`, `level_keyword`, `default_level`, `threshold`, `any_level` |
@@ -198,8 +223,9 @@ The comment goes on the line hydroid reports (the `-->` line).
 
 Python is dynamic; some calls cannot be resolved statically (`getattr(obj, name)()`, untyped
 parameters, callables stored in dicts). hydroid never drops them silently: the summary line counts
-them, and `--strict` lists each one reachable on the loop (except awaited calls, assumed to run a
-coroutine) and exits `1`. Adding type annotations
+them, and `--strict` lists each one reachable on the loop as `note[unresolved-call]` (except
+awaited calls, assumed to run a coroutine) and exits `1`. A note is not a finding: it says what
+hydroid could not check. Adding type annotations
 usually resolves them.
 
 ## 10. CI (GitHub code scanning)
@@ -235,7 +261,10 @@ has a coding agent set all of this up for you: [AGENT_SETUP.md](AGENT_SETUP.md).
 ## 11. JSON output
 
 `--format json` prints the full report: `diagnostics` (location, function, chain, sink,
-reached_from), `unresolved`, and `stats` (files, functions, call sites resolved, timings).
+reached_from, `severity`, and `runs_once` when only the start or stop of the server runs it),
+`unresolved`, and `stats` (files, functions, call sites resolved, timings). `sink.severity` is the
+catalog severity, before `runs_once` lowers it. In SARIF, critical findings have level `error`,
+warn ones `warning`, unresolved calls `note`.
 
 ## 12. How it works
 
@@ -298,7 +327,11 @@ options, the installed packages and every source file's contents.
 
 Where code runs is a property of the call, so "does calling `f` block?" is computed once per
 function by a backwards search from blocking functions: shortest witness chains, no recursion,
-any depth. Diagnostics are the call sites inside loop code whose callee blocks. Loop code is:
+any depth. The search runs twice, from critical blocking functions and from all of them, so a
+call's chain leads to its worst one. Diagnostics are the call sites inside loop code whose callee
+blocks. A diagnostic is one severity lower when its loop code is reached from `runs_once` entry
+points only (through calls, and awaited coroutines: a coroutine created without `await` may run
+later), and from no other entry point or callback the loop runs. Loop code is:
 - `async def` bodies;
 - sync callbacks scheduled on the loop (`[loop_callback]`);
 - what a framework runs on the loop around what is registered with an `[[entry]]`: validating

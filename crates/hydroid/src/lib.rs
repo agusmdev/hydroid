@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use hydroid_core::analysis::analyze;
 use hydroid_core::catalog::Catalog;
-pub use hydroid_core::report::Report;
+pub use hydroid_core::report::{Report, Severity};
 use hydroid_ty::{ExtractOptions, extract};
 
 #[derive(Clone, Debug, Default)]

@@ -133,3 +133,43 @@ fn unchanged_projects_reuse_cached_facts() {
     hydroid(&dir, &["--no-cache"]);
     assert!(!dir.join(".hydroid_cache").exists());
 }
+
+#[test]
+fn severity_levels_and_fail_on() {
+    let warn_only = "from pathlib import Path\n\n\nasync def handler():\n    Path('x').exists()\n";
+    let dir = project("severity-warn", &[("app.py", warn_only)]);
+    let output = hydroid(&dir, &[]);
+    let human = String::from_utf8_lossy(&output.stdout);
+    assert!(human.starts_with("warning[blocking-file]"), "{human}");
+    assert!(human.contains("1 blocking call on the event loop (0 critical, 1 warn)"), "{human}");
+    assert_eq!(output.status.code(), Some(1), "any blocking call fails by default");
+    assert_eq!(hydroid(&dir, &["--fail-on", "critical"]).status.code(), Some(0));
+    assert_eq!(hydroid(&dir, &["--fail-on", "warn"]).status.code(), Some(1));
+    let sarif = json(&hydroid(&dir, &["--format", "sarif"]));
+    assert_eq!(sarif["runs"][0]["results"][0]["level"], "warning");
+    assert_eq!(sarif["runs"][0]["results"][0]["properties"]["severity"], "warn");
+    let report = json(&hydroid(&dir, &["--format", "json"]));
+    assert_eq!(report["diagnostics"][0]["severity"], "warn");
+    assert_eq!(report["diagnostics"][0]["sink"]["severity"], "warn");
+
+    // `fail-on` in `[tool.hydroid]`; the flag wins.
+    let config = "[tool.hydroid]\nfail-on = \"critical\"\n";
+    let dir = project("severity-config", &[("app.py", warn_only), ("pyproject.toml", config)]);
+    assert_eq!(hydroid(&dir, &[]).status.code(), Some(0));
+    assert_eq!(hydroid(&dir, &["--fail-on", "warn"]).status.code(), Some(1));
+
+    let critical = "import time\n\n\nasync def handler():\n    time.sleep(1)\n";
+    let dir = project("severity-critical", &[("app.py", critical), ("pyproject.toml", config)]);
+    let output = hydroid(&dir, &[]);
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("error[blocking-sleep]"));
+    assert_eq!(output.status.code(), Some(1));
+    let sarif = json(&hydroid(&dir, &["--format", "sarif"]));
+    assert_eq!(sarif["runs"][0]["results"][0]["level"], "error");
+
+    // A sink added in `pyproject.toml` can say it is short.
+    let user = "[[tool.hydroid.sink]]\ncategory = \"sdk\"\nadvice = \"x\"\nseverity = \"warn\"\nfunctions = [\"vendor.fetch\"]\n";
+    let app = "from vendor import fetch\n\n\nasync def handler():\n    fetch()\n";
+    let files = [("app.py", app), ("vendor.py", "def fetch():\n    pass\n"), ("pyproject.toml", user)];
+    let report = json(&hydroid(&project("severity-user", &files), &["--format", "json"]));
+    assert_eq!(report["diagnostics"][0]["severity"], "warn", "{report:#}");
+}

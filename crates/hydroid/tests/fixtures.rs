@@ -5,7 +5,8 @@
 //! - `# expect: time.sleep` — a diagnostic on this line whose blocking function is `time.sleep`
 //!   (several qualnames separated by spaces for several diagnostics on one line). A trailing
 //!   `via <entry>` also checks the entry point reported as reaching it (`via route GET /x`,
-//!   `via nothing` when no entry point does). `*` matches any blocking function.
+//!   `via nothing` when no entry point does). A qualname ending in `@warn` or `@critical` also
+//!   checks the severity of the diagnostic. `*` matches any blocking function.
 //! - `# expect-unresolved` — an unresolved call on the event loop on this line; only checked in
 //!   cases whose `case.toml` sets `unresolved = true`.
 //!
@@ -111,9 +112,15 @@ fn run_case(dir: &Path) -> Vec<String> {
     let mut got_blocking = Expected::new();
     for d in &report.diagnostics {
         let key = (d.location.path.clone(), d.location.line);
-        let wants_entry = want_blocking.get(&key).is_some_and(|w| w.iter().any(|n| n.contains(" via ")));
+        let wants = |part: &str| want_blocking.get(&key).is_some_and(|w| w.iter().any(|n| n.contains(part)));
         let entry = d.reached_from.as_ref().map_or("nothing", |r| r.entry.split(": ").next().unwrap_or_default());
-        let got = if wants_entry { format!("{} via {entry}", d.sink.qualname) } else { d.sink.qualname.clone() };
+        let mut got = d.sink.qualname.clone();
+        if wants("@") {
+            got += &format!("@{}", serde_json::to_value(d.severity).unwrap().as_str().unwrap());
+        }
+        if wants(" via ") {
+            got += &format!(" via {entry}");
+        }
         got_blocking.entry(key).or_default().push(got);
     }
     let mut mismatches = Vec::new();

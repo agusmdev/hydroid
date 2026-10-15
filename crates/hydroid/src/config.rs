@@ -6,6 +6,7 @@
 //! follow-libs = false
 //! cpu = false
 //! strict = false
+//! fail-on = "warn"          # or "critical": warn findings are reported, but do not fail
 //! exclude = ["migrations/**", "tests/**"]
 //!
 //! # Catalog additions, same schema as hydroid's builtin catalog:
@@ -32,6 +33,8 @@ pub struct Config {
     pub strict: bool,
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Lowest severity of blocking call that fails the run (default: `warn`).
+    pub fail_on: Option<hydroid_core::report::Severity>,
     /// Catalog tables (`sink`, `blocking_decorator`, `offload`, `loop_callback`, `inspects`,
     /// `arguments`, `entry`, ...), re-serialized for [`hydroid_core::catalog::Catalog::extend`].
     #[serde(flatten)]

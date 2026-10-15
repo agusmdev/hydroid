@@ -12,6 +12,12 @@
 # `socket.getfqdn`) are listed by name. `unless_given` lists arguments that make a call skip the
 # blocking work; calls giving one, or positional arguments (not known to leave them out), don't
 # count. `blocks_in` names the function a helper blocks in, for the diagnostic.
+# `severity` says how long a call can stop the loop:
+#   critical  (default) a long or unknown time: it waits on the network, another process or
+#             thread, a timer or a person; or it is slow by design, or raises on the loop
+#   warn      a short, bounded time on the local machine (file metadata, small reads and writes)
+# A call that only runs while the server starts or stops (see `runs_once` in `[[entry]]`) is
+# one level lower.
 # ---------------------------------------------------------------------------------------------
 
 [[sink]]
@@ -102,15 +108,13 @@ functions = [
 [[sink]]
 category = "file"
 advice = "use `anyio`/`aiofiles` file APIs or `await asyncio.to_thread(...)`"
+severity = "warn"
 functions = [
     "builtins.open",
-    "builtins.input",
     "os.read",
     "os.write",
-    "os.fsync",
     "os.listdir",
     "os.scandir",
-    "os.walk",
     "os.remove",
     "os.unlink",
     "os.rename",
@@ -166,7 +170,6 @@ functions = [
     "pathlib.Path.replace",
     "pathlib.Path.iterdir",
     "pathlib.Path.glob",
-    "pathlib.Path.rglob",
     "pathlib.Path.stat",
     "pathlib.Path.exists",
     "pathlib.Path.is_file",
@@ -182,15 +185,10 @@ functions = [
     "shutil.copy",
     "shutil.copy2",
     "shutil.copyfile",
-    "shutil.copytree",
-    "shutil.move",
-    "shutil.copyfileobj",
     "shutil.copymode",
     "shutil.copystat",
     "shutil.chown",
     "shutil.disk_usage",
-    "shutil.make_archive",
-    "shutil.unpack_archive",
     "shutil.which",
     "zipfile.is_zipfile",
     "tarfile.is_tarfile",
@@ -205,6 +203,23 @@ functions = [
     "typing.IO.readlines",
     "typing.IO.write",
     "typing.IO.writelines",
+]
+
+# File work with no bound on its size (whole trees, archives, streams, flushing to the disk), and
+# reading from a person.
+[[sink]]
+category = "file"
+advice = "use `anyio`/`aiofiles` file APIs or `await asyncio.to_thread(...)`"
+functions = [
+    "builtins.input",
+    "os.fsync",
+    "os.walk",
+    "pathlib.Path.rglob",
+    "shutil.copytree",
+    "shutil.move",
+    "shutil.copyfileobj",
+    "shutil.make_archive",
+    "shutil.unpack_archive",
     "shutil._RmtreeType.__call__",
 ]
 
@@ -214,6 +229,7 @@ functions = [
 [[sink]]
 category = "file"
 advice = "log through a `logging.handlers.QueueHandler` and attach the handler to a `QueueListener`, which emits from its own thread"
+severity = "warn"
 functions = [
     "logging.handlers.RotatingFileHandler.shouldRollover",
     "logging.handlers.TimedRotatingFileHandler.shouldRollover",
@@ -853,6 +869,10 @@ functions = [
 #                      has its return value neither validated nor dumped
 #   injects            a parameter whose default (or `Annotated` metadata) is a call to these is
 #                      filled with what the callable at `slot` provides, not from the request
+#   runs_once          what is registered runs only while the server starts or stops: `true`,
+#                      or the parameters taking it. Diagnostics it reaches only this way are one
+#                      severity level lower; a coroutine it starts without awaiting it (a task)
+#                      runs while the server serves requests, and keeps its level
 # ---------------------------------------------------------------------------------------------
 [[entry]]
 kind = "route"
@@ -965,10 +985,14 @@ functions = [
 
 [[entry]]
 kind = "lifecycle"
+runs_once = ["lifespan", "on_startup", "on_shutdown"]
+functions = ["fastapi.applications.FastAPI.__init__", "fastapi.routing.APIRouter.__init__"]
+
+[[entry]]
+kind = "lifecycle"
+runs_once = true
 functions = [
-    "fastapi.applications.FastAPI.__init__",
     "fastapi.applications.FastAPI.on_event",
-    "fastapi.routing.APIRouter.__init__",
     "fastapi.routing.APIRouter.on_event",
     "fastapi.routing.APIRouter.add_event_handler",
 ]

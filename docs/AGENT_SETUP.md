@@ -29,13 +29,19 @@ Facts you need:
   pass `--python path/to/.venv`.
 - `<PROJECT_ROOT>` is the directory containing the Python package(s) and, ideally, the
   `pyproject.toml`. Config is read from `<PROJECT_ROOT>/pyproject.toml` under `[tool.hydroid]`.
-- Exit status: 0 clean, 1 blocking calls found (or unresolved calls with --strict), 2 hydroid
-  itself failed (bad path, bad config, no Python found).
+- Exit status: 0 clean, 1 blocking calls found (only critical ones with `--fail-on critical`;
+  or unresolved calls with --strict), 2 hydroid itself failed (bad path, bad config, no Python
+  found).
+- Each finding has a severity: `error[...]` is critical (the call can block the loop for a long
+  or unknown time: network, database, subprocess, locks, sleeps), `warning[...]` is warn (a short
+  local block such as `Path.exists`, or a critical call that only runs while the server starts or
+  stops).
 - Flags: `--python PATH`, `--exclude GLOB` (repeatable), `--follow-libs`, `--cpu`, `--strict`,
-  `--no-cache`, `--format human|json|sarif`. Config keys: `python`, `exclude`, `follow-libs`,
-  `cpu`, `strict`. Flags win over config.
+  `--fail-on warn|critical`, `--no-cache`, `--format human|json|sarif`. Config keys: `python`,
+  `exclude`, `follow-libs`, `cpu`, `strict`, `fail-on`. Flags win over config.
 - `--format json` prints `diagnostics` (each with location, function, chain, sink,
-  reached_from), `unresolved` and `stats`. Paths are relative to the project root.
+  reached_from, severity, runs_once), `unresolved` and `stats`. Paths are relative to the
+  project root.
 - A finding's `-->` line is the call inside loop code to fix. `# hydroid: ignore` on that exact
   line suppresses it.
 - It writes a cache to `<PROJECT_ROOT>/.hydroid_cache/`.
@@ -74,8 +80,10 @@ Do this, in order, and stop to ask me only if a step is genuinely ambiguous:
    - False positive (the call never actually runs on the loop, or is trivially fast): add
      `# hydroid: ignore` on the `-->` line with a short reason in the same comment, e.g.
      `# hydroid: ignore - cached after startup, never hits disk`.
+   - Put critical findings (`error[...]`) first in the table.
    - If there are many real findings that I won't fix now, say so; the CI job below is then added
-     in report-only mode (step 8) instead of failing the build.
+     with `--fail-on critical` when no critical finding is left, or in report-only mode (step 8)
+     otherwise.
 8. Add a CI job using the CI system this repo already has (GitHub Actions, GitLab CI, …).
    Use the reference configs in
    https://github.com/agusmdev/hydroid/blob/main/docs/AGENT_SETUP.md#2-cicd-reference.
@@ -239,6 +247,8 @@ second; add `.hydroid_cache/` to `.gitignore`.
    false positives, `exclude` code that never runs on the loop.
 2. If real findings remain that you cannot fix yet, run report-only (code scanning, or
    `allow_failure`) so new ones are visible on pull requests without blocking them.
-3. Once the count reaches zero, switch to failing the build.
-4. Later, consider `--strict` (fails on calls hydroid could not resolve on the loop) once type
+3. Fix the critical findings (`error[...]`) first. Once none is left, fail the build on them
+   with `--fail-on critical`: new warnings stay visible without blocking.
+4. Once the count reaches zero, drop `--fail-on critical` to fail on any finding.
+5. Later, consider `--strict` (fails on calls hydroid could not resolve on the loop) once type
    annotations make that list short.

@@ -49,11 +49,18 @@ hydroid . --python .venv --format sarif > hydroid.sarif
 | `--follow-libs` | also analyze third-party function bodies |
 | `--cpu` | also report CPU-bound calls (bcrypt, pbkdf2, scrypt) |
 | `--strict` | report calls on the loop whose target is unknown, and fail on them |
+| `--fail-on warn\|critical` | lowest severity that fails the run (default `warn`: any finding) |
 | `--exclude GLOB` | skip files (repeatable) |
 | `--no-cache` | do not read or write `.hydroid_cache/` |
 | `--format human\|json\|sarif` | output |
 
 Exit status: `0` clean, `1` findings (or unresolved calls with `--strict`), `2` error.
+
+Each finding has a severity. `error[...]` (**critical**): the call can block the loop for a long or
+unknown time (network, database, subprocess, locks, sleeps). `warning[...]` (**warn**): a short,
+local block (`Path.exists`, small file reads), or a critical call that only runs while the server
+starts or stops. Fix the errors first; `--fail-on critical` gates CI on them only.
+[More](docs/GUIDE.md#severity-error-or-warning).
 Suppress a line with `# hydroid: ignore`.
 
 Configuration in `pyproject.toml` (flags win):
@@ -63,10 +70,12 @@ Configuration in `pyproject.toml` (flags win):
 python = ".venv"
 exclude = ["migrations/**"]
 strict = false
+fail-on = "warn"
 
 [[tool.hydroid.sink]]            # your own blocking functions (defining qualified names)
 category = "sdk"
 advice = "use the async client"
+severity = "critical"            # default; "warn" for short, local work
 functions = ["acme.client.Client.fetch"]
 ```
 
