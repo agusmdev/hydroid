@@ -559,32 +559,39 @@ fn called_name(call: &ast::ExprCall) -> Option<&str> {
 }
 
 /// The elements of a dict (values), list or tuple literal that `container[key]` may be: the one
-/// under `key` when both it and the container's keys are literals, else all of them.
-fn selected_elements<'e>(container: &'e Expr, key: &Expr) -> Vec<&'e Expr> {
+/// under `key` when both it and the container's keys are literals, else all of them. `None` when
+/// the literal does not spell out every element (a `**` spread or a `*` starred element).
+fn selected_elements<'e>(container: &'e Expr, key: &Expr) -> Option<Vec<&'e Expr>> {
     match container {
         Expr::Dict(dict) => {
-            let Expr::StringLiteral(key) = key else { return dict.items.iter().map(|i| &i.value).collect() };
+            if dict.items.iter().any(|i| i.key.is_none()) {
+                return None;
+            }
+            let Expr::StringLiteral(key) = key else { return Some(dict.items.iter().map(|i| &i.value).collect()) };
             let mut selected = Vec::new();
             for item in &dict.items {
                 match &item.key {
                     Some(Expr::StringLiteral(k)) if k.value.to_str() != key.value.to_str() => {}
-                    // A matching key, or one (or a `**` spread) that might be equal.
+                    // A matching key, or one that might be equal.
                     _ => selected.push(&item.value),
                 }
             }
-            selected
+            Some(selected)
         }
         Expr::List(ast::ExprList { elts, .. }) | Expr::Tuple(ast::ExprTuple { elts, .. }) => {
+            if elts.iter().any(Expr::is_starred_expr) {
+                return None;
+            }
             let index = match key {
                 Expr::NumberLiteral(ast::ExprNumberLiteral { value: ast::Number::Int(i), .. }) => i.as_usize(),
                 _ => None,
             };
-            match index {
-                Some(i) if !elts.iter().any(Expr::is_starred_expr) => elts.get(i).into_iter().collect(),
-                _ => elts.iter().filter(|e| !e.is_starred_expr()).collect(),
-            }
+            Some(match index {
+                Some(i) => elts.get(i).into_iter().collect(),
+                None => elts.iter().collect(),
+            })
         }
-        _ => Vec::new(),
+        _ => Some(Vec::new()),
     }
 }
 
@@ -949,9 +956,15 @@ impl<'a, 'db> Extractor<'a, 'db> {
         if depth > 2 {
             return targets;
         }
+        // A literal that does not spell out every element: keep what ty says.
+        let mut incomplete = false;
         match expr {
             Expr::Subscript(subscript) => self.assigned_values(model, &subscript.value, &mut |model, container| {
-                for element in selected_elements(container, &subscript.slice) {
+                let Some(elements) = selected_elements(container, &subscript.slice) else {
+                    incomplete = true;
+                    return;
+                };
+                for element in elements {
                     if let Some(target) = self.stored_function(model, element)
                         && !targets.contains(&target)
                     {
@@ -969,6 +982,9 @@ impl<'a, 'db> Extractor<'a, 'db> {
                 }
             }),
             _ => {}
+        }
+        if incomplete {
+            return Vec::new();
         }
         targets
     }

@@ -54,3 +54,16 @@ async def export(name: str):
 def threadpool():
     VERBS["GET"]("https://example.com")
     return {}
+
+
+# A literal with a spread or starred element does not spell out its elements: ty's targets stand.
+BASE = {"read": read_file}
+SPREAD = {**BASE, "noop": noop}
+STARRED = [*[read_file], noop]
+
+
+@app.get("/spread/{name}")
+async def spread(name: str):
+    SPREAD[name]("a")  # expect: builtins.open
+    STARRED[0]("a")  # expect: builtins.open
+    return {}
