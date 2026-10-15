@@ -16,14 +16,15 @@ use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinition
 use ty_python_semantic::types::ide_support::{
     ResolvedDefinition, call_signature_details, static_member_type_for_attribute,
 };
-use ty_python_semantic::types::{SpecialFormType, Type, TypeDefinition};
+use ty_python_semantic::types::{KnownClass, SpecialFormType, Type, TypeDefinition};
 use ty_python_semantic::{
     HasType, ImportAliasResolution, SemanticModel, definitions_for_attribute, definitions_for_name,
 };
 
 use crate::db::HydroidDb;
+use crate::stacks::{ExitPlan, ExitSite, StackCalls, StackRole, exit_plan};
 use crate::index::{
-    FileIndex, Key, MODULE_KEY, annotation_classes, class_method, class_of, describe, inherits,
+    FileIndex, Key, MODULE_KEY, annotation_classes, class_bases, class_method, find_class, class_of, describe, inherits,
     instance_class, is_class_object, is_class_variable, is_owner, namespace_of, yield_values, yields,
 };
 
@@ -113,6 +114,18 @@ pub struct Instances {
     pub generic_attributes: FxHashSet<String>,
     /// See [`crate::index::FileIndex::rebound`].
     pub rebound: FxHashSet<String>,
+    /// Project classes some project class derives from.
+    pub subclassed: FxHashSet<Key>,
+    /// See [`crate::index::FileIndex::deleted`].
+    pub deleted: FxHashSet<String>,
+}
+
+/// Which arguments a function calls when given callables (see [`CatalogKeys::handed`]).
+#[derive(Clone, Copy)]
+pub enum Handed<'c> {
+    Any,
+    /// The parameters named.
+    Names(&'c [String]),
 }
 
 /// What the project's classes run implicitly on attribute access.
@@ -135,7 +148,7 @@ pub struct RawStore {
     pub value: RawValue,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum RawSlot {
     Positional(usize),
     Keyword(String),
@@ -285,6 +298,17 @@ pub struct CatalogKeys<'c> {
     /// `[[entry]]` functions with `injects`: where a call to them takes the provider (the
     /// position, not counting `self`, and the keyword of the first `slot`).
     pub injects: FxHashMap<Key, (Option<usize>, &'c str)>,
+    /// Functions calling the callables they are given later, somewhere hydroid follows through
+    /// flows (`[offload]`, `[loop_callback]`, `[[entry]]`), with where they take them.
+    pub handed: FxHashMap<Key, Handed<'c>>,
+    /// `[offload]` `copies`: offloads that may run what they are given on a copy, in another
+    /// process.
+    pub copies: FxHashSet<Key>,
+    /// `[[exit_stack]]` calls, with what they do to the stack they are called on.
+    pub stack_roles: FxHashMap<Key, StackRole>,
+    /// The last names of `[[exit_stack]]` `callbacks` and `contexts` (a file without them
+    /// stores nothing on a stack).
+    pub stack_names: FxHashSet<&'c str>,
 }
 
 /// Extracts the bodies of `wanted` functions (every function and the module body when `None`).
@@ -326,6 +350,7 @@ pub fn extract_file(
         },
         streamed: FxHashSet::default(),
         deferred: FxHashMap::default(),
+        exit_plan: ExitPlan::default(),
         out: FileFacts {
             file: index.file,
             signatures: Vec::new(),
@@ -348,6 +373,9 @@ pub fn extract_file(
         &|call| extractor.call_arguments(call).filter(|a| a.lazy),
     );
     (extractor.streamed, extractor.deferred) = (streamed, deferred);
+    if shared.keys.stack_names.iter().any(|m| index.text(parsed.syntax().range()).contains(m)) {
+        extractor.exit_plan = exit_plan(&parsed.syntax().body, &extractor, &shared.keys.stack_names);
+    }
     extractor.visit_body(&parsed.syntax().body);
     extractor.drop_eager_reads();
     extractor.out
@@ -481,7 +509,44 @@ struct Extractor<'a, 'db> {
     /// Other lazy iterables given to calls (by offset), with the offset of that call, see
     /// [`lazy_arguments`].
     deferred: FxHashMap<u32, u32>,
+    /// Where what is stored on exit stacks runs, see [`crate::stacks`].
+    exit_plan: ExitPlan,
     out: FileFacts,
+}
+
+/// Whether a class body reads `__new__` (`cls.__new__(cls)`: an instance its `__init__` never ran
+/// on).
+fn creates_bare(def: &ast::StmtClassDef) -> bool {
+    struct New(bool);
+    impl<'b> SourceOrderVisitor<'b> for New {
+        fn visit_expr(&mut self, expr: &'b Expr) {
+            if matches!(expr, Expr::Attribute(a) if a.attr.as_str() == "__new__") {
+                self.0 = true;
+            }
+            walk_expr(self, expr);
+        }
+    }
+    let mut new = New(false);
+    new.visit_body(&def.body);
+    new.0
+}
+
+/// Whether an `__init__` assigns `self.<name>` in a statement of its own body, with no
+/// `return` anywhere in it.
+fn init_assigns(init: &ast::StmtFunctionDef, name: &str) -> bool {
+    let Some(receiver) = init.parameters.posonlyargs.iter().chain(&init.parameters.args).next() else { return false };
+    let receiver = receiver.parameter.name.as_str();
+    let assigns = init.body.iter().any(|stmt| {
+        let target = match stmt {
+            Stmt::Assign(a) if a.targets.len() == 1 => &a.targets[0],
+            Stmt::AnnAssign(a) if a.value.is_some() => &*a.target,
+            _ => return false,
+        };
+        target.as_attribute_expr().is_some_and(|t| {
+            t.attr.as_str() == name && t.value.as_name_expr().is_some_and(|n| n.id.as_str() == receiver)
+        })
+    });
+    assigns && init.decorator_list.is_empty() && init.body.iter().all(|s| !crate::stacks::returns(s))
 }
 
 /// `Depends` in `Depends(dep)` and `fastapi.Depends(dep)`.
@@ -1071,6 +1136,11 @@ impl<'a, 'db> Extractor<'a, 'db> {
 
     /// A callable argument the callee calls during the call (`sorted(xs, key=f)`).
     fn call_value(&mut self, call: &ast::ExprCall, value: &Expr) {
+        self.call_value_at(value, self.index.location(call.start()), self.text(value.range()));
+    }
+
+    /// Calling the callable `value` evaluates to, at `location`.
+    fn call_value_at(&mut self, value: &Expr, location: Location, text: String) {
         let (targets, param) = match self.value_of(value) {
             Some(RawValue::Function(key)) => (vec![(key, false)], None),
             Some(RawValue::Param(owner, name)) => (Vec::new(), Some((owner, name))),
@@ -1078,8 +1148,8 @@ impl<'a, 'db> Extractor<'a, 'db> {
         };
         self.out.calls.push(RawCall {
             caller: self.current,
-            location: self.index.location(call.start()),
-            text: self.text(value.range()),
+            location,
+            text,
             targets,
             virtual_dispatch: false,
             param,
@@ -1542,6 +1612,100 @@ impl<'a, 'db> Extractor<'a, 'db> {
         }
     }
 
+    /// The `[[exit_stack]]` role every target has, if they share one.
+    fn stack_role(&self, targets: &[(Key, bool)]) -> Option<StackRole> {
+        let mut roles = targets.iter().map(|(t, _)| self.keys.stack_roles.get(t).copied());
+        let first = roles.next()??;
+        roles.all(|r| r == Some(first)).then_some(first)
+    }
+
+    /// A call storing on an exit stack the callable (`Callback`) or the exit of the context
+    /// manager (`Context`, entered now) given first: what it stores runs at the `sites` where
+    /// the stack runs it (see [`crate::stacks`]).
+    fn stack_store(&mut self, call: &ast::ExprCall, role: StackRole, sites: Vec<ExitSite>) {
+        let Some(stored) = call.arguments.args.first().filter(|x| !x.is_starred_expr()) else { return };
+        let context = role == StackRole::Context;
+        if context {
+            if let Expr::Call(created) = stored {
+                self.iterated.insert(created.start().to_u32());
+            }
+            self.iterate_later(stored);
+            let text = self.argument_text(call, stored);
+            self.implicit_call(stored, "__enter__", text, false, false);
+        }
+        for site in sites {
+            match site {
+                ExitSite::At { offset, text, with } => {
+                    let location = self.index.location(offset.into());
+                    let prefix = match with {
+                        Some(true) => "async with ",
+                        Some(false) => "with ",
+                        None => "",
+                    };
+                    let text = format!("{prefix}{}", self.text(text));
+                    if context {
+                        self.implicit_call_at(stored, "__exit__", text, false, false, location);
+                    } else {
+                        self.call_value_at(stored, location, text);
+                    }
+                }
+                ExitSite::Handed { offset, slot, into, literal } => {
+                    let value = if context {
+                        let exit = self.synthesized_member(stored, "__exit__");
+                        self.resolved_function_keys(definitions_for_attribute(self.model, &exit))
+                            .into_iter()
+                            .next()
+                            .map(RawValue::Function)
+                    } else {
+                        self.value_of(stored)
+                    };
+                    let Some(value) = value else { continue };
+                    let receiver = self.called_instance(stored);
+                    let location = self.index.location(offset.into());
+                    for (into, bound) in into {
+                        self.out.flows.push(RawFlow {
+                            caller: self.current,
+                            location: location.clone(),
+                            into,
+                            bound,
+                            slot: slot.clone(),
+                            value: value.clone(),
+                            receiver,
+                            literal: literal.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// What a call on an exit stack calls: as resolved, or, on a `with ... as name` target ty
+    /// leaves unknown, the method of the context manager's class (see [`Self::entered_class`]).
+    fn stack_targets(&self, callee: &Expr, call: &ast::ExprCall) -> Vec<(Key, bool)> {
+        let targets = self.resolve(callee, Some(call)).targets;
+        if !targets.is_empty() {
+            return targets;
+        }
+        self.entered_method(callee).map(|k| (k, true)).into_iter().collect()
+    }
+
+    /// `name.method` on a `with ... as name` target ty leaves unknown: the method of the context
+    /// manager's class.
+    fn entered_method(&self, expr: &Expr) -> Option<Key> {
+        let attr = expr.as_attribute_expr()?;
+        if !matches!(attr.value.inferred_type(self.model), Some(Type::Dynamic(_))) {
+            return None;
+        }
+        class_method(self.db, self.entered_class(&attr.value)?, attr.attr.as_str())
+    }
+
+    /// Whether the function at `key` is a coroutine function.
+    fn is_async_def(&self, (file, offset): Key) -> bool {
+        let db = self.model.db();
+        let parsed = parsed_module(db, ty_python_semantic::Db::program_file(db, file).python_file(db)).load(db);
+        find_function(parsed.syntax(), offset).is_some_and(|def| def.is_async)
+    }
+
     /// `f(x)`, the text of an implicit call a library function `f` makes on its argument `x`.
     fn argument_text(&self, call: &ast::ExprCall, x: &Expr) -> String {
         format!("{}({})", self.text(call.func.range()), self.text(x.range()))
@@ -1622,6 +1786,19 @@ impl<'a, 'db> Extractor<'a, 'db> {
     }
 
     fn implicit_call(&mut self, receiver: &Expr, dunder: &str, text: String, awaited: bool, iterates: bool) {
+        self.implicit_call_at(receiver, dunder, text, awaited, iterates, self.index.location(receiver.start()));
+    }
+
+    /// [`Extractor::implicit_call`], made at `location`.
+    fn implicit_call_at(
+        &mut self,
+        receiver: &Expr,
+        dunder: &str,
+        text: String,
+        awaited: bool,
+        iterates: bool,
+        location: Location,
+    ) {
         let member = self.synthesized_member(receiver, dunder);
         let keys = self.resolved_function_keys(definitions_for_attribute(self.model, &member));
         // An instance ty knows nothing about: look the dunder up in the class it came from.
@@ -1636,7 +1813,7 @@ impl<'a, 'db> Extractor<'a, 'db> {
         };
         self.out.calls.push(RawCall {
             caller: self.current,
-            location: self.index.location(receiver.start()),
+            location,
             text,
             targets: keys.into_iter().map(|k| (k, true)).collect(),
             virtual_dispatch: true,
@@ -1716,8 +1893,17 @@ impl<'a, 'db> Extractor<'a, 'db> {
         }
         let arguments = self.arguments_of(&resolution);
         self.call_arguments.borrow_mut().insert(call.start().to_u32(), arguments);
-        if let Some(arguments) = arguments {
-            self.argument_call(arguments, call);
+        // A store on an exit stack followed to where it runs (see `crate::stacks`); where it is
+        // not, the call does what `[[arguments]]` says.
+        let sites = self.exit_plan.get(&call.start().to_u32()).cloned();
+        let role = if resolution.targets.is_empty() { self.stack_role(&self.stack_targets(&call.func, call)) } else { self.stack_role(&resolution.targets) };
+        match (sites, role) {
+            (Some(sites), Some(role @ (StackRole::Callback | StackRole::Context))) => self.stack_store(call, role, sites),
+            _ => {
+                if let Some(arguments) = arguments {
+                    self.argument_call(arguments, call);
+                }
+            }
         }
         let attribute = if resolution.targets.is_empty() { self.attribute_slot(&call.func) } else { None };
         // Also when resolved: ty types `retrying.wraps(f)` as `f` itself, the call runs a wrapper.
@@ -2810,6 +2996,168 @@ impl<'a, 'db> Extractor<'a, 'db> {
         let previous = std::mem::replace(&mut self.current, key);
         f(self);
         self.current = previous;
+    }
+}
+
+impl StackCalls for Extractor<'_, '_> {
+    fn role(&self, call: &ast::ExprCall) -> Option<StackRole> {
+        self.stack_role(&self.stack_targets(&call.func, call))
+    }
+
+    fn coroutine(&self, call: &ast::ExprCall) -> bool {
+        self.stack_targets(&call.func, call).iter().any(|&(t, _)| self.is_async_def(t))
+    }
+
+    fn constructs(&self, call: &ast::ExprCall) -> bool {
+        let Some(class) = self.resolve(&call.func, Some(call)).constructs else { return false };
+        if describe(self.db, class.0).1 != Origin::Project {
+            return true;
+        }
+        // A project class is a stack when it defines stack methods itself, not when it derives
+        // from one (overriding what they call).
+        let db = self.model.db();
+        let parsed = parsed_module(db, ty_python_semantic::Db::program_file(db, class.0).python_file(db)).load(db);
+        find_class(parsed.syntax(), class.1).is_some_and(|def| {
+            def.body.iter().any(|stmt| match stmt {
+                Stmt::FunctionDef(f) => self.keys.stack_roles.contains_key(&(class.0, f.name.start().to_u32())),
+                _ => false,
+            })
+        })
+    }
+
+    fn empties_handed(&self, call: &ast::ExprCall) -> bool {
+        !self.resolve(&call.func, Some(call)).targets.iter().any(|(t, _)| self.keys.copies.contains(t))
+    }
+
+    fn exit_runs(&self, expr: &Expr, is_async: bool) -> bool {
+        let exit = self.synthesized_member(expr, if is_async { "__aexit__" } else { "__exit__" });
+        let keys = self.resolved_function_keys(definitions_for_attribute(self.model, &exit));
+        let targets: Vec<(Key, bool)> = keys.into_iter().map(|k| (k, true)).collect();
+        self.stack_role(&targets) == Some(StackRole::Run)
+    }
+
+    fn handed_run(&self, expr: &Expr) -> bool {
+        let key = match self.value_of(expr) {
+            Some(RawValue::Function(key)) => Some(key),
+            Some(_) => None,
+            None => self.entered_method(expr),
+        };
+        key.is_some_and(|key| self.keys.stack_roles.get(&key) == Some(&StackRole::Run) && !self.is_async_def(key))
+    }
+
+    fn inert_read(&self, attribute: &ast::ExprAttribute) -> bool {
+        let Some(ty @ Type::NominalInstance(_)) = attribute.value.inferred_type(self.model) else { return false };
+        let Some(class) = self.class_key(&ty) else { return false };
+        if self.instances.subclassed.contains(&class) || self.instances.deleted.contains(attribute.attr.as_str()) {
+            return false;
+        }
+        let object = self.class_key(&KnownClass::Object.to_instance(self.db, &self.model.program_environment()));
+        let name = attribute.attr.as_str();
+        let db = self.model.db();
+        // A chain of plain project classes (single bases, no decorators or class keywords) down
+        // to `object`, none defining the attribute in its body or customizing attribute access or
+        // creation; the first `__init__` assigns it on every path.
+        let (mut current, mut assigned) = (class, None);
+        for _ in 0..32 {
+            if Some(current) == object {
+                return assigned == Some(true);
+            }
+            if describe(self.db, current.0).1 != Origin::Project {
+                return false;
+            }
+            let parsed = parsed_module(db, ty_python_semantic::Db::program_file(db, current.0).python_file(db)).load(db);
+            let Some(def) = find_class(parsed.syntax(), current.1) else { return false };
+            if !def.decorator_list.is_empty()
+                || def.arguments.as_ref().is_some_and(|a| !a.keywords.is_empty())
+                || creates_bare(def)
+            {
+                return false;
+            }
+            for stmt in &def.body {
+                let defined: Vec<&str> = match stmt {
+                    Stmt::FunctionDef(f) => vec![f.name.as_str()],
+                    Stmt::Assign(a) => a.targets.iter().filter_map(|t| t.as_name_expr()).map(|n| n.id.as_str()).collect(),
+                    Stmt::AnnAssign(a) => a.target.as_name_expr().map(|n| n.id.as_str()).into_iter().collect(),
+                    Stmt::Pass(_) | Stmt::Expr(_) => Vec::new(),
+                    _ => return false,
+                };
+                let customized = ["__getattr__", "__getattribute__", "__setattr__", "__delattr__", "__new__", "__slots__"];
+                if defined.iter().any(|d| *d == name || customized.contains(d)) {
+                    return false;
+                }
+                if let Stmt::FunctionDef(init) = stmt
+                    && init.name.as_str() == "__init__"
+                    && assigned.is_none()
+                {
+                    assigned = Some(init_assigns(init, name));
+                }
+            }
+            current = match class_bases(self.db, current)[..] {
+                [base] => base,
+                [] => match object {
+                    Some(object) => object,
+                    None => return false,
+                },
+                _ => return false,
+            };
+        }
+        false
+    }
+
+    fn plain(&self, expr: &Expr) -> bool {
+        let env = self.model.program_environment();
+        match expr.inferred_type(self.model) {
+            Some(Type::LiteralValue(literal)) => !literal.is_enum(),
+            Some(ty) => [KnownClass::Str, KnownClass::Int, KnownClass::Float].iter().any(|k| k.to_instance(self.db, &env) == ty),
+            None => false,
+        }
+    }
+
+    fn runs_handed(&self, call: &ast::ExprCall, slot: &RawSlot, argument: &Expr) -> bool {
+        if !self.handed_run(argument) {
+            return false;
+        }
+        let targets = self.resolve(&call.func, Some(call)).targets;
+        if targets.is_empty() {
+            return false;
+        }
+        // The first callable an API is given is the one it calls (`to_thread(f, *args)`).
+        for (i, given) in call.arguments.args.iter().enumerate() {
+            if matches!(slot, RawSlot::Positional(p) if *p == i) {
+                break;
+            }
+            if given.is_starred_expr() || self.value_of(given).is_some() {
+                return false;
+            }
+        }
+        targets.iter().all(|(target, _)| match self.keys.handed.get(target) {
+            Some(Handed::Any) => true,
+            Some(Handed::Names(names)) => matches!(slot, RawSlot::Keyword(k) if names.contains(k)),
+            None => false,
+        })
+    }
+
+    fn frame_access(&self, call: &ast::ExprCall) -> bool {
+        // A builtin function may reach the calling frame's variables (`locals()`, `exec(...)`).
+        let object = self.class_key(&KnownClass::Object.to_instance(self.db, &self.model.program_environment()));
+        let targets = self.resolve(&call.func, Some(call)).targets;
+        object.is_some_and(|(builtins, _)| {
+            targets.iter().any(|((file, offset), _)| {
+                *file == builtins && {
+                    let db = self.model.db();
+                    let parsed = parsed_module(db, ty_python_semantic::Db::program_file(db, *file).python_file(db)).load(db);
+                    // A module-level function, not a method of a builtin class.
+                    parsed.syntax().body.iter().any(|stmt| match stmt {
+                        Stmt::FunctionDef(f) => f.name.start().to_u32() == *offset,
+                        _ => false,
+                    })
+                }
+            })
+        })
+    }
+
+    fn receivers(&self, call: &ast::ExprCall) -> (Vec<(Key, bool)>, Option<String>) {
+        (self.resolve(&call.func, Some(call)).targets, first_string_literal(call))
     }
 }
 

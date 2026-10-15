@@ -409,6 +409,8 @@ functions = [
 # ---------------------------------------------------------------------------------------------
 # Work moved off the event loop. Callables passed to these run in a worker thread or process:
 # hydroid never follows them, and never follows the bodies of these functions.
+#   copies  those that may run it in another process, on a pickled copy: what it does there
+#           changes nothing here (closing a copy of an exit stack leaves the original full)
 # ---------------------------------------------------------------------------------------------
 [offload]
 functions = [
@@ -424,6 +426,41 @@ functions = [
     "threading.Thread.__init__",
     "multiprocessing.process.BaseProcess.__init__",
 ]
+copies = [
+    "anyio.to_process.run_sync",
+    "asyncio.events.AbstractEventLoop.run_in_executor",
+    "concurrent.futures._base.Executor.submit",
+    "concurrent.futures._base.Executor.map",
+    "multiprocessing.process.BaseProcess.__init__",
+]
+
+# ---------------------------------------------------------------------------------------------
+# Objects storing callables, and context managers' exits, that they run later: a call storing
+# one does not run it, the calls running what the instance stores do, where they run.
+#   callbacks  calls storing the callable given first
+#   contexts   calls entering the context manager given first (now), and storing its exit
+#   runs       calls running everything stored; leaving a `with` block on the instance runs it
+#              too when its `__exit__` (`__aexit__`) is one
+#   moves      calls returning a new instance holding everything stored, the original left empty
+# Where hydroid cannot follow the instance from its construction to every run (it is handed to
+# another function, returned, stored), the call does what `[[arguments]]` says: an exit stack's
+# `callback` and `enter_context` are taken to run what they store right away.
+# ---------------------------------------------------------------------------------------------
+[[exit_stack]]
+callbacks = ["contextlib._BaseExitStack.callback", "contextlib._BaseExitStack.push"]
+contexts = ["contextlib._BaseExitStack.enter_context"]
+runs = [
+    "contextlib.ExitStack.close",
+    "contextlib.ExitStack.__exit__",
+    "contextlib.AsyncExitStack.aclose",
+    "contextlib.AsyncExitStack.__aexit__",
+]
+moves = ["contextlib._BaseExitStack.pop_all"]
+
+[[exit_stack]]
+callbacks = ["unittest.case.TestCase.addCleanup"]
+contexts = ["unittest.case.TestCase.enterContext"]
+runs = ["unittest.case.TestCase.doCleanups"]
 
 # ---------------------------------------------------------------------------------------------
 # Registries running the observers attached to them on the calling thread.

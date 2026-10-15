@@ -7,6 +7,7 @@ mod cache;
 mod db;
 mod extract;
 mod index;
+mod stacks;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -30,10 +31,11 @@ use ty_python_semantic::{HasDefinition, SemanticModel, map_stub_definition};
 
 use crate::db::HydroidDb;
 use crate::extract::{
-    AppState, CatalogKeys, Expiry, FileFacts, Implicit, Instances, Orm, RawInstance, RawSlot, RawValue, Shared, extract_file,
+    AppState, CatalogKeys, Expiry, Handed, FileFacts, Implicit, Instances, Orm, RawInstance, RawSlot, RawValue, Shared, extract_file,
     find_function,
 };
 use crate::index::{FileIndex, IndexCatalog, Key, class_bases};
+use crate::stacks::StackRole;
 
 pub struct Extraction {
     pub facts: Facts,
@@ -177,6 +179,31 @@ fn catalog_keys<'c>(db: &HydroidDb, indexes: &Indexes, catalog: &'c Catalog) -> 
     }
     for name in catalog.passthrough() {
         keys.passthrough.extend(catalog_definitions(db, indexes, name).into_iter().map(|key| (key, name)));
+    }
+    // What calls a callable it is given (an exit stack's run method handed to it runs there).
+    for name in catalog.copies() {
+        keys.copies.extend(catalog_definitions(db, indexes, name));
+    }
+    for name in catalog.offloads().chain(catalog.loop_callbacks()) {
+        keys.handed.extend(catalog_definitions(db, indexes, &name).into_iter().map(|k| (k, Handed::Any)));
+    }
+    for (name, entry) in catalog.entry_entries() {
+        let slots = if entry.slot.is_empty() { Handed::Any } else { Handed::Names(&entry.slot) };
+        keys.handed.extend(catalog_definitions(db, indexes, &name).into_iter().map(|k| (k, slots)));
+    }
+    for stack in catalog.exit_stacks() {
+        let roles = [
+            (&stack.callbacks, StackRole::Callback),
+            (&stack.contexts, StackRole::Context),
+            (&stack.runs, StackRole::Run),
+            (&stack.moves, StackRole::Move),
+        ];
+        for (names, role) in roles {
+            for name in names {
+                keys.stack_roles.extend(catalog_definitions(db, indexes, name).into_iter().map(|k| (k, role)));
+            }
+        }
+        keys.stack_names.extend(stack.callbacks.iter().chain(&stack.contexts).filter_map(|f| f.rsplit('.').next()));
     }
     for (name, raises) in catalog.loop_probes() {
         let raised = catalog_definitions(db, indexes, raises);
@@ -529,6 +556,8 @@ impl Indexes {
         Instances {
             generic_attributes: map.values().flat_map(|i| i.generic_attributes.iter().cloned()).collect(),
             rebound: map.values().flat_map(|i| i.rebound.iter().cloned()).collect(),
+            subclassed: map.values().flat_map(|i| i.classes.values().flat_map(|c| c.bases.iter().copied())).collect(),
+            deleted: map.values().flat_map(|i| i.deleted.iter().cloned()).collect(),
         }
     }
 

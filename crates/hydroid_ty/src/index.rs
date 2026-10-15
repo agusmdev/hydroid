@@ -13,7 +13,7 @@ use ruff_text_size::{Ranged, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 use ty_python_core::definition::DefinitionKind;
 use ty_python_semantic::types::ide_support::ResolvedDefinition;
-use ty_python_semantic::types::{Type, TypeDefinition};
+use ty_python_semantic::types::{KnownClass, Type, TypeDefinition};
 use ty_python_semantic::{HasType, ImportAliasResolution, SemanticModel, TypeQualifiers, definitions_for_name};
 
 use crate::db::HydroidDb;
@@ -124,6 +124,9 @@ pub struct FileIndex {
     /// declared `global` or `nonlocal`, or assigned as an attribute of something other than
     /// `self` (`module.client = ...`).
     pub rebound: Vec<String>,
+    /// Attribute names the module may delete or set by name (project files only): `del x.name`,
+    /// or a builtin given a string (`delattr(x, "name")`; `"*"` for one given a computed name).
+    pub deleted: Vec<String>,
     /// The names the module uses (project files only), see [`used_names`].
     pub used_names: FxHashSet<String>,
     display_path: String,
@@ -161,6 +164,7 @@ impl FileIndex {
             eager_loads: FxHashMap::default(),
             generic_attributes: Vec::new(),
             rebound: Vec::new(),
+            deleted: Vec::new(),
             used_names: if origin == Origin::Project { used_names(&parsed.syntax().body) } else { FxHashSet::default() },
             display_path,
             lines,
@@ -261,6 +265,23 @@ struct Builder<'a, 'db> {
 }
 
 impl Builder<'_, '_> {
+    /// A builtin function given an object and an attribute name (`delattr(obj, "name")`): see
+    /// [`FileIndex::deleted`].
+    fn named_attribute(&mut self, call: &ast::ExprCall) {
+        let ([_, name, ..], Expr::Name(_)) = (&call.arguments.args[..], &*call.func) else { return };
+        let Some(Type::FunctionLiteral(_)) = call.func.inferred_type(self.model) else { return };
+        let env = self.model.program_environment();
+        let builtins = class_of(self.model, KnownClass::Object.to_instance(self.db, &env)).map(|(file, _)| file);
+        let defined = callee_key(self.model, &call.func).map(|(file, _)| file);
+        if builtins.is_none() || defined != builtins {
+            return;
+        }
+        match name {
+            Expr::StringLiteral(literal) => self.index.deleted.push(literal.value.to_str().to_string()),
+            _ => self.index.deleted.push("*".to_string()),
+        }
+    }
+
     fn prefix(&self) -> String {
         match self.scopes.last() {
             None => self.module.clone(),
@@ -430,7 +451,7 @@ pub fn class_of<'db>(model: &SemanticModel<'db>, ty: Type<'db>) -> Option<Key> {
 }
 
 /// The definition of the class whose name starts at `offset`.
-fn find_class(module: &ast::ModModule, offset: u32) -> Option<&ast::StmtClassDef> {
+pub(crate) fn find_class(module: &ast::ModModule, offset: u32) -> Option<&ast::StmtClassDef> {
     struct Finder<'a> {
         offset: u32,
         found: Option<&'a ast::StmtClassDef>,
@@ -1027,6 +1048,10 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
                     self.index.rebound.extend(names.iter().map(|n| n.to_string()));
                 }
                 Stmt::Assign(assign) => self.index.rebound.extend(assign.targets.iter().filter_map(rebound)),
+                Stmt::Delete(ast::StmtDelete { targets, .. }) => {
+                    let attributes = targets.iter().filter_map(|t| t.as_attribute_expr());
+                    self.index.deleted.extend(attributes.map(|a| a.attr.to_string()));
+                }
                 Stmt::AnnAssign(ast::StmtAnnAssign { target, .. }) | Stmt::AugAssign(ast::StmtAugAssign { target, .. }) => {
                     self.index.rebound.extend(rebound(target));
                 }
@@ -1176,6 +1201,7 @@ impl<'ast> SourceOrderVisitor<'ast> for Builder<'_, '_> {
         {
             self.eager_load(call);
             self.lifespan_state(call);
+            self.named_attribute(call);
         }
         if let Expr::Lambda(lambda) = expr {
             let key = lambda.start().to_u32();

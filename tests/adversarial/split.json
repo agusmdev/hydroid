@@ -74,7 +74,7 @@
   "r18_abc_register_virtual": "open",
   "r18_callback_protocol_global": "open",
   "r18_decorator_registry_dispatch": "open",
-  "r18_exitstack_pop_all_background_close": "open",
+  "r18_exitstack_pop_all_background_close": "train",
   "r18_init_subclass_registry": "holdout",
   "r18_protocol_factory_sync_client": "open",
   "r18_queue_job_drain_inline": "holdout",

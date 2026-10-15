@@ -18,7 +18,7 @@ struct CatalogFile {
     #[serde(default)]
     blocking_decorator: Vec<SinkGroup>,
     #[serde(default)]
-    offload: Group,
+    offload: OffloadGroup,
     #[serde(default)]
     loop_callback: Group,
     /// Functions that only inspect the callables passed to them (`functools.wraps(func)`).
@@ -50,6 +50,30 @@ struct CatalogFile {
     /// Class attributes whose first read loads them (I/O).
     #[serde(default)]
     lazy_attribute: Vec<LazyAttribute>,
+    /// Objects storing callables and context managers' exits that they run later.
+    #[serde(default)]
+    exit_stack: Vec<ExitStack>,
+}
+
+/// `[[exit_stack]]`: calls storing a callable, or the exit of a context manager, on the
+/// instance they are called on (they do not run it), and the calls running what it stores:
+/// `contextlib.ExitStack`, `unittest.TestCase` cleanups.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExitStack {
+    /// Calls storing the callable given first.
+    #[serde(default)]
+    pub callbacks: Vec<String>,
+    /// Calls entering the context manager given first, and storing its `__exit__`.
+    #[serde(default)]
+    pub contexts: Vec<String>,
+    /// Calls running everything stored (leaving a `with` block runs it when its `__exit__` or
+    /// `__aexit__` is one).
+    #[serde(default)]
+    pub runs: Vec<String>,
+    /// Calls returning a new instance holding everything stored, leaving the original empty.
+    #[serde(default)]
+    pub moves: Vec<String>,
 }
 
 /// `name = factory(...)` in a class body makes reading `instance.name` load it, running `loads`
@@ -294,6 +318,18 @@ struct SinkGroup {
 struct Group {
     #[serde(default)]
     functions: Vec<String>,
+}
+
+/// `[offload]`: functions running the callables given to them off the loop.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct OffloadGroup {
+    #[serde(default)]
+    functions: Vec<String>,
+    /// Those that may run it in another process, on a copy (pickled): what it changes there
+    /// leaves the original as it was.
+    #[serde(default)]
+    copies: Vec<String>,
 }
 
 /// `[[arguments]]`: functions doing the same with their arguments (see [`Arguments`]).
@@ -630,6 +666,8 @@ pub struct Catalog {
     /// The `blocks_in` function of each group, by index.
     blocks_in: Vec<Option<String>>,
     offload: Patterns<()>,
+    /// `[offload]` `copies`.
+    copies: Vec<String>,
     loop_callbacks: Patterns<()>,
     inspectors: Patterns<()>,
     dispatches: Patterns<usize>,
@@ -650,6 +688,7 @@ pub struct Catalog {
     builders: Vec<BuildsOnLoop>,
     lazy_attributes: Vec<LazyAttribute>,
     state_namespaces: Vec<StateNamespace>,
+    exit_stacks: Vec<ExitStack>,
 }
 
 impl Catalog {
@@ -682,6 +721,7 @@ impl Catalog {
         for name in &file.offload.functions {
             self.offload.insert(name, ());
         }
+        self.copies.extend(file.offload.copies);
         for name in &file.loop_callback.functions {
             self.loop_callbacks.insert(name, ());
         }
@@ -716,6 +756,7 @@ impl Catalog {
         }
         self.state_namespaces.extend(file.state_namespace);
         self.lazy_attributes.extend(file.lazy_attribute);
+        self.exit_stacks.extend(file.exit_stack);
         for BuildsOnLoopGroup { kind, slot, label, unless_passthrough, functions } in file.builds_on_loop {
             let index = self.builders.len();
             self.builders.push(BuildsOnLoop { kind, slot, label, unless_passthrough });
@@ -854,6 +895,16 @@ impl Catalog {
         self.offload.all()
     }
 
+    /// The `[offload]` functions that may run what they are given on a copy, in another process.
+    pub fn copies(&self) -> &[String] {
+        &self.copies
+    }
+
+    /// Every `[loop_callback]` name (or pattern).
+    pub fn loop_callbacks(&self) -> impl Iterator<Item = String> + '_ {
+        self.loop_callbacks.all()
+    }
+
     pub fn is_loop_callback(&self, qualname: &str) -> bool {
         self.loop_callbacks.get(qualname).is_some()
     }
@@ -903,6 +954,11 @@ impl Catalog {
         &self.lazy_attributes
     }
 
+    /// The `[[exit_stack]]` groups.
+    pub fn exit_stacks(&self) -> &[ExitStack] {
+        &self.exit_stacks
+    }
+
     /// The `[[state_namespace]]` groups, in order (their index identifies them).
     pub fn state_namespaces(&self) -> &[StateNamespace] {
         &self.state_namespaces
@@ -925,6 +981,7 @@ impl Catalog {
             .all()
             .chain(self.blocking_decorators.all())
             .chain(self.offload.all())
+            .chain(self.copies.iter().cloned())
             .chain(self.loop_callbacks.all())
             .chain(self.inspectors.all())
             .chain(self.observers.iter().flat_map(|o| {
@@ -951,6 +1008,9 @@ impl Catalog {
                 let app = n.app.iter().flat_map(|a| a.owners.iter());
                 let lifespan = n.lifespan.iter().flat_map(|l| l.owners.iter());
                 n.owners.iter().chain(app).chain(lifespan).cloned()
+            }))
+            .chain(self.exit_stacks.iter().flat_map(|e| {
+                [&e.callbacks, &e.contexts, &e.runs, &e.moves].into_iter().flatten().cloned()
             }))
             .chain(self.blocks_in.iter().flatten().cloned())
             .collect();

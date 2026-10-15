@@ -161,7 +161,7 @@ a class name stands for constructing the class.
 |---|---|---|
 | `[[sink]]` | these functions block | `category`, `advice`, `functions`; `direct` (only calls made directly from loop code count), `opt_in` (only with `--cpu`), `unless_given` (keyword arguments that make a call skip the blocking work), `blocks_in` (the function to name in diagnostics) |
 | `[[blocking_decorator]]` | sync functions decorated with these block | as `[[sink]]` |
-| `[offload]` | callables passed to these run in a worker thread | `functions` |
+| `[offload]` | callables passed to these run in a worker thread | `functions`; `copies` (those that may run it in another process, on a pickled copy: an exit stack's `close` handed there leaves the original full) |
 | `[loop_callback]` | callables passed to these run on the event loop later | `functions` |
 | `[inspects]` | callables passed to these are only inspected, never called | `functions` |
 | `[[arguments]]` | what these functions do with their arguments, in the calling thread | `functions`, and any of: `calls` (callables given there are called), `iterates` (iterables given there are iterated), `enters` (context managers given there are entered and exited), `methods` (methods called on the first positional argument), `lazy` (the call returns a lazy iterator: iterating it iterates what `iterates` names, and what `calls` names runs where it is consumed); for calls declaring a field in a class body, `factory` (constructing the class without the field calls the callable given there) and `names` (string literals giving other names of the field) |
@@ -172,6 +172,7 @@ a class name stands for constructing the class.
 | `[[builds_on_loop]]` | a class (or a factory) given to these at `slot` is constructed (called) by the library later, on the loop: its `__init__` runs there, with the project overrides of what the library `__init__` it inherits calls on `self` (`Response.__init__` calls `self.render`) | `kind` (what running it is called in diagnostics), `slot`, `functions`; `label` (how diagnostics name what reaches it; default: the function's `[[entry]]`), `unless_passthrough` (not when every callable the same call registers always returns one of its entry's `passthrough` classes) |
 | `[[lazy_attribute]]` | `name = factory(...)` in a class body makes reading `instance.name` load it, running `loads`, unless it is already loaded (SQLAlchemy's `relationship()`) | `factories`, `loads`; `keyword` and `lazy` (the factory's keyword choosing how it loads, and its literal values that load on read; without the keyword, it does), `eager` (options loading the attributes they name up front), `expires_all` and `expires` (calls expiring every loaded attribute, or those of the instance given first), `reload` (`{ functions, names }`: calls loading the attributes named at `names` on the instance given first; given none, they expire it), `raises_under` (classes under which a load raises instead of blocking: a function naming one loads nothing) |
 | `[[observer]]` | a registry: `attach` calls attach observers (instances of `classes`, or callables) to the registry they are called on, and its `dispatch` calls run them on the calling thread (stdlib logging handlers, filters and formatters; blinker receivers) | `dispatch`; `attach` (`{ functions, propagates, callable }`), `classes` (`{ base, runs, calls, exception_only, level, offloaded_by }`: what runs on an attached instance: `runs`, or what the library's methods call on `self` where the project does not override them), `scope` (`{ naming, keyword, root, separator, stop }`: how registries are named; observers only run for the registries they are attached to); logging only: `levels`, `exception`, `level_names`, `level_keyword`, `default_level`, `threshold`, `any_level` |
+| `[[exit_stack]]` | calls storing a callable (`callbacks`), or a context manager's exit (`contexts`: entered now), on the instance they are called on, which runs what it stores later, where `runs` calls run it (and where a `with` block on it ends, when its `__exit__` is one); `moves` calls move what it stores to a new instance (`pop_all()`). Where hydroid cannot follow the instance to where it runs, the call does what `[[arguments]]` says | `callbacks`, `contexts`, `runs`, `moves` |
 | `[[state_namespace]]` | an attribute namespace the library types as `Any` (`app.state`, Flask's `g`): reading `<namespace>.name` gets the class of what the project stores under `name` there, when every store (and every key of a lifespan's yielded dict) agrees | `owners` (classes whose instances own one); `attribute` (the owners' attribute holding it; without it, the owner itself); `app` (`{ attribute, owners }`: `<owner>.<attribute>` is the application, typed as the one project subclass of `owners`); `lifespan` (`{ owners, keyword }`: the dicts yielded by the lifespan given at `keyword` to the constructor of `owners` go into the namespace) |
 
 Argument slots (`calls`, `iterates`, `enters`) are positions (`0` is the first argument after
@@ -248,13 +249,38 @@ go-to-definition) to the functions it can run. Implicit calls are included:
   call does not give (`[[arguments]]` `factory`).
 
 The catalog adds what library code does with its arguments (`[[arguments]]`), such as
-`sorted(xs, key=f)`, `stack.enter_context(cm)` or `copy_context().run(f)`. Callables passed as
+`sorted(xs, key=f)` or `copy_context().run(f)`. Callables passed as
 arguments are recorded as flows (`to_thread(f)`, `Depends(dep)`, `on_startup=[f]`,
 decorators), and so are callables stored on instances and returned by functions. Calls through
 dispatch tables (`TABLE[key](...)` on a dict, list or tuple literal) resolve to the callables
 stored there, only the one under `key` when the key is a literal. When ty does not know a
 value's type because it comes from an unannotated function, the class that function returns is
 used.
+
+Storing a callable or a context manager's exit on an exit stack (`[[exit_stack]]`:
+`stack.callback(f)`, `stack.enter_context(cm)`) does not run it: it runs where the stack is run,
+`stack.close()` or the end of a `with` block on it, or wherever `stack.close` is handed to
+(`await asyncio.to_thread(stack.close)` runs it in a worker thread), on the stack `pop_all()`
+moved it to. The stack is followed only in a local variable of the function creating it, and
+only when every statement of that function touching it has one of the shapes modeled exactly:
+storing, closing or moving it as a statement of its own, handing its sync `close` to a function
+the catalog says calls what it is given later (`[offload]`, `[loop_callback]`, `[[entry]]`),
+`if` statements, a sync `with` block on the stack alone, and `try` ...
+`finally` without handlers (the `finally` runs on every way out: normal end, `return`,
+exception). Exceptions and `return` leave through the `with` blocks and `finally` clauses
+around them. Every statement may raise, but for literals, names bound on every path, reads of
+an attribute a plain project class always assigns in its `__init__`, and f-strings formatting
+those as `str`, `int` or `float` without a spec. An awaited hand-off,
+`await asyncio.to_thread(stack.close)` (the awaited call itself, not one nested in it), has run
+the stack once the await returns. Any other use
+(a loop, `except` handlers, a `with` on another manager, an async stack, rebinding the stack's
+name while it holds stores, a builtin function such as `locals()` that can reach the frame,
+handing it to another function, returning or storing it) leaves the stack unfollowed: its store
+calls do what their `[[arguments]]` entry says, so a new library declares both,
+`[[exit_stack]]` for where its stores run and `[[arguments]]` (`calls`, `enters`) for reporting
+them where they are stored when its stacks are not followed; without `[[arguments]]`, those
+stores run nothing. A stack that is a project subclass of a stack class is not followed either,
+and neither is a function calling a builtin that can reach its frame (`locals()`, `exec`).
 
 Objects read back from a namespace the library types as `Any` (`[[state_namespace]]`:
 `app.state.x`, `request.state.x`, a lifespan's `yield {"x": ...}`) get the class the project
@@ -324,6 +350,11 @@ reachable on the loop. Not modeled yet:
 - `getattr(obj, "name")` and containers of callables (`HANDLERS[kind]()`);
 - metaclasses;
 - `.pyi`-only libraries under `--follow-libs`.
+- Exit stacks: an exit that runs on the loop only when an unexpected exception is raised between
+  storing it and an offloaded close (a property or `__format__` raising, an attribute deleted
+  where hydroid does not see it) may go unreported; so may a stack reached through
+  `sys._getframe()` or `inspect`; `stack.push(cm)` with a context manager object stores its
+  `__exit__`, which hydroid does not model.
 
 Classes never instantiated: a virtual call on a base class only dispatches to the overrides of
 subclasses that can have instances. A class can have instances if:
