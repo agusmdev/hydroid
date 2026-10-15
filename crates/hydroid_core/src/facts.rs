@@ -5,14 +5,14 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FnId(pub u32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ClassId(pub u32);
 
 /// A 1-based source position. `path` is relative to the project root when inside it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Location {
     pub path: String,
     pub line: u32,
@@ -61,17 +61,56 @@ pub struct Function {
     /// An undecorated generator function: calling it only creates the generator, iterating the
     /// generator runs the body.
     pub is_generator: bool,
+    /// A method whose first parameter is its receiver (the instance, or the class of a
+    /// `classmethod`): not a `staticmethod`.
+    #[serde(default)]
+    pub takes_receiver: bool,
     /// A pydantic validator: constructing or validating its model runs it.
     pub is_validator: bool,
+    /// A pydantic serialization hook (`@computed_field`, `@field_serializer`,
+    /// `@model_serializer`): dumping its model runs it.
+    pub is_serializer: bool,
+    /// The fields a serialization hook is for (`@field_serializer("a", "b")`, the name of a
+    /// `@computed_field`): excluding all of them from a dump skips it. Empty: any field.
+    pub serializes: Vec<String>,
+    /// A serialization hook only used when dumping to JSON (`when_used="json"` or
+    /// `"json-unless-none"`): python-mode dumps (`model_dump()`) skip it.
+    pub json_only: bool,
+    /// A SQLAlchemy attribute validator (`@validates("email")`): setting one of these attributes
+    /// on an instance of its class (in the constructor, or `obj.email = ...`) runs it.
+    pub validates: Vec<String>,
     pub params: Vec<String>,
     /// Lexically enclosing function (closures read its parameters).
     pub parent: Option<FnId>,
     pub class: Option<ClassId>,
     /// Resolved decorator callables, outermost first.
     pub decorators: Vec<FnId>,
+    /// The methods a library method calls on its own instance (`self.name(...)`): a project
+    /// subclass overriding one of them runs its override there (template methods).
+    pub self_calls: Vec<String>,
+    /// The methods `async def` closures defined in a library method call on its instance:
+    /// `FastAPI.setup` registers the route `async def openapi(req)`, which calls `self.openapi()`
+    /// on the loop. A project callable assigned over one of them on an instance runs there.
+    #[serde(default)]
+    pub closure_self_calls: Vec<String>,
+    /// The parameters a library function calls, directly or through a local name: a class
+    /// passed there gets instantiated (`route_class(...)`).
+    #[serde(default)]
+    pub called_params: Vec<String>,
+    /// `(parameter, attribute)`: the parameters a library method stores on its instance
+    /// (`self.route_class = route_class`).
+    #[serde(default)]
+    pub stored_params: Vec<(String, String)>,
+    /// The attributes of its instance a library method calls (`self.route_class(...)`).
+    #[serde(default)]
+    pub called_attributes: Vec<String>,
     /// Whether the body was analyzed. Unanalyzed functions (stdlib stubs, libraries without
     /// `--follow-libs`) are leaves: only the catalog knows whether they block.
     pub analyzed: bool,
+    /// A copy of this method made by the analysis for one kind of `self` (see
+    /// [`Instance`]): the method it copies.
+    #[serde(default)]
+    pub specializes: Option<FnId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -79,11 +118,77 @@ pub struct Class {
     pub qualname: String,
     pub bases: Vec<ClassId>,
     pub is_protocol: bool,
+    /// The project names the class (outside class bases), registers it (decorators, class
+    /// keywords), or it is a library class: it may have instances of its own. A project class
+    /// nothing names is only a base: its instances are instances of subclasses.
+    #[serde(default)]
+    pub referenced: bool,
     /// Methods defined directly in the class body.
     pub methods: Vec<(String, FnId)>,
+    /// Classes named in the annotations of its class-level fields (nested models). Project
+    /// classes only.
+    pub fields: Vec<ClassId>,
+    /// Fields declared with `Field(default_factory=f)` (pydantic) or `field(default_factory=f)`
+    /// (dataclasses): constructing the class without giving the field calls the factory. Each is
+    /// `(the names the field can be given by, the factory)`.
+    pub default_factories: Vec<(Vec<String>, Value)>,
+    /// The class-level fields of a project class (pydantic model fields), see [`ModelField`].
+    pub model_fields: Vec<ModelField>,
 }
 
+/// A class-level field of a project class: `name: Annotated[list[Item], AfterValidator(f)]`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ModelField {
+    /// The names the field can be given by (its name and aliases).
+    pub names: Vec<String>,
+    /// Classes named in its annotation (looking through type aliases): data given to the field
+    /// is validated into these models.
+    pub classes: Vec<ClassId>,
+    /// Validators attached by `Annotated` metadata (`AfterValidator(f)`, ...): validating data
+    /// given to the field runs them.
+    pub validators: Vec<FnId>,
+    /// Serializers attached by `Annotated` metadata (`PlainSerializer(f)`, ...): dumping the
+    /// field runs them.
+    pub serializers: Vec<FnId>,
+    /// The `serializers` only used when dumping to JSON (`when_used="json"`, ...).
+    pub json_serializers: Vec<FnId>,
+}
+
+/// What a framework validates and serializes around a function registered with an `[[entry]]`
+/// (catalog `validates_params`, `serializes_return`, `validates_return`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Signature {
+    pub function: FnId,
+    /// What validating the parameters FastAPI fills from the request (not `Depends(...)` ones)
+    /// runs: the classes named in their annotations, and the validators attached to them with
+    /// `Annotated[str, AfterValidator(f)]`.
+    pub params: Vec<Value>,
+    /// Classes named in the return annotation (the default `response_model`). Empty for
+    /// generators, whose items are streamed.
+    pub annotation: Vec<ClassId>,
+    /// Classes of the instances it returns (inferred). Empty for generators.
+    pub returned: Vec<ClassId>,
+    /// Some value it returns has a type ty does not know (it may be a model instance).
+    pub returns_unknown: bool,
+    /// The catalog `[[entry]]` `passthrough` classes every value it returns is an instance of
+    /// (frameworks send these as they are).
+    pub always_returns: Vec<String>,
+}
+
+/// Response options given to an `[[entry]]` function at a call (its `response_model` keyword
+/// given `None`, its `response_exclude` keyword).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResponseOptions {
+    pub caller: FnId,
+    pub location: Location,
+    /// The response model keyword given `None`: no response model, not even the return
+    /// annotation.
+    pub no_model: bool,
+    /// The top-level fields left out of the response (`{"a", "b"}` at the exclude keyword).
+    pub exclude: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Call {
     pub caller: FnId,
     pub location: Location,
@@ -92,6 +197,12 @@ pub struct Call {
     pub targets: Vec<FnId>,
     /// `obj.method(...)` on an instance: overrides in subclasses may run instead.
     pub virtual_dispatch: bool,
+    /// The class of the instance a method is called on (`super().name(...)`: the class of the
+    /// calling method). A target's `super().name(...)` runs the next `name` in this class's MRO,
+    /// which, through cooperative mixins, is not the one the target's own bases define.
+    pub receiver: Option<ClassId>,
+    /// `super().name(...)`: the name.
+    pub super_name: Option<String>,
     /// The callee is a parameter of this or an enclosing function: `(owner, name)`.
     pub param: Option<(FnId, String)>,
     pub awaited: bool,
@@ -105,10 +216,120 @@ pub struct Call {
     /// callables the class stores in that attribute (see [`Facts::stores`]).
     pub attribute: Option<(ClassId, String)>,
     /// The callee is the value returned by calling these functions (`get_loader()()`,
-    /// `nap = make_sleeper(); nap()`), see [`Facts::returns`].
+    /// `nap = make_sleeper(); nap()`), see [`Facts::returns`]. Recorded for resolved callees
+    /// too: a decorator applied by hand (`safe = retrying.wraps(fetch)`) returns a wrapper ty
+    /// types as the function it wraps.
     pub returned_by: Vec<FnId>,
+    /// Attributes this call sets on an instance of the class: the keyword arguments of a
+    /// construction, or the target of `obj.name = value`. Their ORM validators run (see
+    /// [`Function::validates`]).
+    pub sets: Option<(ClassId, Vec<String>)>,
+    /// The arguments the call gives explicitly, by keyword: a construction's default factories
+    /// for these fields do not run, and sinks skip their blocking work for some (catalog
+    /// `unless_given`). `None` when that is not known (positional arguments).
+    pub given: Option<Vec<String>>,
+    /// The call passes `**mapping`: any keyword may be given.
+    pub unpacks: bool,
+    /// Keyword arguments given model instances (or nothing to validate, like `[]`): pydantic
+    /// does not validate them into nested models again.
+    pub instances: Vec<String>,
+    /// A dump (`model.model_dump(...)`: a catalog `[[runs_hooks]]` operation with `runs = "dump"`):
+    /// what it dumps.
+    pub dump: Option<Box<Dump>>,
     /// Why nothing was resolved (only set when `targets` is empty and `param` is `None`).
     pub unresolved: Option<String>,
+    /// The logging level the call passes: its `level=` keyword, or the first argument of
+    /// `setLevel(...)` and `log(...)`.
+    pub level: Option<Box<Level>>,
+    /// See [`LogUse`]: set on logging calls, on calls attaching handlers, filters and formatters,
+    /// and on constructions whose instance only gets attached.
+    pub logging: Option<Box<LogUse>>,
+    /// See [`Instance`]: set on `obj.name(...)` calls whose dispatch depends on more than the
+    /// declared class of `obj`.
+    pub instance: Option<Box<Instance>>,
+    /// `(parameter, class)`: arguments that are exactly an instance of a class (`io.BytesIO()`,
+    /// or a variable only ever assigned such constructions), by the callee's parameter.
+    #[serde(default)]
+    pub exact_args: Vec<(String, ClassId)>,
+    /// The callees are decorated generator functions, and what the call returns is a context
+    /// manager or an iterator (`@contextmanager`): their bodies run when it is entered or
+    /// iterated (`iterates`), not now.
+    #[serde(default)]
+    pub deferred_body: bool,
+    /// `(line, column)` of a call in the same caller this call is deferred to: it computes an
+    /// element of a lazy iterable passed to that call (`to_thread(list, map(f, xs))`,
+    /// `run_in_threadpool(sum, (f(x) for x in xs))`), so it runs wherever that call pulls the
+    /// elements. Not run here when that call is an offload API.
+    #[serde(default)]
+    pub lazy_in: Option<(u32, u32)>,
+}
+
+/// What is known about the instance a method is called on (`obj.name(...)`), beyond the
+/// declared class of `obj`, that narrows which `name` runs.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Instance {
+    pub name: String,
+    /// `obj` is the calling method's `self` (or `cls`): which `name` runs depends on the instance
+    /// the method itself was called on.
+    pub is_self: bool,
+    /// `obj` is `self.<attribute>`, typed by a type variable of the class (`self.repo: RepoT` in
+    /// `class Service(Generic[RepoT])`): the class an instance specializes it to (see `binds`)
+    /// says which `name` runs.
+    pub generic: Option<String>,
+    /// `obj` is exactly an instance of one of these classes (`Model()`, or a variable only ever
+    /// assigned constructions): `name` is the one their MROs find, never an override in a
+    /// subclass.
+    pub exact: Vec<ClassId>,
+    /// `(attribute, class)`: attributes of `obj` typed by a type variable, and the class `obj`'s
+    /// type specializes each to (`TagService(BaseService[TagRepository])`: `repo`,
+    /// `TagRepository`).
+    pub binds: Vec<(String, ClassId)>,
+    /// `obj` is this parameter of the calling function (not its receiver, never assigned in
+    /// it): which `name` runs depends on what each caller passes (see [`Call::exact_args`]).
+    #[serde(default)]
+    pub param: Option<String>,
+}
+
+/// The arguments of a pydantic dump that decide which serializers run.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Dump {
+    /// Dumps to JSON (`model_dump_json()`, `model_dump(mode="json")`), or the mode is not
+    /// known: JSON-only serializers run too.
+    pub json: bool,
+    /// `exclude={"a"}` (a literal set, or a dict mapping names to `True`): top-level fields
+    /// left out.
+    pub exclude: Vec<String>,
+    /// `include={"a", "b"}` (a literal set or dict): the only top-level fields dumped.
+    pub include: Option<Vec<String>>,
+}
+
+/// How a call takes part in the logging setup.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LogUse {
+    /// The logger the call is made on (`log.info(...)`, `log.addHandler(h)`; the root logger
+    /// for `logging.info(...)`), when it is known to be one with a known name.
+    pub logger: Option<LoggerName>,
+    /// `addHandler(h)`, `addFilter(f)`, `setFormatter(f)`: the class of the instance attached.
+    pub attaches: Option<ClassId>,
+    /// A construction whose instance is only attached (`log.addHandler(Handler())`, or held in
+    /// a variable that is only configured and attached).
+    pub attach_only: bool,
+}
+
+/// A logger name: `getLogger("audit")`, `getLogger(__name__)` (the module), `""` for the root
+/// logger. Not `exact`: only the start of it is known (`getLogger(f"svc.{name}")`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoggerName {
+    pub name: String,
+    pub exact: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Level {
+    /// `None`: not a known level (a variable, a setting).
+    pub value: Option<u32>,
+    /// `obj.setLevel(...)` on an instance of this class.
+    pub receiver: Option<ClassId>,
 }
 
 /// `self.name = value` in a method of `class`, with a callable (or a parameter) as the value.
@@ -128,6 +349,9 @@ pub struct Flow {
     pub into: FnId,
     pub slot: Slot,
     pub value: Value,
+    /// The class of the instance a bound method value belongs to (`Depends(scheme)`: the class
+    /// of `scheme`, whose `__call__` is the value).
+    pub receiver: Option<ClassId>,
     /// First string-literal argument of the receiving call (route paths, event names).
     pub literal: Option<String>,
 }
@@ -161,8 +385,14 @@ pub struct Facts {
     /// `(dispatcher, implementation)`: calling the dispatcher may run the implementation
     /// (`@render.register` on a `functools.singledispatch` function).
     pub dispatches: Vec<(FnId, FnId)>,
+    /// Signatures of the functions that annotate or return classes, see [`Signature`].
+    pub signatures: Vec<Signature>,
+    /// See [`ResponseOptions`].
+    pub response_options: Vec<ResponseOptions>,
     /// Lines carrying a `# hydroid: ignore` comment.
     pub suppressed: Vec<(String, u32)>,
+    /// `logger.propagate = value` on a logger with a known name: `(name, value is False)`.
+    pub stops_propagation: Vec<(String, bool)>,
 }
 
 impl Facts {

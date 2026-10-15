@@ -31,20 +31,20 @@ pub fn check(options: &Options) -> anyhow::Result<Report> {
     for document in &options.catalogs {
         catalog.extend(document, options.cpu)?;
     }
-    let follow = |qualname: &str| catalog.sink(qualname).is_none() && !catalog.is_offload(qualname);
     let started = Instant::now();
     let extraction = extract(&ExtractOptions {
         root: &options.root,
         python: options.python.as_deref(),
         follow_libs: options.follow_libs,
-        follow: &follow,
+        catalog: &catalog,
         exclude: &options.exclude,
         cache: options.cache,
-        // With --follow-libs, which library bodies get extracted depends on the catalogs.
+        // What extraction reads of the catalogs, and with --follow-libs which library bodies
+        // get extracted, depends on them.
         cache_salt: &format!("{} {:?}", options.cpu, options.catalogs),
     })?;
     let extracted = Instant::now();
-    let mut report = analyze(&extraction.facts, &catalog);
+    let mut report = analyze(extraction.facts, &catalog);
     report.stats.files = extraction.files;
     report.stats.extract_ms = (extracted - started).as_millis();
     report.stats.analyze_ms = extracted.elapsed().as_millis();

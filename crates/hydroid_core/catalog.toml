@@ -8,6 +8,10 @@
 # ---------------------------------------------------------------------------------------------
 # Blocking functions. A call to one of these on the event loop is a diagnostic.
 # A call whose result is awaited is never blocking (dual sync/async APIs share definitions).
+# Stdlib bodies are never analyzed: stdlib helpers doing I/O internally (`shutil.make_archive`,
+# `socket.getfqdn`) are listed by name. `unless_given` lists arguments that make a call skip the
+# blocking work; calls giving one, or positional arguments (not known to leave them out), don't
+# count. `blocks_in` names the function a helper blocks in, for the diagnostic.
 # ---------------------------------------------------------------------------------------------
 
 [[sink]]
@@ -59,6 +63,10 @@ functions = [
     "_socket.gethostbyname",
     "_socket.gethostbyname_ex",
     "_socket.gethostbyaddr",
+    "_socket.getnameinfo",
+    "socket.getfqdn",
+    "ssl.get_server_certificate",
+    "urllib.robotparser.RobotFileParser.read",
     "socket.socket.accept",
     "_socket.socket.connect",
     "_socket.socket.recv",
@@ -76,6 +84,10 @@ functions = [
     "smtplib.SMTP.send_message",
     "smtplib.SMTP.quit",
     "ftplib.FTP.__init__",
+    "imaplib.IMAP4.__init__",
+    "imaplib.IMAP4_SSL.__init__",
+    "poplib.POP3.__init__",
+    "poplib.POP3_SSL.__init__",
     "ftplib.FTP.connect",
     "ftplib.FTP.login",
     "imaplib.IMAP4.__init__",
@@ -173,6 +185,21 @@ functions = [
     "shutil.copytree",
     "shutil.move",
     "shutil.copyfileobj",
+    "shutil.copymode",
+    "shutil.copystat",
+    "shutil.chown",
+    "shutil.disk_usage",
+    "shutil.make_archive",
+    "shutil.unpack_archive",
+    "shutil.which",
+    "zipfile.is_zipfile",
+    "tarfile.is_tarfile",
+    "filecmp.cmp",
+    "filecmp.cmpfiles",
+    "configparser.RawConfigParser.read",
+    "netrc.netrc.__init__",
+    "shelve.open",
+    "dbm.open",
     "typing.IO.read",
     "typing.IO.readline",
     "typing.IO.readlines",
@@ -180,6 +207,32 @@ functions = [
     "typing.IO.writelines",
     "shutil._RmtreeType.__call__",
 ]
+
+# Stdlib handlers doing I/O in `emit`, which a logging call runs on the calling thread (see the
+# logging `[[observer]]`). Typeshed declares no `emit` on them: these are the methods their
+# `emit` calls on every record.
+[[sink]]
+category = "file"
+advice = "log through a `logging.handlers.QueueHandler` and attach the handler to a `QueueListener`, which emits from its own thread"
+functions = [
+    "logging.handlers.RotatingFileHandler.shouldRollover",
+    "logging.handlers.TimedRotatingFileHandler.shouldRollover",
+    "logging.handlers.WatchedFileHandler.reopenIfNeeded",
+]
+
+[[sink]]
+category = "network"
+advice = "log through a `logging.handlers.QueueHandler` and attach the handler to a `QueueListener`, which emits from its own thread"
+functions = ["logging.handlers.SocketHandler.send"]
+
+# Called without a domain, `make_msgid` names the host with `socket.getfqdn()` (a reverse DNS
+# lookup).
+[[sink]]
+category = "network"
+advice = "pass `domain=...`, or `await asyncio.to_thread(...)`"
+unless_given = ["domain"]
+blocks_in = "socket.getfqdn"
+functions = ["email.utils.make_msgid"]
 
 [[sink]]
 category = "subprocess"
@@ -335,10 +388,11 @@ advice = "use `tenacity.AsyncRetrying` / decorate the coroutine, whose waits use
 functions = ["tenacity.Retrying.__call__", "tenacity.BaseRetrying.__iter__"]
 
 # Calling a sync function decorated with these runs a retry loop that sleeps between attempts.
+# So does calling what they return when applied by hand (`safe = retrying.wraps(fetch)`).
 [[blocking_decorator]]
 category = "retry"
 advice = "decorate a coroutine instead (tenacity then waits with `asyncio.sleep`), or run the call with `await asyncio.to_thread(...)`"
-functions = ["tenacity.retry"]
+functions = ["tenacity.retry", "tenacity.BaseRetrying.wraps"]
 
 [[sink]]
 category = "cpu"
@@ -355,6 +409,8 @@ functions = [
 # ---------------------------------------------------------------------------------------------
 # Work moved off the event loop. Callables passed to these run in a worker thread or process:
 # hydroid never follows them, and never follows the bodies of these functions.
+#   copies  those that may run it in another process, on a pickled copy: what it does there
+#           changes nothing here (closing a copy of an exit stack leaves the original full)
 # ---------------------------------------------------------------------------------------------
 [offload]
 functions = [
@@ -370,6 +426,400 @@ functions = [
     "threading.Thread.__init__",
     "multiprocessing.process.BaseProcess.__init__",
 ]
+copies = [
+    "anyio.to_process.run_sync",
+    "asyncio.events.AbstractEventLoop.run_in_executor",
+    "concurrent.futures._base.Executor.submit",
+    "concurrent.futures._base.Executor.map",
+    "multiprocessing.process.BaseProcess.__init__",
+]
+
+# ---------------------------------------------------------------------------------------------
+# Objects storing callables, and context managers' exits, that they run later: a call storing
+# one does not run it, the calls running what the instance stores do, where they run.
+#   callbacks  calls storing the callable given first
+#   contexts   calls entering the context manager given first (now), and storing its exit
+#   runs       calls running everything stored; leaving a `with` block on the instance runs it
+#              too when its `__exit__` (`__aexit__`) is one
+#   moves      calls returning a new instance holding everything stored, the original left empty
+# Where hydroid cannot follow the instance from its construction to every run (it is handed to
+# another function, returned, stored), the call does what `[[arguments]]` says: an exit stack's
+# `callback` and `enter_context` are taken to run what they store right away.
+# ---------------------------------------------------------------------------------------------
+[[exit_stack]]
+callbacks = ["contextlib._BaseExitStack.callback", "contextlib._BaseExitStack.push"]
+contexts = ["contextlib._BaseExitStack.enter_context"]
+runs = [
+    "contextlib.ExitStack.close",
+    "contextlib.ExitStack.__exit__",
+    "contextlib.AsyncExitStack.aclose",
+    "contextlib.AsyncExitStack.__aexit__",
+]
+moves = ["contextlib._BaseExitStack.pop_all"]
+
+[[exit_stack]]
+callbacks = ["unittest.case.TestCase.addCleanup"]
+contexts = ["unittest.case.TestCase.enterContext"]
+runs = ["unittest.case.TestCase.doCleanups"]
+
+# ---------------------------------------------------------------------------------------------
+# Registries running the observers attached to them on the calling thread.
+#   dispatch       calls running the observers attached (to the registry they are called on, or
+#                  to the root one for a module-level function)
+#   attach         { functions, propagates, callable }: calls attaching what they are given
+#                  first to the registry (or observer) they are called on; `propagates`: it also
+#                  runs for the registries below; `callable`: a plain callable may be attached
+#   classes        { base, runs, calls, exception_only, level, offloaded_by }: what a dispatch
+#                  runs on an attached instance of `base`: `runs`, or, where the project does not
+#                  override it, what the library's method calls on `self` (`calls`, by method);
+#                  `exception_only` methods only for records with an exception; `level`: calls
+#                  setting the observer's level; `offloaded_by`: classes whose instances, once
+#                  constructed, run these observers in their own thread
+#   scope          { naming, keyword, root, separator, stop }: calls naming registries (first
+#                  argument, or `keyword`; none: the root), a name (and module attribute) for the
+#                  root, the separator of hierarchical names, and the attribute that, set
+#                  `False`, keeps records from going up
+#   levels         the level each dispatch (by last name) gives; the others take it as an
+#                  argument (first, or `level_keyword`)
+#   exception      dispatches (by last name) whose records carry an exception
+#   level_names    level names, as strings or module attributes
+#   default_level  dispatches below it run nothing, unless the project sets a lower `threshold`
+#   threshold      calls setting that level; `any_level`: calls that may set it to anything
+# ---------------------------------------------------------------------------------------------
+# stdlib logging (`Logger._log -> handle -> callHandlers -> Handler.handle -> filter / emit`):
+# the `filter`, `emit` and `format` overrides of the project's handlers, filters and formatters
+# (and the I/O of the stdlib handlers above) run there, for records at or above the logger and
+# handler levels the project sets. `debug` is left out: below the levels applications run with,
+# it returns before any filter or handler runs.
+[[observer]]
+dispatch = [
+    "logging.Logger.info",
+    "logging.Logger.warning",
+    "logging.Logger.warn",
+    "logging.Logger.error",
+    "logging.Logger.exception",
+    "logging.Logger.critical",
+    "logging.Logger.log",
+    "logging.LoggerAdapter.info",
+    "logging.LoggerAdapter.warning",
+    "logging.LoggerAdapter.warn",
+    "logging.LoggerAdapter.error",
+    "logging.LoggerAdapter.exception",
+    "logging.LoggerAdapter.critical",
+    "logging.LoggerAdapter.log",
+    "logging.info",
+    "logging.warning",
+    "logging.warn",
+    "logging.error",
+    "logging.exception",
+    "logging.critical",
+    "logging.log",
+]
+attach = [
+    { functions = ["logging.Logger.addHandler"], propagates = true },
+    { functions = ["logging.Filterer.addFilter"], callable = true },
+    { functions = ["logging.Handler.setFormatter"] },
+]
+classes = [
+    { base = "logging.Handler", runs = "handle", calls = { handle = ["filter", "emit"], emit = ["format", "shouldRollover", "reopenIfNeeded", "send"] }, level = ["logging.Handler.setLevel", "logging.Handler.__init__"], offloaded_by = ["logging.handlers.QueueListener"] },
+    { base = "logging.Filter", runs = "filter" },
+    { base = "logging.Formatter", runs = "format", calls = { format = ["usesTime", "formatMessage", "formatTime", "formatException", "formatStack"] }, exception_only = ["formatException", "formatStack"] },
+]
+scope = { naming = ["logging.getLogger"], keyword = "name", root = "root", separator = ".", stop = "propagate" }
+levels = { info = 20, warning = 30, warn = 30, error = 40, exception = 40, critical = 50 }
+exception = ["exception"]
+level_names = { NOTSET = 0, DEBUG = 10, INFO = 20, WARN = 30, WARNING = 30, ERROR = 40, FATAL = 50, CRITICAL = 50 }
+level_keyword = "level"
+default_level = 30
+threshold = ["logging.Logger.setLevel", "logging.LoggerAdapter.setLevel", "logging.basicConfig"]
+any_level = ["logging.config.dictConfig", "logging.config.fileConfig"]
+
+# blinker (not built in; works through `[tool.hydroid]` as is): `Signal.send` calls the receivers
+# connected to the signal, in the sending thread; `signal("name")` names it.
+# [[observer]]
+# dispatch = ["blinker.base.Signal.send"]
+# attach = [{ functions = ["blinker.base.Signal.connect"], callable = true }]
+# scope = { naming = ["blinker.base.Namespace.signal"], keyword = "name" }
+
+# ---------------------------------------------------------------------------------------------
+# What functions do with their arguments, in the thread calling them (stub and library bodies are
+# not analyzed). A class stands for constructing it. Slots are a position (0: the first argument
+# after `self`), a keyword, or "*" (every positional argument not in `calls`).
+#   calls     callables given there are called during the call
+#   iterates  iterables given there are iterated during the call
+#   enters    context managers given there are entered and exited
+#   methods   methods called on the first positional argument
+#   lazy      the call returns a lazy iterator over what `iterates` names: iterating it iterates
+#             those, and `calls` runs where it is consumed (in a worker thread when it is
+#             consumed there, see `[offload]`)
+# ---------------------------------------------------------------------------------------------
+[[arguments]]
+iterates = ["*"]
+functions = [
+    "builtins.list",
+    "builtins.tuple",
+    "builtins.set",
+    "builtins.frozenset",
+    "builtins.dict",
+    "builtins.sum",
+    "builtins.any",
+    "builtins.all",
+    "builtins.next",
+    "builtins.*.join",
+    "builtins.*.extend",
+    "builtins.*.update",
+]
+
+[[arguments]]
+iterates = ["*"]
+calls = ["key"]
+functions = ["builtins.sorted", "builtins.min", "builtins.max"]
+
+[[arguments]]
+calls = ["key"]
+functions = ["builtins.list.sort"]
+
+[[arguments]]
+calls = [0]
+iterates = [1]
+functions = ["functools.reduce"]
+
+[[arguments]]
+calls = [0]
+functions = ["_contextvars.Context.run", "contextlib._BaseExitStack.callback"]
+
+[[arguments]]
+calls = [0]
+iterates = ["*"]
+lazy = true
+functions = ["builtins.map", "builtins.filter"]
+
+[[arguments]]
+iterates = ["*"]
+lazy = true
+functions = ["builtins.zip", "builtins.enumerate", "builtins.reversed"]
+
+# `iter(x)` only calls `x.__iter__()`: a generator `__iter__` (like a generator function) creates
+# its generator, whose body runs when the result is advanced (`next`, `for`), maybe in a worker
+# thread (`to_thread(next, it)`).
+[[arguments]]
+iterates = [0]
+methods = ["__iter__"]
+lazy = true
+functions = ["builtins.iter"]
+
+[[arguments]]
+methods = ["__len__"]
+functions = ["builtins.len"]
+
+[[arguments]]
+enters = [0]
+functions = ["contextlib._BaseExitStack.enter_context"]
+
+[[arguments]]
+methods = ["close"]
+functions = ["contextlib.closing"]
+
+# The same for a third-party library, sortedcontainers: the sorted collections iterate the
+# iterable they are built from and call `key` on every element.
+# [[arguments]]
+# iterates = [0, "iterable"]
+# calls = [1, "key"]
+# functions = [
+#     "sortedcontainers.sortedlist.SortedList",
+#     "sortedcontainers.sortedlist.SortedKeyList",
+#     "sortedcontainers.sortedset.SortedSet",
+# ]
+#
+# [[arguments]]
+# iterates = ["*"]
+# functions = ["sortedcontainers.sortedlist.SortedList.update", "sortedcontainers.sortedset.SortedSet.update"]
+
+# ---------------------------------------------------------------------------------------------
+# Callables passed to these are only inspected (name, signature, docstring), never called: a
+# decorator's `@functools.wraps(func)` does not make its wrapper call `func`.
+# ---------------------------------------------------------------------------------------------
+[inspects]
+functions = [
+    "functools.wraps",
+    "functools.update_wrapper",
+    "inspect.signature",
+    "inspect.iscoroutinefunction",
+    "asyncio.coroutines.iscoroutinefunction",
+]
+
+# Field declarations in a class body: constructing the class without giving the field calls the
+# callable given at `factory` (constructs the class given there), and the field can also be given
+# by the string literals given at `names`.
+[[arguments]]
+factory = ["default_factory"]
+names = ["alias", "validation_alias"]
+functions = ["pydantic.fields.Field", "sqlmodel.main.Field"]
+
+[[arguments]]
+factory = ["default_factory"]
+functions = ["dataclasses.field"]
+
+# The same for other libraries: attrs (`attrs.field(factory=f, alias="x")`, its stubs define it in
+# `attrs`) and msgspec (`msgspec.field(default_factory=f, name="x")`).
+# [[arguments]]
+# factory = ["factory"]
+# names = ["alias"]
+# functions = ["attrs.field", "attr.attrib"]
+#
+# [[arguments]]
+# factory = ["default_factory"]
+# names = ["name"]
+# functions = ["msgspec.field"]
+
+# ---------------------------------------------------------------------------------------------
+# Model hooks: methods, and callables attached to fields, that validating or dumping a model runs
+# (inside pydantic-core, which no analysis can follow).
+#   [[hook]]        what makes a function a hook of its class: a decorator; or (with `callable`)
+#                   a class or function whose call in the `Annotated[...]` metadata of a field
+#                   attaches the callable given at that slot to the field
+#     runs          "validation" (constructing an instance or validating data into the class),
+#                   "dump", or "set" (setting the fields it names on an instance, constructor
+#                   keyword arguments included)
+#     fields        "arguments" (the fields the decorator's call names; "*": every field) or
+#                   "name" (the field named like the decorated function); default: every field
+#     json_only     { keyword, values }: a dump hook only runs for JSON dumps when its call gives
+#                   the keyword one of these literal values
+#   [[runs_hooks]]  operations running the hooks of the class they are called on (a class
+#                   object, or an instance)
+#     runs          "validation" (like constructing it, from any data) or "dump"
+#     json          a dump to JSON
+#     json_unless   { keyword, values }: when the call gives the keyword, the dump is to JSON
+#                   unless its literal value is one of these
+#     exclude       keyword naming (in a literal set or dict) the top-level fields left out
+#     include       keyword naming the only top-level fields dumped
+# ---------------------------------------------------------------------------------------------
+[[hook]]
+runs = "validation"
+functions = [
+    "pydantic.functional_validators.field_validator",
+    "pydantic.functional_validators.model_validator",
+    "pydantic.deprecated.class_validators.validator",
+    "pydantic.deprecated.class_validators.root_validator",
+]
+
+[[hook]]
+runs = "dump"
+fields = "arguments"
+json_only = { keyword = "when_used", values = ["json", "json-unless-none"] }
+functions = ["pydantic.functional_serializers.field_serializer"]
+
+[[hook]]
+runs = "dump"
+json_only = { keyword = "when_used", values = ["json", "json-unless-none"] }
+functions = ["pydantic.functional_serializers.model_serializer"]
+
+[[hook]]
+runs = "dump"
+fields = "name"
+functions = ["pydantic.fields.computed_field"]
+
+# SQLAlchemy's `@validates("email")` runs when `email` is set on an instance of the mapped class.
+[[hook]]
+runs = "set"
+fields = "arguments"
+functions = ["sqlalchemy.orm.mapper.validates"]
+
+# The same for another library, traitlets (not built in; works through `[tool.hydroid]` as is):
+# `@observe("count")` and `@validate("count")` run when `count` is set.
+# [[hook]]
+# runs = "set"
+# fields = "arguments"
+# functions = ["traitlets.traitlets.observe", "traitlets.traitlets.validate"]
+
+# `Annotated[T, AfterValidator(f)]`; annotated-types' `Predicate(f)` and `Not(f)`, which pydantic
+# runs as validators too.
+[[hook]]
+runs = "validation"
+callable = [0, "func"]
+functions = [
+    "pydantic.functional_validators.AfterValidator",
+    "pydantic.functional_validators.BeforeValidator",
+    "pydantic.functional_validators.PlainValidator",
+    "pydantic.functional_validators.WrapValidator",
+    "annotated_types.Predicate",
+    "annotated_types.Not",
+]
+
+[[hook]]
+runs = "dump"
+callable = [0, "func"]
+json_only = { keyword = "when_used", values = ["json", "json-unless-none"] }
+functions = ["pydantic.functional_serializers.PlainSerializer", "pydantic.functional_serializers.WrapSerializer"]
+
+[[runs_hooks]]
+runs = "validation"
+functions = [
+    "pydantic.main.BaseModel.model_validate",
+    "pydantic.main.BaseModel.model_validate_json",
+    "pydantic.main.BaseModel.model_validate_strings",
+    "pydantic.main.BaseModel.parse_obj",
+    "pydantic.main.BaseModel.parse_raw",
+    "sqlmodel.main.SQLModel.model_validate",
+    "sqlmodel.main.SQLModel.parse_obj",
+]
+
+[[runs_hooks]]
+runs = "dump"
+json = true
+exclude = "exclude"
+include = "include"
+functions = ["pydantic.main.BaseModel.model_dump_json", "pydantic.main.BaseModel.json"]
+
+[[runs_hooks]]
+runs = "dump"
+json_unless = { keyword = "mode", values = ["python"] }
+exclude = "exclude"
+include = "include"
+functions = ["pydantic.main.BaseModel.model_dump"]
+
+[[runs_hooks]]
+runs = "dump"
+exclude = "exclude"
+include = "include"
+functions = ["pydantic.main.BaseModel.dict"]
+
+# The same for another library, marshmallow: schemas run their `@pre_dump` / `@post_dump` hooks
+# when dumping and their `@pre_load` / `@post_load` / `@validates` hooks when loading.
+# [[hook]]
+# runs = "dump"
+# functions = ["marshmallow.decorators.pre_dump", "marshmallow.decorators.post_dump"]
+#
+# [[hook]]
+# runs = "validation"
+# functions = [
+#     "marshmallow.decorators.pre_load",
+#     "marshmallow.decorators.post_load",
+#     "marshmallow.decorators.validates",
+#     "marshmallow.decorators.validates_schema",
+# ]
+#
+# [[runs_hooks]]
+# runs = "dump"
+# functions = ["marshmallow.schema.Schema.dump", "marshmallow.schema.Schema.dumps"]
+#
+# [[runs_hooks]]
+# runs = "validation"
+# functions = ["marshmallow.schema.Schema.load", "marshmallow.schema.Schema.loads"]
+
+# ---------------------------------------------------------------------------------------------
+# Functions raising `raises` when no event loop runs in the calling thread. The handlers that
+# catch it (or one of its bases) of a `try` doing nothing but call these never run on the loop:
+# sync helpers shared by loop code and worker threads fall back to blocking work there.
+# ---------------------------------------------------------------------------------------------
+[[loop_probe]]
+raises = "builtins.RuntimeError"
+functions = ["_asyncio.get_running_loop"]
+
+# The same for a third-party library, sniffio:
+# [[loop_probe]]
+# raises = "sniffio._impl.AsyncLibraryNotFoundError"
+# functions = ["sniffio._impl.current_async_library"]
 
 # ---------------------------------------------------------------------------------------------
 # Sync callables passed to these run *on* the event loop.
@@ -388,9 +838,31 @@ functions = [
 
 # ---------------------------------------------------------------------------------------------
 # FastAPI / Starlette entry points: used to show which endpoint reaches a diagnostic.
+#   kind               what is registered ("route", "dependency", "middleware", ...)
+#   slot               the parameters taking the callable (or class) registered; a decorator
+#                      registers what it decorates. Without it, any argument.
+#   validates_params   the framework validates, on the loop, the annotated parameters of what is
+#                      registered (of its `__init__`, for a class) from the request
+#   serializes_return  the framework dumps what it returns on the loop (sync callables included)
+#   validates_return   the framework validates what it returns into the response model in the
+#                      thread the callable runs in (the loop for an `async def`)
+#   response_model     the keyword giving the response model (`None`: no model); the return
+#                      annotation otherwise
+#   response_exclude   the keyword naming top-level fields left out of the dump
+#   passthrough        classes sent as they are: a callable always returning instances of them
+#                      has its return value neither validated nor dumped
+#   injects            a parameter whose default (or `Annotated` metadata) is a call to these is
+#                      filled with what the callable at `slot` provides, not from the request
 # ---------------------------------------------------------------------------------------------
 [[entry]]
 kind = "route"
+slot = ["endpoint"]
+validates_params = true
+serializes_return = true
+validates_return = true
+response_model = "response_model"
+response_exclude = "response_model_exclude"
+passthrough = ["starlette.responses.Response"]
 functions = [
     "fastapi.applications.FastAPI.get",
     "fastapi.applications.FastAPI.put",
@@ -413,23 +885,67 @@ functions = [
     "fastapi.routing.APIRouter.api_route",
     "fastapi.routing.APIRouter.add_api_route",
     "fastapi.routing.APIRoute.__init__",
-    "starlette.routing.Route.__init__",
-    "starlette.applications.Starlette.add_route",
 ]
+
+# Starlette passes the request as is, and sends what the endpoint returns as is.
+[[entry]]
+kind = "route"
+slot = ["endpoint"]
+functions = ["starlette.routing.Route.__init__", "starlette.applications.Starlette.add_route"]
 
 [[entry]]
 kind = "websocket"
+slot = ["endpoint"]
+validates_params = true
 functions = [
     "fastapi.applications.FastAPI.websocket",
     "fastapi.applications.FastAPI.add_api_websocket_route",
     "fastapi.routing.APIRouter.websocket",
     "fastapi.routing.APIRouter.add_api_websocket_route",
-    "starlette.routing.WebSocketRoute.__init__",
 ]
 
 [[entry]]
+kind = "websocket"
+slot = ["endpoint"]
+functions = ["starlette.routing.WebSocketRoute.__init__"]
+
+# Litestar (not built in; works through `[tool.hydroid]` as is): it validates `data` and the
+# other parameters on the loop, and encodes what handlers return on the loop, sync handlers
+# (`sync_to_thread=True`) included.
+# [[entry]]
+# kind = "route"
+# validates_params = true
+# serializes_return = true
+# functions = [
+#     "litestar.handlers.http_handlers.decorators.get.__init__",
+#     "litestar.handlers.http_handlers.decorators.post.__init__",
+#     "litestar.handlers.http_handlers.decorators.put.__init__",
+#     "litestar.handlers.http_handlers.decorators.patch.__init__",
+#     "litestar.handlers.http_handlers.decorators.delete.__init__",
+#     "litestar.handlers.http_handlers.decorators.head.__init__",
+# ]
+
+[[entry]]
 kind = "dependency"
+slot = ["dependency"]
+validates_params = true
+injects = true
 functions = ["fastapi.param_functions.Depends", "fastapi.param_functions.Security"]
+
+# FastStream (not built in; works through `[tool.hydroid]` as is): fast_depends validates the
+# message into the annotated parameters of a subscriber on the loop, and fills `Depends(...)`
+# parameters from the dependency instead.
+# [[entry]]
+# kind = "subscriber"
+# validates_params = true
+# functions = ["faststream.redis.broker.registrator.RedisRegistrator.subscriber"]
+#
+# [[entry]]
+# kind = "dependency"
+# slot = ["dependency"]
+# validates_params = true
+# injects = true
+# functions = ["fast_depends.use.Depends"]
 
 [[entry]]
 kind = "middleware"
@@ -464,3 +980,160 @@ functions = [
     "starlette.background.BackgroundTasks.add_task",
     "starlette.background.BackgroundTask.__init__",
 ]
+
+# ---------------------------------------------------------------------------------------------
+# Classes (or factories) given to these functions are constructed (called) by the library later,
+# on the loop: their `__init__` runs there, with the project overrides of what the library
+# `__init__` they inherit calls on `self`.
+#   kind                what running them is called in diagnostics
+#   slot                the parameters taking the class (or factory)
+#   label               how diagnostics name what reaches it (default: the function's `[[entry]]`)
+#   unless_passthrough  not when every callable the same call registers always returns one of its
+#                       entry's `passthrough` classes
+# ---------------------------------------------------------------------------------------------
+# FastAPI's `get_request_handler` constructs the response class after the endpoint returns, sync
+# endpoints included; a returned `Response` is sent as is. Starlette's `Response.__init__` calls
+# `render` and `init_headers`.
+[[builds_on_loop]]
+kind = "response rendering"
+slot = ["response_class"]
+unless_passthrough = true
+functions = [
+    "fastapi.applications.FastAPI.get",
+    "fastapi.applications.FastAPI.put",
+    "fastapi.applications.FastAPI.post",
+    "fastapi.applications.FastAPI.delete",
+    "fastapi.applications.FastAPI.options",
+    "fastapi.applications.FastAPI.head",
+    "fastapi.applications.FastAPI.patch",
+    "fastapi.applications.FastAPI.trace",
+    "fastapi.applications.FastAPI.api_route",
+    "fastapi.applications.FastAPI.add_api_route",
+    "fastapi.routing.APIRouter.get",
+    "fastapi.routing.APIRouter.put",
+    "fastapi.routing.APIRouter.post",
+    "fastapi.routing.APIRouter.delete",
+    "fastapi.routing.APIRouter.options",
+    "fastapi.routing.APIRouter.head",
+    "fastapi.routing.APIRouter.patch",
+    "fastapi.routing.APIRouter.trace",
+    "fastapi.routing.APIRouter.api_route",
+    "fastapi.routing.APIRouter.add_api_route",
+    "fastapi.routing.APIRoute.__init__",
+]
+
+[[builds_on_loop]]
+kind = "response rendering"
+label = "default response class"
+slot = ["default_response_class"]
+functions = [
+    "fastapi.applications.FastAPI.__init__",
+    "fastapi.applications.FastAPI.include_router",
+    "fastapi.routing.APIRouter.__init__",
+    "fastapi.routing.APIRouter.include_router",
+]
+
+# Starlette's `build_middleware_stack` calls the middleware factories lazily, in
+# `Starlette.__call__` on the first lifespan or request event.
+[[builds_on_loop]]
+kind = "construction"
+slot = ["middleware_class", "cls"]
+functions = ["starlette.applications.Starlette.add_middleware", "starlette.middleware.Middleware.__init__"]
+
+# Litestar (not built in; works through `[tool.hydroid]` as is): it constructs the response class
+# on the loop after the handler returns, `sync_to_thread=True` handlers included.
+# [[builds_on_loop]]
+# kind = "response rendering"
+# slot = ["response_class"]
+# functions = [
+#     "litestar.handlers.http_handlers.decorators.get.__init__",
+#     "litestar.handlers.http_handlers.decorators.post.__init__",
+#     "litestar.handlers.http_handlers.decorators.put.__init__",
+#     "litestar.handlers.http_handlers.decorators.patch.__init__",
+#     "litestar.handlers.http_handlers.decorators.delete.__init__",
+#     "litestar.handlers.http_handlers.decorators.head.__init__",
+# ]
+
+# ---------------------------------------------------------------------------------------------
+# Attribute namespaces the library types as `Any`: a read gets the class of what the project
+# stores under that name (when every store agrees).
+#   owners     classes whose instances (and subclasses') own one
+#   attribute  the owners' attribute holding it (`app.state`); without it, the owner itself
+#   app        `{ attribute, owners }`: `<owner>.<attribute>` is the application, an instance
+#              of `owners`, typed as the one project subclass of them
+#   lifespan   `{ owners, keyword }`: the dicts yielded by the lifespan given at `keyword` to
+#              the constructor of `owners` are copied into the namespace
+# ---------------------------------------------------------------------------------------------
+[[state_namespace]]
+owners = ["starlette.applications.Starlette"]
+attribute = "state"
+
+# Starlette copies a lifespan's state into every connection's.
+[[state_namespace]]
+owners = ["starlette.requests.HTTPConnection"]
+attribute = "state"
+app = { attribute = "app", owners = ["starlette.applications.Starlette"] }
+lifespan = { owners = ["starlette.applications.Starlette"], keyword = "lifespan" }
+
+# Flask and Quart (not built in; work through `[tool.hydroid]` as is): `g`, typed as
+# `_AppCtxGlobals`, is its own namespace.
+# [[state_namespace]]
+# owners = ["flask.ctx._AppCtxGlobals"]
+
+# ---------------------------------------------------------------------------------------------
+# Class attributes whose first read loads them (I/O), unless already loaded.
+#   factories     `name = factory(...)` in a class body makes `instance.name` one
+#   keyword       the factory's keyword choosing how it loads; `lazy`: its literal values that
+#                 load on read (without the keyword, it does)
+#   loads         what a load runs
+#   eager         options loading the attributes they name up front
+#   expires_all   calls expiring every loaded attribute
+#   expires       calls expiring the loaded attributes of the instance they are given first
+#   reload        { functions, names }: calls loading, on the instance given first, the
+#                 attributes named (in a literal list, tuple or set) at `names`; given no names,
+#                 they expire it
+#   raises_under  classes under which a load raises instead of blocking: a function naming one
+#                 (in an annotation, or a value of one) loads nothing
+# ---------------------------------------------------------------------------------------------
+# SQLAlchemy relationships: `lazy="select"` (the default) emits a query through the session on
+# first read (`LazyLoader._emit_lazyload`); an `AsyncSession` raises `MissingGreenlet` instead.
+[[lazy_attribute]]
+factories = ["sqlalchemy.orm._orm_constructors.relationship"]
+keyword = "lazy"
+lazy = ["select", true]
+loads = "sqlalchemy.orm.session.Session.execute"
+eager = [
+    "sqlalchemy.orm.strategy_options.selectinload",
+    "sqlalchemy.orm.strategy_options.joinedload",
+    "sqlalchemy.orm.strategy_options.subqueryload",
+    "sqlalchemy.orm.strategy_options.immediateload",
+    "sqlalchemy.orm.strategy_options.contains_eager",
+    "sqlalchemy.orm.strategy_options.raiseload",
+    "sqlalchemy.orm.strategy_options.noload",
+    "sqlalchemy.orm.strategy_options._AbstractLoad.selectinload",
+    "sqlalchemy.orm.strategy_options._AbstractLoad.joinedload",
+    "sqlalchemy.orm.strategy_options._AbstractLoad.subqueryload",
+    "sqlalchemy.orm.strategy_options._AbstractLoad.immediateload",
+    "sqlalchemy.orm.strategy_options._AbstractLoad.contains_eager",
+    "sqlalchemy.orm.strategy_options._AbstractLoad.raiseload",
+    "sqlalchemy.orm.strategy_options._AbstractLoad.noload",
+]
+expires_all = [
+    "sqlalchemy.orm.session.Session.commit",
+    "sqlalchemy.orm.session.Session.rollback",
+    "sqlalchemy.orm.session.Session.expire_all",
+    "sqlalchemy.orm.scoping.scoped_session.commit",
+    "sqlalchemy.orm.scoping.scoped_session.rollback",
+    "sqlalchemy.orm.scoping.scoped_session.expire_all",
+]
+expires = ["sqlalchemy.orm.session.Session.expire", "sqlalchemy.orm.scoping.scoped_session.expire"]
+reload = { functions = ["sqlalchemy.orm.session.Session.refresh", "sqlalchemy.orm.scoping.scoped_session.refresh"], names = [1, "attribute_names"] }
+raises_under = ["sqlalchemy.ext.asyncio.session.AsyncSession", "sqlalchemy.ext.asyncio.session.async_sessionmaker"]
+
+# Peewee (not built in; works through `[tool.hydroid]` as is): a `ForeignKeyField` queries the
+# related row on first read, unless declared with `lazy_load=False` (then it reads the id).
+# [[lazy_attribute]]
+# factories = ["peewee.ForeignKeyField"]
+# keyword = "lazy_load"
+# lazy = [true]
+# loads = "peewee.Database.execute_sql"

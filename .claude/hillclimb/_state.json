@@ -194,7 +194,253 @@
           23240
         ]
       }
+    },
+    {
+      "round": 6,
+      "lever": "protocol",
+      "protocol": "holdout batch 3 sealed: new holdout cases promoted by the self-improve loop from round 6 on (batches 1-2 were unsealed into train in rounds 3-4). Baseline scored at bff7a46, before any round-6 fix; gate.py ratchets holdout recall against this entry, not round 2's batch-1 score.",
+      "holdout_recall": "0/1",
+      "holdout_fp": 0
+    },
+    {
+      "round": 7,
+      "lever": "recall: FastAPI framework hooks, DI typing, dispatch tables",
+      "change": "round 6: FastAPI-run pydantic hooks (request validation, response validation/serialization incl. computed_field/field_serializer/model_serializer); unannotated Depends/Security params typed from their provider; response_class/default_response_class __init__/render/init_headers as loop roots; callables in dict/list/tuple literals called by subscript or alias",
+      "train_recall": "130/130",
+      "train_fp": 0,
+      "holdout_recall": "0/1",
+      "holdout_fp": 0,
+      "results": ".claude/hillclimb/recall/v10",
+      "ratcheted_to_train": [
+        "computed_field_io",
+        "di_sync_dep_param_validation",
+        "http_depends_untyped_client",
+        "http_method_registry",
+        "ser_field_serializer",
+        "ser_response_model_validate",
+        "ser_response_render"
+      ]
+    },
+    {
+      "round": 8,
+      "lever": "recall: app state flow, ORM attribute hooks, library-invoked callables",
+      "change": "round 8: request.state/app.state/request.app typed from project stores; SQLAlchemy lazy relationship loads (skipped for eager options, async ORM, awaited origins) and @validates hooks; pydantic/dataclass default factories on construction and request validation; contextvars Context.run",
+      "train_recall": "139/139",
+      "train_fp": 0,
+      "holdout_recall": "0/2",
+      "holdout_fp": 0,
+      "results": ".claude/hillclimb/recall/v11",
+      "ratcheted_to_train": [
+        "cache_default_factory_secret",
+        "life_app_state_store",
+        "life_app_subclass_attr",
+        "life_state_dict_client",
+        "orm_lazy_relationship_access",
+        "orm_validates_on_construct",
+        "py_copy_context_run"
+      ]
+    },
+    {
+      "round": 9,
+      "lever": "protocol",
+      "protocol": "holdout baseline after promoting this round's cases, scored before any fix (same protocol as round 6): new holdout cases change the set the ratchet compares against.",
+      "holdout_recall": "0/5",
+      "holdout_fp": 0
+    },
+    {
+      "round": 10,
+      "lever": "recall+precision: decorators, logging, MRO, stdlib helpers, middleware",
+      "change": "round 10: offloading decorators (functools.wraps no longer counts as using the wrapped fn) and running-loop guards not loop code; logging calls run attached project Handler/Filter/Formatter hooks and blocking stdlib handlers, level-aware; cooperative super() chains along the receiver's MRO, overrides limited to the receiver's subclasses; stdlib helpers that block internally (catalog, unless_given/blocks_in); Starlette middleware constructed on the loop",
+      "train_recall": "145/145",
+      "train_fp": 0,
+      "holdout_recall": "3/5",
+      "holdout_fp": 0,
+      "results": ".claude/hillclimb/recall/v12",
+      "ratcheted_to_train": [
+        "fp2_asyncify_decorator",
+        "fp2_running_loop_branch",
+        "log_filter_hostname_lookup",
+        "mw_middleware_init_io",
+        "py_mixin_super_chain",
+        "std_email_make_msgid_fqdn"
+      ]
+    },
+    {
+      "round": 11,
+      "lever": "protocol",
+      "protocol": "holdout baseline after promoting this round's cases, before any fix (same protocol as round 6). Note: candidate cache_configparser_read (would-be holdout, never shown to a fixer) started passing after round 10's stdlib catalog work and was dropped.",
+      "holdout_recall": "3/7",
+      "holdout_fp": 0
+    },
+    {
+      "round": 12,
+      "lever": "precision + recall: logging scope, ORM, pydantic nesting, library template methods",
+      "change": "round 12: logging hooks scoped to the logger hierarchy and propagate; relationships loaded off the loop are not lazy loads; nested and Annotated pydantic validators/serializers, explicit model_dump; response_model=None, Response-only endpoints and response_model_exclude skip response hooks; project overrides of self-called hooks in library async methods",
+      "train_recall": "151/151",
+      "train_fp": 0,
+      "holdout_recall": "4/7",
+      "holdout_fp": 0,
+      "results": ".claude/hillclimb/recall/v13",
+      "ratcheted_to_train": [
+        "auth_apikey_check_override",
+        "fp3_log_handler_other_logger",
+        "fp3_orm_collection_touched_in_helper",
+        "fp3_orm_refresh_attribute_names",
+        "pyd_nested_model_validator",
+        "pyd_plain_serializer_dump"
+      ]
+    },
+    {
+      "round": 13,
+      "lever": "protocol",
+      "protocol": "holdout baseline after promoting this round's cases, before any fix (same protocol as round 6). Proven false positives that hash to holdout are not promoted (they would block every fix); from this round they are handed to fixers as review leads (fixers write their own fixtures) and then deleted, so they never enter the holdout.",
+      "holdout_recall": "4/18",
+      "holdout_fp": 0
+    },
+    {
+      "round": 14,
+      "lever": "precision + recall: pydantic dump modes, instance dispatch, method replacement, streaming",
+      "change": "round 14: pydantic dumps honour when_used/mode/exclude/include and nested instances are not revalidated; per-instance method specialisation (exact receivers, specialised generics); project callables replacing library methods on instances (app.openapi = f); lazy iterables streamed by StreamingResponse are off the loop",
+      "train_recall": "154/154",
+      "train_fp": 0,
+      "holdout_recall": "4/18",
+      "holdout_fp": 0,
+      "results": ".claude/hillclimb/recall/v14",
+      "ratcheted_to_train": [
+        "fp4_pyd_dump_exclude_serializer",
+        "fp4_pyd_json_only_serializer",
+        "route_openapi_override"
+      ]
+    },
+    {
+      "round": 15,
+      "lever": "protocol",
+      "protocol": "holdout baseline after promoting this round's cases (incl. 12 backlog holdout misses from earlier rounds), before any fix (same protocol as round 6).",
+      "holdout_recall": "4/34",
+      "holdout_fp": 0
+    },
+    {
+      "round": 16,
+      "lever": "library knowledge to the catalog (phase B)",
+      "change": "Phase B: library-specific rules moved to catalog.toml or derived from library source (AUDIT.md items F, P, I, A, C, S, O, L, G1); file_bytesio_binaryio false positive fixed by exact argument classes; new catalog concepts arguments, loop_probe, hook, runs_hooks, builds_on_loop, state_namespace, lazy_attribute, observer, each tested with a second library",
+      "train_recall": "161/161",
+      "train_fp": 0,
+      "holdout_recall": "4/34",
+      "holdout_fp": 0,
+      "holdout_set": "48ec61bf2a43",
+      "holdout_baseline": "4/34 with the binary at 3093ac1",
+      "results": ".claude/hillclimb/recall/v15",
+      "ratcheted_to_train": [
+        "fp5_iter_generator_dunder_offloaded",
+        "fp5_lazy_iter_to_thread_consumer",
+        "http_tenacity_wraps",
+        "lib_pymysql_cursor_with",
+        "lib_sqlmodel_session_execute",
+        "mw_route_handler_per_request",
+        "rc_route_hook_queue_override"
+      ],
+      "polar_cold_ms_median": 11478,
+      "polar_warm_ms_median": 378
+    },
+    {
+      "round": 17,
+      "lever": "stub packages; level literals",
+      "change": "PEP 561 <pkg>-stubs packages name the module <pkg> (catalog names match with stubs installed; --follow-libs follows the implementation behind a stub); logging levels read from where ty finds them defined instead of ty's type display (AUDIT L17)",
+      "train_recall": "161/161",
+      "train_fp": 0,
+      "holdout_recall": "4/34",
+      "holdout_fp": 0,
+      "holdout_set": "48ec61bf2a43",
+      "holdout_baseline": "4/34 recorded in round 16",
+      "results": ".claude/hillclimb/recall/v16",
+      "ratcheted_to_train": [],
+      "polar_cold_ms_median": 10009,
+      "polar_warm_ms_median": 348
+    },
+    {
+      "round": 18,
+      "lever": "deferred exit callbacks",
+      "change": "Exits registered on an exit stack (ExitStack.callback/push/enter_context, unittest addCleanup) run where the stack is closed, not where they are registered; stacks followed only through statements modelled exactly, otherwise reported at registration as before",
+      "train_recall": "162/166",
+      "train_fp": 0,
+      "holdout_recall": "4/38",
+      "holdout_fp": 0,
+      "holdout_set": "c3fb05576bf2",
+      "holdout_baseline": "4/38 with the binary at 52fb3ea",
+      "results": ".claude/hillclimb/recall/v17",
+      "ratcheted_to_train": [
+        "r18_exitstack_pop_all_background_close"
+      ],
+      "polar_cold_ms_median": 15731,
+      "polar_warm_ms_median": 762
     }
   ],
-  "ground_truth": "scripts/hillclimb/oracle_runtime.py via check.py: a case is promoted only when the runtime proves every line where hydroid disagrees (verdict BREAKS), or with a reviewer's note"
+  "ground_truth": "scripts/hillclimb/oracle_runtime.py via check.py: a case is promoted only when the runtime proves every line where hydroid disagrees (verdict BREAKS), or with a reviewer's note",
+  "holdout_sets": {
+    "48ec61bf2a43": [
+      "auth_request_user_method",
+      "bg_datagram_protocol",
+      "bg_from_thread_run_sync",
+      "cache_singleton_class",
+      "conc_thread_run_inline",
+      "di_wraps_sync_wrapper",
+      "file_archive_helpers",
+      "file_spooled_export",
+      "flow_event_bus_hooks",
+      "flow_global_hook_rebind",
+      "lib_sqlmodel_create_all_lifespan",
+      "log_dictconfig_rotating_file",
+      "log_webhook_alert_handler",
+      "mod_importlib_plugins",
+      "mod_lazy_package_getattr",
+      "orm_hybrid_property_query",
+      "pyd_annotated_field_validator",
+      "route_endpoint_custom_dispatch",
+      "route_path_convertor",
+      "std_backoff_default_sleep",
+      "std_logging_smtp_handler",
+      "svc_dev_inline_job_queue",
+      "svc_settings_conditional_base",
+      "svc_uow_event_handler_lists",
+      "typ_callable_protocol_factory",
+      "typ_protocol_callable_attribute",
+      "ws_endpoint_class_init",
+      "ws_stream_iterable_iter",
+      "ws_stream_sync_aiter"
+    ],
+    "c3fb05576bf2": [
+      "auth_request_user_method",
+      "bg_datagram_protocol",
+      "bg_from_thread_run_sync",
+      "cache_singleton_class",
+      "conc_thread_run_inline",
+      "di_wraps_sync_wrapper",
+      "file_archive_helpers",
+      "file_spooled_export",
+      "flow_event_bus_hooks",
+      "flow_global_hook_rebind",
+      "lib_sqlmodel_create_all_lifespan",
+      "log_dictconfig_rotating_file",
+      "log_webhook_alert_handler",
+      "mod_importlib_plugins",
+      "mod_lazy_package_getattr",
+      "orm_hybrid_property_query",
+      "pyd_annotated_field_validator",
+      "r18_init_subclass_registry",
+      "r18_queue_job_drain_inline",
+      "r18_sched_scheduler_run",
+      "route_endpoint_custom_dispatch",
+      "route_path_convertor",
+      "std_backoff_default_sleep",
+      "std_logging_smtp_handler",
+      "svc_dev_inline_job_queue",
+      "svc_settings_conditional_base",
+      "svc_uow_event_handler_lists",
+      "typ_callable_protocol_factory",
+      "typ_protocol_callable_attribute",
+      "ws_endpoint_class_init",
+      "ws_stream_iterable_iter",
+      "ws_stream_sync_aiter"
+    ]
+  }
 }

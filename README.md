@@ -111,39 +111,37 @@ drop it and the upload step to fail the build instead.
 ## How it works
 
 1. **Facts** (`crates/hydroid_ty`, the only crate that touches ty): every function body is walked
-   in parallel; each call is resolved to its definitions through ty (types, then
-   go-to-definition), including implicit calls (`with`, `for` and comprehensions, properties
-   and their setters, descriptors, operators like `x[k]` and `k in x` on user classes,
-   `__getattr__`, iterators' `__next__`, constructors with `__post_init__` and pydantic
-   validators, builtins and `contextlib` helpers that iterate, enter or call their arguments like
-   `sorted(xs, key=f)` or `stack.enter_context(cm)`, `singledispatch` implementations). Callables passed as arguments are recorded as flows
-   (`to_thread(f)`, `Depends(dep)`, `on_startup=[f]`, decorators), and so are callables stored
-   on `self` and returned by functions. When ty does not know a value's type because it comes
-   from an unannotated function, the class that function returns is used. The facts of an unchanged project are reused from `.hydroid_cache/` (keyed by the
-   binary, the options, the installed packages and every source file's contents).
-2. **Analysis** (`crates/hydroid_core`, plain graph code): where code runs is a property of the
-   call, so "does calling `f` block?" is computed once per function by a backwards BFS from
-   blocking functions — shortest witness chains, no recursion, any depth. Diagnostics are the
-   call sites inside loop code (`async def` bodies, sync callbacks scheduled on the loop) whose
-   callee blocks. Offload APIs cut the graph; callbacks are attributed to the call site passing
-   them; overrides are found by class-hierarchy analysis (test doubles only stand in for real
-   classes in test code); calling a generator function runs nothing until the generator is
-   iterated; a decorated function is reached through its decorator's wrappers only when they call
-   it. Starting an event loop (`asyncio.run`) is only reported when loop code does it directly:
-   sync bridges reaching it almost always check for a running loop first.
-3. **Catalog** (`crates/hydroid_core/catalog.toml`): blocking functions, offload APIs, loop
-   callback APIs and FastAPI entry points, by defining qualified name. A test checks every name
-   exists in a real environment.
+   in parallel, and each call is resolved through ty to the functions it can run, implicit calls
+   included (`with`, `for`, properties, descriptors, operators, constructors). Callables passed
+   as arguments, stored on instances or returned are recorded as flows. What a library does
+   that its source does not show (stub-only stdlib, frameworks calling project code later) comes
+   from the catalog. The facts of an unchanged project are reused from `.hydroid_cache/`.
+2. **Analysis** (`crates/hydroid_core`, plain graph code): "does calling `f` block?" is computed
+   once per function by a backwards search from blocking functions, giving shortest witness
+   chains. Diagnostics are the call sites in loop code (`async def` bodies, callbacks the loop
+   runs, code a framework runs on the loop around an entry point) whose callee blocks. Offload
+   APIs cut the graph. Overrides are found by class hierarchy, narrowed by what is known about
+   the instance (or argument). Generators run when iterated, not when called.
+3. **Catalog** (`crates/hydroid_core/catalog.toml`): library knowledge as data, by defining
+   qualified name. It covers:
+   - what blocks, and what offloads or schedules on the loop;
+   - what functions do with their arguments;
+   - framework entry points and what the framework runs around them;
+   - model hooks, observers (logging), exit stacks, running-loop probes, lazily loaded attributes,
+     and state namespaces.
+   Library knowledge goes here, not in the Rust code. Every table can be extended from
+   `pyproject.toml`, and a test checks that every name exists in a real environment.
 
-Sync `def` endpoints and dependencies are not reported: FastAPI runs them in a threadpool.
+Sync `def` endpoints and dependencies are not reported: FastAPI runs them in a threadpool. The
+details, and what hydroid knowingly misses: [docs/GUIDE.md](docs/GUIDE.md#12-how-it-works).
 
 ## Limits
 
-Python is dynamic: calls through `getattr`, untyped parameters, or containers of callables cannot
-always be resolved. They are never silently dropped — `--strict` lists every one reachable on the
-loop. Not modeled yet: `getattr(obj, "name")`, containers of callables (`HANDLERS[kind]()`),
-metaclasses, and `.pyi`-only libraries under `--follow-libs`. A change to any source file re-extracts the whole
-project (no per-file incremental cache yet).
+Python is dynamic: calls through `getattr`, untyped parameters, or registries of callables filled
+at run time cannot always be resolved. `--strict` lists every one reachable on the loop (except
+awaited calls, assumed to run a coroutine). A call on a value typed as a Protocol or ABC resolves to the abstract
+method, so the real implementation can be missed. What hydroid knowingly misses, and why:
+[docs/GUIDE.md](docs/GUIDE.md#known-limits).
 
 ## Development
 

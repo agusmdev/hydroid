@@ -7,23 +7,35 @@ mod cache;
 mod db;
 mod extract;
 mod index;
+mod stacks;
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use hydroid_core::catalog::qualname_matches;
-use hydroid_core::facts::{Call, Class, ClassId, Facts, FnId, Flow, Function, Origin, Slot, Store, Value};
+use hydroid_core::catalog::{Catalog, HookPhase, qualname_matches};
+use hydroid_core::facts::{
+    Call, Class, ClassId, Facts, FnId, Flow, Function, Instance, Level, LogUse, ModelField, Origin, ResponseOptions, Signature, Slot,
+    Store, Value,
+};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use ruff_db::files::{File, system_path_to_file};
+use ruff_db::parsed::parsed_module;
 use ruff_db::system::{SystemPath, SystemPathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};
 use ty_module_resolver::{ModuleName, resolve_module_confident};
+use ty_python_core::definition::DefinitionKind;
+use ty_python_semantic::types::ide_support::ResolvedDefinition;
+use ty_python_semantic::{HasDefinition, SemanticModel, map_stub_definition};
 
 use crate::db::HydroidDb;
-use crate::extract::{FileFacts, Implicit, RawSlot, RawValue, extract_file};
-use crate::index::{FileIndex, Key, class_bases};
+use crate::extract::{
+    AppState, CatalogKeys, Expiry, Handed, FileFacts, Implicit, Instances, Orm, RawInstance, RawSlot, RawValue, Shared, extract_file,
+    find_function,
+};
+use crate::index::{FileIndex, IndexCatalog, Key, class_bases};
+use crate::stacks::StackRole;
 
 pub struct Extraction {
     pub facts: Facts,
@@ -34,13 +46,14 @@ pub struct ExtractOptions<'a> {
     pub root: &'a Path,
     pub python: Option<&'a Path>,
     /// Also analyze the bodies of third-party functions reachable from project code, except
-    /// those for which `follow` returns `false` (catalog functions).
+    /// catalog sinks and offload APIs.
     pub follow_libs: bool,
-    pub follow: &'a (dyn Fn(&str) -> bool + Sync),
+    /// What extraction reads of the catalog: what library functions do with their arguments.
+    pub catalog: &'a Catalog,
     /// Gitignore-style globs, relative to `root`, of project files to skip.
     pub exclude: &'a [String],
     /// Reuse (and save) the facts of an unchanged project in `<root>/.hydroid_cache`.
-    /// `cache_salt` must capture everything else the extraction depends on (`follow`).
+    /// `cache_salt` must capture everything else the extraction depends on (the catalogs).
     pub cache: bool,
     pub cache_salt: &'a str,
 }
@@ -60,25 +73,158 @@ fn python_path(path: &Path) -> anyhow::Result<SystemPathBuf> {
 pub fn unknown_names(root: &Path, python: Option<&Path>, names: &[String]) -> anyhow::Result<Vec<String>> {
     let python = python.map(python_path).transpose()?;
     let db = HydroidDb::new(&system_path(root)?, python.as_deref())?;
-    let environment = db.program().resolver_environment(&db);
-    let mut indexes: FxHashMap<File, FileIndex> = FxHashMap::default();
-    let mut unknown = Vec::new();
-    for name in names {
-        let segments: Vec<&str> = name.split('.').collect();
-        let found = (1..segments.len()).rev().any(|split| {
-            let Some(module) = ModuleName::new(&segments[..split].join(".")) else { return false };
-            let Some(file) = resolve_module_confident(&db, environment, &module).and_then(|m| m.file(&db))
-            else {
-                return false;
-            };
-            let index = indexes.entry(file).or_insert_with(|| FileIndex::build(&db, file));
-            index.functions.values().any(|f| qualname_matches(name, &f.qualname))
-        });
-        if !found {
-            unknown.push(name.clone());
+    let indexes = Indexes::default();
+    Ok(names.iter().filter(|name| catalog_definitions(&db, &indexes, name).is_empty()).cloned().collect())
+}
+
+/// The definitions a catalog name (or pattern) names, in the module its longest importable
+/// prefix resolves to: functions, and classes (calling a class constructs it).
+fn catalog_definitions(db: &HydroidDb, indexes: &Indexes, name: &str) -> Vec<Key> {
+    let environment = db.program().resolver_environment(db);
+    let segments: Vec<&str> = name.split('.').collect();
+    for split in (1..segments.len()).rev() {
+        let Some(module) = ModuleName::new(&segments[..split].join(".")) else { continue };
+        let Some(file) = resolve_module_confident(db, environment, &module).and_then(|m| m.file(db)) else {
+            continue;
+        };
+        let index = indexes.get(db, file);
+        let functions = index.functions.iter().filter(|(_, f)| qualname_matches(name, &f.qualname));
+        let classes = index.classes.iter().filter(|(_, c)| qualname_matches(name, &c.qualname));
+        let keys: Vec<Key> = functions.map(|(&o, _)| (file, o)).chain(classes.map(|(&o, _)| (file, o))).collect();
+        if !keys.is_empty() {
+            return keys;
         }
     }
-    Ok(unknown)
+    Vec::new()
+}
+
+/// What the catalog says about the definitions extraction meets, resolved to them once.
+fn catalog_keys<'c>(db: &HydroidDb, indexes: &Indexes, catalog: &'c Catalog) -> CatalogKeys<'c> {
+    let mut keys = CatalogKeys::default();
+    for (name, arguments) in catalog.argument_entries() {
+        for key in catalog_definitions(db, indexes, &name) {
+            keys.arguments.insert(key, arguments);
+        }
+    }
+    for (name, hook) in catalog.hooks() {
+        for key in catalog_definitions(db, indexes, name) {
+            keys.hooks.insert(key, hook);
+        }
+    }
+    for (name, operation) in catalog.operations() {
+        for key in catalog_definitions(db, indexes, name) {
+            keys.operations.insert(key, operation);
+        }
+    }
+    for observer in catalog.observers() {
+        let definitions = |names: &[String]| -> Vec<Key> {
+            names.iter().flat_map(|n| catalog_definitions(db, indexes, n)).collect()
+        };
+        keys.dispatches.extend(definitions(&observer.dispatch));
+        for attach in &observer.attach {
+            keys.attaches.extend(definitions(&attach.functions));
+            keys.attach_names.extend(attach.functions.iter().filter_map(|f| f.rsplit('.').next()));
+        }
+        if let Some(scope) = &observer.scope {
+            keys.naming.extend(definitions(&scope.naming).into_iter().map(|k| (k, scope)));
+            keys.roots.extend(scope.root.as_deref());
+            keys.stops.extend(scope.stop.as_deref());
+        }
+        // Dispatches without a level of their own take it as their first argument.
+        let unleveled: Vec<String> = observer
+            .dispatch
+            .iter()
+            .filter(|d| !d.rsplit('.').next().is_some_and(|m| observer.levels.contains_key(m)))
+            .cloned()
+            .collect();
+        let setters = observer.classes.iter().flat_map(|c| c.level.iter()).chain(&observer.threshold).cloned();
+        keys.level_first.extend(definitions(&setters.chain(unleveled).collect::<Vec<_>>()));
+        keys.level_keywords.extend(observer.level_keyword.as_deref());
+        keys.level_names.extend(observer.level_names.iter().map(|(n, &l)| (n.as_str(), l)));
+    }
+    for name in catalog.offloads() {
+        keys.offloads.extend(catalog_definitions(db, indexes, &name));
+    }
+    for (name, entry) in catalog.entry_entries() {
+        if entry.response_model.is_some() || entry.response_exclude.is_some() {
+            for key in catalog_definitions(db, indexes, &name) {
+                keys.entries.insert(key, entry);
+            }
+        }
+    }
+    for (group, lazy) in catalog.lazy_attributes().iter().enumerate() {
+        let definitions = |names: &[String]| -> Vec<Key> {
+            names.iter().flat_map(|n| catalog_definitions(db, indexes, n)).collect()
+        };
+        let loads = definitions(std::slice::from_ref(&lazy.loads)).first().copied();
+        keys.lazy_factories.extend(definitions(&lazy.factories).into_iter().map(|k| (k, (group, loads))));
+        keys.eager.extend(definitions(&lazy.eager));
+        keys.expiry.extend(definitions(&lazy.expires_all).into_iter().map(|k| (k, Expiry::All)));
+        keys.expiry.extend(definitions(&lazy.expires).into_iter().map(|k| (k, Expiry::Given)));
+        if let Some(reload) = &lazy.reload {
+            keys.expiry.extend(definitions(&reload.functions).into_iter().map(|k| (k, Expiry::Reload(&reload.names[..]))));
+        }
+        keys.raises_under.extend(definitions(&lazy.raises_under));
+    }
+    for (name, entry) in catalog.entry_entries().filter(|(_, e)| e.injects) {
+        let Some(slot) = entry.slot.first() else { continue };
+        for key in catalog_definitions(db, indexes, &name) {
+            let index = indexes.get(db, key.0);
+            let position = index.functions.get(&key.1).and_then(|f| {
+                let i = f.params[..f.positional].iter().position(|p| p == slot)?;
+                i.checked_sub(usize::from(f.class.is_some()))
+            });
+            keys.injects.insert(key, (position, slot.as_str()));
+        }
+    }
+    for name in catalog.passthrough() {
+        keys.passthrough.extend(catalog_definitions(db, indexes, name).into_iter().map(|key| (key, name)));
+    }
+    // What calls a callable it is given (an exit stack's run method handed to it runs there).
+    for name in catalog.copies() {
+        keys.copies.extend(catalog_definitions(db, indexes, name));
+    }
+    for name in catalog.offloads().chain(catalog.loop_callbacks()) {
+        keys.handed.extend(catalog_definitions(db, indexes, &name).into_iter().map(|k| (k, Handed::Any)));
+    }
+    for (name, entry) in catalog.entry_entries() {
+        let slots = if entry.slot.is_empty() { Handed::Any } else { Handed::Names(&entry.slot) };
+        keys.handed.extend(catalog_definitions(db, indexes, &name).into_iter().map(|k| (k, slots)));
+    }
+    for stack in catalog.exit_stacks() {
+        let roles = [
+            (&stack.callbacks, StackRole::Callback),
+            (&stack.contexts, StackRole::Context),
+            (&stack.runs, StackRole::Run),
+            (&stack.moves, StackRole::Move),
+        ];
+        for (names, role) in roles {
+            for name in names {
+                keys.stack_roles.extend(catalog_definitions(db, indexes, name).into_iter().map(|k| (k, role)));
+            }
+        }
+        keys.stack_names.extend(stack.callbacks.iter().chain(&stack.contexts).filter_map(|f| f.rsplit('.').next()));
+    }
+    for (name, raises) in catalog.loop_probes() {
+        let raised = catalog_definitions(db, indexes, raises);
+        for key in catalog_definitions(db, indexes, name) {
+            keys.loop_probes.entry(key).or_default().extend(raised.iter().copied());
+        }
+    }
+    keys
+}
+
+/// See [`IndexCatalog`].
+fn index_catalog(catalog: &Catalog) -> IndexCatalog {
+    let last = |names: &[String]| -> Vec<String> {
+        names.iter().filter_map(|n| n.rsplit('.').next()).map(str::to_string).collect()
+    };
+    let lazy = catalog.lazy_attributes();
+    IndexCatalog {
+        namespaces: catalog.state_namespaces().to_vec(),
+        factories: lazy.iter().flat_map(|l| last(&l.factories)).collect(),
+        eager: lazy.iter().flat_map(|l| last(&l.eager)).collect(),
+    }
 }
 
 /// Phase timings on stderr when `HYDROID_TIMINGS` is set (for profiling large projects).
@@ -122,12 +268,13 @@ pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
     let files = project_files(&db, &root, options.exclude)?;
     timings.phase("environment and project files");
 
-    let indexes = Indexes::default();
+    let indexes = Indexes(Default::default(), Default::default(), index_catalog(options.catalog));
+    let keys = catalog_keys(&db, &indexes, options.catalog);
     let mut merger = Merger::new(&db, &indexes);
     let units: Vec<(File, Option<FxHashSet<u32>>)> = files.iter().map(|&f| (f, None)).collect();
     indexes.prebuild(&db, files.iter().copied().collect(), FxHashSet::default());
     timings.phase("project indexes");
-    let mut round = run(&db, &indexes, &units, options.follow_libs);
+    let mut round = run(&db, &indexes, &units, options.follow_libs, options.catalog, &keys);
     timings.phase("bodies");
     let mut first = true;
     loop {
@@ -135,6 +282,10 @@ pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
         // all in parallel first.
         let (referenced_files, classes) = referenced(&round);
         indexes.prebuild(&db, referenced_files, classes);
+        let overriding = indexes.method_classes(&round);
+        if !overriding.is_empty() {
+            indexes.prebuild(&db, FxHashSet::default(), overriding);
+        }
         timings.phase("referenced indexes");
         if std::mem::take(&mut first) {
             for &file in &files {
@@ -147,11 +298,12 @@ pub fn extract(options: &ExtractOptions) -> anyhow::Result<Extraction> {
         if !options.follow_libs {
             break;
         }
-        let next = merger.library_frontier(options.follow);
+        let follow = |q: &str| options.catalog.sink(q).is_none() && !options.catalog.is_offload(q);
+        let next = merger.library_frontier(&follow);
         if next.is_empty() {
             break;
         }
-        round = run(&db, &indexes, &next, true);
+        round = run(&db, &indexes, &next, true, options.catalog, &keys);
     }
     let entry = cache::Entry { files: files.len(), facts: merger.finish() };
     timings.phase("merged");
@@ -190,17 +342,18 @@ fn project_files(db: &HydroidDb, root: &SystemPath, exclude: &[String]) -> anyho
     Ok(files)
 }
 
-/// File indexes shared between extraction threads and the merge, and the bases of the library
-/// classes that are ancestors of project classes.
+/// File indexes shared between extraction threads and the merge, the bases of the library
+/// classes that are ancestors of project classes, and the catalog `[[state_namespace]]` groups
+/// (project files record what is stored in them).
 #[derive(Default)]
-struct Indexes(Mutex<FxHashMap<File, Arc<FileIndex>>>, Mutex<FxHashMap<Key, Vec<Key>>>);
+struct Indexes(Mutex<FxHashMap<File, Arc<FileIndex>>>, Mutex<FxHashMap<Key, Vec<Key>>>, IndexCatalog);
 
 impl Indexes {
     fn get(&self, db: &HydroidDb, file: File) -> Arc<FileIndex> {
         if let Some(index) = self.0.lock().get(&file) {
             return index.clone();
         }
-        let index = Arc::new(FileIndex::build(db, file));
+        let index = Arc::new(FileIndex::build(db, file, &self.2));
         self.0.lock().entry(file).or_insert(index).clone()
     }
 
@@ -225,7 +378,7 @@ impl Indexes {
             let shared = Mutex::new(db.clone());
             let built: Vec<(File, Arc<FileIndex>)> = pending
                 .par_iter()
-                .map_init(|| shared.lock().clone(), |db, &file| (file, Arc::new(FileIndex::build(db, file))))
+                .map_init(|| shared.lock().clone(), |db, &file| (file, Arc::new(FileIndex::build(db, file, &self.2))))
                 .collect();
             {
                 let mut map = self.0.lock();
@@ -258,6 +411,153 @@ impl Indexes {
             if pending.is_empty() && unresolved.is_empty() {
                 break;
             }
+        }
+    }
+
+    /// The library classes defining the library methods `facts` call whose bases are not
+    /// resolved yet: a method overriding a blocking method of a base blocks like it.
+    fn method_classes(&self, facts: &[FileFacts]) -> FxHashSet<Key> {
+        let map = self.0.lock();
+        let resolved = self.1.lock();
+        let mut classes = FxHashSet::default();
+        for (file, offset) in facts.iter().flat_map(|f| f.calls.iter().flat_map(|c| c.targets.iter().map(|(k, _)| *k))) {
+            let Some(index) = map.get(&file) else { continue };
+            if index.origin != Origin::Library {
+                continue;
+            }
+            if let Some(class) = index.functions.get(&offset).and_then(|f| f.class)
+                && !resolved.contains_key(&(file, class))
+            {
+                classes.insert((file, class));
+            }
+        }
+        classes
+    }
+
+    /// What project files store in the catalog `[[state_namespace]]` groups: see [`AppState`].
+    fn app_state(&self) -> AppState {
+        let map = self.0.lock();
+        let library_bases = self.1.lock();
+        let mut state = AppState::default();
+        let projects = || map.values().filter(|i| i.origin == Origin::Project);
+        for store in projects().flat_map(|i| &i.state_stores) {
+            state
+                .stored
+                .entry((store.namespace, store.name.clone()))
+                .and_modify(|class| {
+                    if *class != store.class {
+                        *class = None;
+                    }
+                })
+                .or_insert(store.class);
+        }
+        // Project classes deriving from the application classes (through indexed ancestors).
+        let bases = |key: &Key| -> Vec<Key> {
+            match map.get(&key.0).and_then(|i| i.classes.get(&key.1)) {
+                Some(entry) if !entry.bases.is_empty() => entry.bases.clone(),
+                _ => library_bases.get(key).cloned().unwrap_or_default(),
+            }
+        };
+        for (namespace, group) in self.2.namespaces.iter().enumerate() {
+            let Some(app) = &group.app else { continue };
+            let is_app = |key: &Key| {
+                map.get(&key.0).and_then(|i| i.classes.get(&key.1)).is_some_and(|c| app.owners.contains(&c.qualname))
+            };
+            let mut apps: Vec<Key> = Vec::new();
+            for index in projects() {
+                for &offset in index.classes.keys() {
+                    let (mut queue, mut seen) = (bases(&(index.file, offset)), FxHashSet::default());
+                    while let Some(key) = queue.pop() {
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                        if is_app(&key) {
+                            apps.push((index.file, offset));
+                            break;
+                        }
+                        queue.extend(bases(&key));
+                    }
+                }
+            }
+            // The most derived one: the application is an instance of a class no other app
+            // subclasses.
+            let leaves: Vec<Key> = apps.iter().copied().filter(|a| !apps.iter().any(|b| bases(b).contains(a))).collect();
+            if let [app] = leaves[..] {
+                state.apps.insert(namespace, app);
+            }
+        }
+        state
+    }
+
+    /// What the project's SQLAlchemy models run implicitly: see [`Orm`].
+    fn orm(&self, catalog: &Catalog, keys: &CatalogKeys) -> Orm {
+        let mut orm = Orm::default();
+        let mut lazy_classes: Vec<Key> = Vec::new();
+        {
+            let map = self.0.lock();
+            let projects = || map.values().filter(|i| i.origin == Origin::Project);
+            for index in projects() {
+                // The attributes `[[hook]]`s run on set name (`@validates("email")`).
+                let sets = |(callee, _): &&(Key, Vec<String>)| keys.hooks.get(callee).is_some_and(|h| h.runs == HookPhase::Set);
+                let named = index.functions.values().flat_map(|f| f.naming_decorators.iter().filter(sets));
+                orm.validated.extend(named.flat_map(|(_, names)| names.iter().cloned()));
+                for (&function, options) in &index.eager_loads {
+                    let names = options.iter().filter(|(option, _)| keys.eager.contains(option));
+                    let names: Vec<String> = names.flat_map(|(_, names)| names.iter().cloned()).collect();
+                    if !names.is_empty() {
+                        orm.eager.insert((index.file, function), names);
+                    }
+                }
+                for (&offset, class) in &index.classes {
+                    if !class.attribute_factories.is_empty() {
+                        lazy_classes.push((index.file, offset));
+                    }
+                }
+            }
+            if lazy_classes.is_empty() {
+                return orm;
+            }
+            // Mapped subclasses inherit the relationships of their (project) bases.
+            for index in projects() {
+                for &offset in index.classes.keys() {
+                    let (mut queue, mut seen) = (vec![(index.file, offset)], FxHashSet::default());
+                    while let Some(key) = queue.pop() {
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                        let Some(class) = map.get(&key.0).and_then(|i| i.classes.get(&key.1)) else { continue };
+                        for found in &class.attribute_factories {
+                            let Some(&(group, Some(loads))) = keys.lazy_factories.get(&found.factory) else { continue };
+                            let group = &catalog.lazy_attributes()[group];
+                            // A literal value of the keyword choosing the strategy loads lazily
+                            // only if listed; any other value does not.
+                            let keyword = group.keyword.as_ref().and_then(|k| found.keywords.iter().find(|(n, _)| n == k));
+                            let lazy = match keyword {
+                                None => true,
+                                Some((_, Some(value))) => group.lazy.contains(value),
+                                Some((_, None)) => false,
+                            };
+                            if lazy {
+                                orm.lazy.insert(((index.file, offset), found.name.clone()), loads);
+                                orm.lazy_names.insert(found.name.clone());
+                            }
+                        }
+                        queue.extend(class.bases.iter().copied());
+                    }
+                }
+            }
+        }
+        orm
+    }
+
+    /// What the indexed files say about instances: see [`Instances`].
+    fn instances(&self) -> Instances {
+        let map = self.0.lock();
+        Instances {
+            generic_attributes: map.values().flat_map(|i| i.generic_attributes.iter().cloned()).collect(),
+            rebound: map.values().flat_map(|i| i.rebound.iter().cloned()).collect(),
+            subclassed: map.values().flat_map(|i| i.classes.values().flat_map(|c| c.bases.iter().copied())).collect(),
+            deleted: map.values().flat_map(|i| i.deleted.iter().cloned()).collect(),
         }
     }
 
@@ -313,6 +613,10 @@ fn referenced(facts: &[FileFacts]) -> (FxHashSet<File>, FxHashSet<Key>) {
     for f in facts {
         classes.extend(f.calls.iter().filter_map(|c| c.attribute.as_ref().map(|(key, _)| *key)));
         classes.extend(f.calls.iter().filter_map(|c| c.constructs));
+        classes.extend(f.calls.iter().filter_map(|c| c.sets.as_ref().map(|(key, _)| *key)));
+        for instance in f.calls.iter().filter_map(|c| c.instance.as_ref()) {
+            classes.extend(instance.exact.iter().chain(instance.binds.iter().map(|(_, key)| key)));
+        }
         files.extend(classes.iter().map(|key| key.0));
         files.extend(f.calls.iter().flat_map(|c| c.targets.iter().map(|(key, _)| key.0)));
         files.extend(f.decorators.iter().flat_map(|(_, d)| d.iter().map(|key| key.0)));
@@ -323,9 +627,25 @@ fn referenced(facts: &[FileFacts]) -> (FxHashSet<File>, FxHashSet<Key>) {
         }
         files.extend(f.calls.iter().flat_map(|c| c.returned_by.iter().map(|key| key.0)));
         files.extend(f.dispatches.iter().map(|(key, _)| key.0));
+        for signature in &f.signatures {
+            classes.extend(signature.annotation.iter().chain(&signature.returned).copied());
+            for value in &signature.params {
+                match value {
+                    RawValue::Class(key) => {
+                        classes.insert(*key);
+                    }
+                    RawValue::Function((file, _)) => {
+                        files.insert(*file);
+                    }
+                    RawValue::Param(..) => {}
+                }
+            }
+            files.extend(classes.iter().map(|key| key.0));
+        }
         files.extend(f.calls.iter().filter_map(|c| c.attribute.as_ref().map(|(key, _)| key.0)));
         for store in &f.stores {
             files.insert(store.class.0);
+            classes.insert(store.class);
             if let RawValue::Function((file, _)) | RawValue::Class((file, _)) = store.value {
                 files.insert(file);
             }
@@ -348,8 +668,13 @@ fn run(
     indexes: &Indexes,
     units: &[(File, Option<FxHashSet<u32>>)],
     all_implicit: bool,
+    catalog: &Catalog,
+    keys: &CatalogKeys,
 ) -> Vec<FileFacts> {
     let implicit = (!all_implicit).then(|| indexes.implicit());
+    let state = indexes.app_state();
+    let orm = indexes.orm(catalog, keys);
+    let instances = indexes.instances();
     let shared = Mutex::new(db.clone());
     units
         .par_iter()
@@ -357,7 +682,8 @@ fn run(
             || shared.lock().clone(),
             |db, (file, wanted)| {
                 let index = indexes.get(db, *file);
-                extract_file(db, &index, wanted.as_ref(), implicit.as_ref())
+                let shared = Shared { state: &state, orm: &orm, instances: &instances, catalog, keys };
+                extract_file(db, &index, wanted.as_ref(), implicit.as_ref(), &shared)
             },
         )
         .collect()
@@ -411,12 +737,23 @@ impl<'a> Merger<'a> {
             is_async: entry.is_async,
             property: entry.property,
             is_generator: entry.is_generator,
-            is_validator: entry.is_validator,
+            takes_receiver: entry.takes_receiver,
+            is_validator: false,
+            is_serializer: false,
+            serializes: Vec::new(),
+            json_only: false,
+            validates: Vec::new(),
             params: entry.params.clone(),
+            self_calls: entry.self_calls.clone(),
+            closure_self_calls: entry.closure_self_calls.clone(),
+            called_params: entry.called_params.clone(),
+            stored_params: entry.stored_params.clone(),
+            called_attributes: entry.called_attributes.clone(),
             parent: None,
             class: None,
             decorators: Vec::new(),
             analyzed: false,
+            specializes: None,
         });
         let parent = entry.parent.and_then(|p| self.fn_id((key.0, p)));
         let class = entry.class.and_then(|c| self.class_id((key.0, c)));
@@ -438,7 +775,12 @@ impl<'a> Merger<'a> {
             qualname: entry.qualname.clone(),
             bases: Vec::new(),
             is_protocol: entry.is_protocol,
+            // Set in `finish`, once every project module's names are known.
+            referenced: true,
             methods: Vec::new(),
+            fields: Vec::new(),
+            default_factories: Vec::new(),
+            model_fields: Vec::new(),
         });
         let bases = self.indexes.bases(key).into_iter().filter_map(|b| self.class_id(b)).collect();
         let methods = entry
@@ -446,10 +788,29 @@ impl<'a> Merger<'a> {
             .iter()
             .filter_map(|(name, m)| Some((name.clone(), self.fn_id((key.0, *m))?)))
             .collect();
+        let fields = entry.fields.iter().filter_map(|&f| self.class_id(f)).collect();
         let class = &mut self.facts.classes[id.0 as usize];
         class.bases = bases;
         class.methods = methods;
+        class.fields = fields;
         Some(id)
+    }
+
+    /// See [`Instance`]: `None` when nothing beyond the declared class is known (an exact class
+    /// that is not indexed makes the instance's class unknown).
+    fn instance(&mut self, raw: RawInstance) -> Option<Instance> {
+        let exact: Option<Vec<ClassId>> = raw.exact.iter().map(|&k| self.class_id(k)).collect();
+        let binds = raw.binds.into_iter().filter_map(|(name, k)| Some((name, self.class_id(k)?))).collect();
+        let instance = Instance {
+            name: raw.name,
+            is_self: raw.is_self,
+            generic: raw.generic,
+            exact: exact.unwrap_or_default(),
+            binds,
+            param: raw.param,
+        };
+        let narrows = instance.is_self || instance.generic.is_some() || !instance.exact.is_empty();
+        (narrows || !instance.binds.is_empty() || instance.param.is_some()).then_some(instance)
     }
 
     fn merge(&mut self, file_facts: FileFacts) {
@@ -465,13 +826,39 @@ impl<'a> Merger<'a> {
             if let Some(accessor) = raw.accessor {
                 targets.retain(|t| self.facts.function(*t).property == Some(accessor));
             }
-            if raw.implicit && targets.is_empty() && raw.attribute.is_none() {
+            let sets = raw.sets.and_then(|(k, names)| Some((self.class_id(k)?, names)));
+            if raw.implicit && targets.is_empty() && raw.attribute.is_none() && sets.is_none() {
                 continue;
             }
             let param = raw.param.and_then(|(owner, name)| Some((self.fn_id((file, owner))?, name)));
             let constructs = raw.constructs.and_then(|k| self.class_id(k));
             let attribute = raw.attribute.and_then(|(k, name)| Some((self.class_id(k)?, name)));
             let returned_by = raw.returned_by.into_iter().filter_map(|k| self.fn_id(k)).collect();
+            let level = raw.level.map(|(value, receiver)| Level { value, receiver: receiver.and_then(|k| self.class_id(k)) });
+            let receiver = raw.receiver.and_then(|k| self.class_id(k));
+            let instance = raw.instance.and_then(|i| self.instance(i));
+            // Positional arguments land on the parameter at their position (after the receiver).
+            let exact_args = match raw.targets[..] {
+                [(key, bound)] => {
+                    let index = self.index(key.0);
+                    let entry = &index.functions[&key.1];
+                    let skip = usize::from(bound && entry.class.is_some());
+                    let named = |slot: RawSlot| match slot {
+                        RawSlot::Keyword(name) => Some(name),
+                        RawSlot::Positional(i) => (i + skip < entry.positional).then(|| entry.params[i + skip].clone()),
+                        RawSlot::Decorated => None,
+                    };
+                    let found: Vec<(String, Key)> =
+                        raw.exact_args.into_iter().filter_map(|(slot, class)| Some((named(slot)?, class))).collect();
+                    found.into_iter().filter_map(|(name, class)| Some((name, self.class_id(class)?))).collect()
+                }
+                _ => Vec::new(),
+            };
+            let logging = raw.logging.map(|(logger, attaches, attach_only)| LogUse {
+                logger,
+                attaches: attaches.and_then(|k| self.class_id(k)),
+                attach_only,
+            });
             self.facts.calls.push(Call {
                 caller,
                 location: raw.location,
@@ -489,7 +876,34 @@ impl<'a> Merger<'a> {
                 constructs,
                 attribute,
                 returned_by,
+                sets,
+                given: raw.given,
+                unpacks: raw.unpacks,
+                instances: raw.instances,
+                dump: raw.dump.map(Box::new),
+                level: level.map(Box::new),
+                receiver,
+                super_name: raw.super_name,
+                logging: logging.map(Box::new),
+                instance: instance.map(Box::new),
+                exact_args,
+                lazy_in: raw.lazy_in,
+                deferred_body: raw.deferred_body,
             });
+        }
+        self.facts.stops_propagation.extend(file_facts.stops_propagation);
+        for hook in file_facts.hooks {
+            let Some(id) = self.fn_id((file, hook.function)) else { continue };
+            let function = &mut self.facts.functions[id.0 as usize];
+            match hook.runs {
+                HookPhase::Validation => function.is_validator = true,
+                HookPhase::Set => function.validates = hook.fields,
+                HookPhase::Dump => {
+                    function.is_serializer = true;
+                    function.serializes = hook.fields;
+                    function.json_only = hook.json_only;
+                }
+            }
         }
         for (dispatcher, implementation) in file_facts.dispatches {
             let (Some(dispatcher), Some(implementation)) = (self.fn_id(dispatcher), self.fn_id((file, implementation)))
@@ -504,10 +918,42 @@ impl<'a> Merger<'a> {
             };
             self.facts.returns.push((function, value));
         }
+        for raw in file_facts.signatures {
+            let Some(function) = self.fn_id((file, raw.function)) else { continue };
+            let params = raw.params.into_iter().filter_map(|v| self.value(file, v)).collect();
+            let annotation = raw.annotation.into_iter().filter_map(|k| self.class_id(k)).collect();
+            let returned = raw.returned.into_iter().filter_map(|k| self.class_id(k)).collect();
+            let (returns_unknown, always_returns) = (raw.returns_unknown, raw.always_returns);
+            self.facts.signatures.push(Signature { function, params, annotation, returned, returns_unknown, always_returns });
+        }
         for raw in file_facts.stores {
             let Some(class) = self.class_id(raw.class) else { continue };
             let Some(value) = self.value(file, raw.value) else { continue };
             self.facts.stores.push(Store { class, name: raw.name, value });
+        }
+        for (class, names, value) in file_facts.default_factories {
+            let (Some(class), Some(value)) = (self.class_id((file, class)), self.value(file, value)) else { continue };
+            self.facts.classes[class.0 as usize].default_factories.push((names, value));
+        }
+        for (class, raw) in file_facts.model_fields {
+            let Some(class) = self.class_id((file, class)) else { continue };
+            let functions = |this: &mut Self, values: Vec<RawValue>| -> Vec<FnId> {
+                values.into_iter().filter_map(|v| match this.value(file, v) {
+                    Some(Value::Function(f)) => Some(f),
+                    _ => None,
+                }).collect()
+            };
+            let classes = raw.classes.into_iter().filter_map(|k| self.class_id(k)).collect();
+            let validators = functions(self, raw.validators);
+            let serializers = functions(self, raw.serializers);
+            let json_serializers = functions(self, raw.json_serializers);
+            let field = ModelField { names: raw.names, classes, validators, serializers, json_serializers };
+            self.facts.classes[class.0 as usize].model_fields.push(field);
+        }
+        for raw in file_facts.response_options {
+            let Some(caller) = self.fn_id((file, raw.caller)) else { continue };
+            let (location, no_model, exclude) = (raw.location, raw.no_model, raw.exclude);
+            self.facts.response_options.push(ResponseOptions { caller, location, no_model, exclude });
         }
         for raw in file_facts.flows {
             let (Some(caller), Some(into)) = (self.fn_id((file, raw.caller)), self.fn_id(raw.into)) else {
@@ -524,7 +970,8 @@ impl<'a> Merger<'a> {
                     if i < entry.positional { Slot::Param(entry.params[i].clone()) } else { Slot::Unknown }
                 }
             };
-            self.facts.flows.push(Flow { location: raw.location, caller, into, slot, value, literal: raw.literal });
+            let receiver = raw.receiver.and_then(|k| self.class_id(k));
+            self.facts.flows.push(Flow { location: raw.location, caller, into, slot, value, receiver, literal: raw.literal });
         }
     }
 
@@ -537,17 +984,60 @@ impl<'a> Merger<'a> {
     }
 
     /// Library functions called from analyzed code whose bodies have not been analyzed yet.
+    /// The definition a function declared in a library stub stands for (ty's stub mapping, as
+    /// for go-to-definition): `foo/bar.py` for `foo-stubs/bar.pyi`.
+    fn implementation(&self, (file, offset): Key) -> Option<Key> {
+        let db = self.db;
+        let model = SemanticModel::new(db, ty_python_semantic::Db::program_file(db, file));
+        let parsed = parsed_module(db, model.python_file()).load(db);
+        let definition = find_function(parsed.syntax(), offset)?.definition(&model);
+        let mapped = map_stub_definition(db, &ResolvedDefinition::Definition(definition), None)?;
+        mapped.into_iter().find_map(|d| {
+            let ResolvedDefinition::Definition(d) = d else { return None };
+            if !matches!(d.kind(db), DefinitionKind::Function(_)) {
+                return None;
+            }
+            let module = parsed_module(db, d.python_file(db)).load(db);
+            let range = d.focus_range(db, &module);
+            Some((range.file(), ruff_text_size::Ranged::start(&range).to_u32()))
+        })
+    }
+
     fn library_frontier(&mut self, follow: &(dyn Fn(&str) -> bool + Sync)) -> Vec<(File, Option<FxHashSet<u32>>)> {
         let mut wanted: FxHashMap<File, FxHashSet<u32>> = FxHashMap::default();
         let keys: FxHashMap<FnId, Key> = self.fn_ids.iter().map(|(k, v)| (*v, *k)).collect();
+        let mut stubs: FxHashSet<FnId> = FxHashSet::default();
         for call in &self.facts.calls {
             for &t in &call.targets {
                 let f = self.facts.function(t);
-                if f.analyzed || f.origin != Origin::Library || !f.location.path.ends_with(".py") || !follow(&f.qualname) {
+                if f.analyzed || f.origin != Origin::Library || !follow(&f.qualname) {
+                    continue;
+                }
+                if f.location.path.ends_with(".pyi") {
+                    stubs.insert(t);
                     continue;
                 }
                 let (file, key) = keys[&t];
                 wanted.entry(file).or_default().insert(key);
+            }
+        }
+        // A function declared in a stub (a `foo-stubs` package, or a `.pyi` next to the source)
+        // runs its implementation: follow that one.
+        let mut stubs: Vec<FnId> = stubs.into_iter().collect();
+        stubs.sort_unstable();
+        for stub in stubs {
+            let Some(implementation) = self.implementation(keys[&stub]) else { continue };
+            let Some(id) = self.fn_id(implementation) else { continue };
+            let f = self.facts.function(id);
+            if f.location.path.ends_with(".pyi") {
+                continue;
+            }
+            let (text, analyzed) = (f.qualname.clone(), f.analyzed);
+            let location = self.facts.function(stub).location.clone();
+            self.facts.calls.push(Call { caller: stub, location, text, targets: vec![id], ..Call::default() });
+            self.facts.functions[stub.0 as usize].analyzed = true;
+            if !analyzed {
+                wanted.entry(implementation.0).or_default().insert(implementation.1);
             }
         }
         for (file, keys_in_file) in &wanted {
@@ -560,7 +1050,22 @@ impl<'a> Merger<'a> {
         wanted.into_iter().map(|(f, k)| (f, Some(k))).collect()
     }
 
-    fn finish(self) -> Facts {
+    fn finish(mut self) -> Facts {
+        // A project class is referenced when a project module uses its name (see
+        // `index::used_names`), or something may register it without naming it.
+        let indexes = self.indexes.0.lock();
+        let used: FxHashSet<&str> = indexes
+            .values()
+            .filter(|i| i.origin == Origin::Project)
+            .flat_map(|i| i.used_names.iter().map(String::as_str))
+            .collect();
+        for (key, &id) in &self.class_ids {
+            let Some(index) = indexes.get(&key.0).filter(|i| i.origin == Origin::Project) else { continue };
+            let Some(entry) = index.classes.get(&key.1) else { continue };
+            let name = entry.qualname.rsplit('.').next().unwrap_or_default();
+            self.facts.classes[id.0 as usize].referenced = entry.registered || used.contains(name);
+        }
+        drop(indexes);
         self.facts
     }
 }

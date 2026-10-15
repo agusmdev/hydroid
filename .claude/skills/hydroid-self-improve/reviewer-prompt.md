@@ -11,6 +11,10 @@ For each disputed line (`runtime: unreached` or `runtime: doubt` where hydroid d
    blocking calls on the loop with a stand-in (`"{}"` that accepts any use). Reorder or simplify
    the case so the line runs, without changing the mechanism under test. Re-run `check.py`.
    `BREAKS` means proven: done.
+   The oracle does not record calls that cannot block: a call returning an awaitable, an
+   operation on a non-blocking socket, a call giving an `unless_given` argument (catalog), and
+   FastAPI's own one-time read of the endpoint's source (`IGNORED_FRAMES` in the oracle).
+   Blocking inside an async library function the case awaits is recorded at the `await` line.
 2. If the line truly cannot run under the oracle (an exception handler, a path needing real
    data), judge it by FastAPI / Starlette / Python semantics. Read the library source in
    `tests/fixtures/.venv/lib/python*/site-packages/` to confirm on which thread the code runs.

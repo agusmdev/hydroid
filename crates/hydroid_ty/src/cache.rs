@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use hydroid_core::facts::{Call, Class, Facts, FnId, Flow, Function, Store, Value};
+use hydroid_core::facts::{Call, Class, Facts, FnId, Flow, Function, ResponseOptions, Signature, Store, Value};
 use rayon::prelude::*;
 use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
@@ -37,7 +37,10 @@ struct Head {
     stores: Vec<Store>,
     returns: Vec<(FnId, Value)>,
     dispatches: Vec<(FnId, FnId)>,
+    signatures: Vec<Signature>,
     suppressed: Vec<(String, u32)>,
+    stops_propagation: Vec<(String, bool)>,
+    response_options: Vec<ResponseOptions>,
 }
 
 /// Hash of everything an extraction depends on.
@@ -149,7 +152,10 @@ pub fn load(root: &Path) -> Option<(u64, Entry)> {
         stores: head.stores,
         returns: head.returns,
         dispatches: head.dispatches,
+        signatures: head.signatures,
         suppressed: head.suppressed,
+        stops_propagation: head.stops_propagation,
+        response_options: head.response_options,
     };
     Some((
         u64::from_le_bytes(*stored),
@@ -222,7 +228,10 @@ pub fn store(root: &Path, fingerprint: u64, entry: &Entry) {
             stores: facts.stores.clone(),
             returns: facts.returns.clone(),
             dispatches: facts.dispatches.clone(),
+            signatures: facts.signatures.clone(),
             suppressed: facts.suppressed.clone(),
+            stops_propagation: facts.stops_propagation.clone(),
+            response_options: facts.response_options.clone(),
         };
         let mut sections = vec![bincode::serialize(&head)?];
         sections.extend(chunks(&facts.calls)?);
