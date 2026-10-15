@@ -5,7 +5,8 @@ use anyhow::Context;
 use rustc_hash::FxHashMap as HashMap;
 use serde::Deserialize;
 
-use crate::report::Sink;
+use crate::facts::Slot;
+use crate::report::{Severity, Sink};
 
 const BUILTIN: &str = include_str!("../catalog.toml");
 
@@ -310,6 +311,9 @@ struct SinkGroup {
     /// diagnostics name it as the blocking function.
     #[serde(default)]
     blocks_in: Option<String>,
+    /// How long these functions can stop the loop (default: `critical`).
+    #[serde(default)]
+    severity: Severity,
     functions: Vec<String>,
 }
 
@@ -506,7 +510,25 @@ struct EntryGroup {
     passthrough: Vec<String>,
     #[serde(default)]
     injects: bool,
+    #[serde(default)]
+    runs_once: RunsOnce,
     functions: Vec<String>,
+}
+
+/// Which callables an `[[entry]]` function registers run only while the server starts or stops
+/// (lifespan, startup and shutdown handlers): `true` for all of them, or the parameters taking
+/// them.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum RunsOnce {
+    All(bool),
+    Slots(Vec<String>),
+}
+
+impl Default for RunsOnce {
+    fn default() -> Self {
+        Self::All(false)
+    }
 }
 
 /// What registering a callable (or a class) with an `[[entry]]` function means.
@@ -539,6 +561,19 @@ pub struct Entry {
     /// injected: the framework fills it with what the callable registered at `slot` provides
     /// (what it returns or yields; an instance, for a class), not from the request.
     pub injects: bool,
+    /// See [`RunsOnce`].
+    pub runs_once: RunsOnce,
+}
+
+impl Entry {
+    /// Whether what is registered at `slot` runs only while the server starts or stops.
+    pub fn runs_once(&self, slot: &Slot) -> bool {
+        match (&self.runs_once, slot) {
+            (RunsOnce::All(all), _) => *all,
+            (RunsOnce::Slots(slots), Slot::Param(p)) => slots.contains(p),
+            (RunsOnce::Slots(_), _) => false,
+        }
+    }
 }
 
 /// Qualified-name patterns: exact names in a map, `*` patterns scanned.
@@ -665,6 +700,8 @@ pub struct Catalog {
     unless_given: Vec<Vec<String>>,
     /// The `blocks_in` function of each group, by index.
     blocks_in: Vec<Option<String>>,
+    /// The severity of each group, by index.
+    severity: Vec<Severity>,
     offload: Patterns<()>,
     /// `[offload]` `copies`.
     copies: Vec<String>,
@@ -713,6 +750,7 @@ impl Catalog {
             self.direct.push(group.direct);
             self.unless_given.push(group.unless_given);
             self.blocks_in.push(group.blocks_in);
+            self.severity.push(group.severity);
             let patterns = if blocking_decorator { &mut self.blocking_decorators } else { &mut self.sinks };
             for name in &group.functions {
                 patterns.insert(name, index);
@@ -775,6 +813,7 @@ impl Catalog {
                 response_exclude,
                 passthrough,
                 injects,
+                runs_once,
                 functions,
             } = group;
             let index = self.entry_groups.len();
@@ -788,6 +827,7 @@ impl Catalog {
                 response_exclude,
                 passthrough,
                 injects,
+                runs_once,
             });
             for name in &functions {
                 self.entries.insert(name, index);
@@ -813,15 +853,23 @@ impl Catalog {
     /// [`Catalog::sink`] for a function whose roles are known.
     pub fn sink_of(&self, roles: Roles, qualname: &str) -> Option<Sink> {
         let index = roles.sink?;
+        Some(self.group_sink(index, self.blocks_in[index].as_deref().unwrap_or(qualname)))
+    }
+
+    /// What blocking in `qualname`, a function of group `index`, means.
+    fn group_sink(&self, index: usize, qualname: &str) -> Sink {
         let (category, advice) = &self.groups[index];
-        let qualname = self.blocks_in[index].as_deref().unwrap_or(qualname).to_string();
-        Some(Sink { qualname, category: category.clone(), advice: advice.clone() })
+        Sink {
+            qualname: qualname.to_string(),
+            category: category.clone(),
+            advice: advice.clone(),
+            severity: self.severity[index],
+        }
     }
 
     /// [`Catalog::blocking_decorator`] for a function whose roles are known.
     pub fn blocking_decorator_of(&self, roles: Roles, qualname: &str) -> Option<Sink> {
-        let (category, advice) = &self.groups[roles.blocking_decorator?];
-        Some(Sink { qualname: qualname.to_string(), category: category.clone(), advice: advice.clone() })
+        Some(self.group_sink(roles.blocking_decorator?, qualname))
     }
 
     /// [`Catalog::is_direct_sink`] for a function whose roles are known.
@@ -864,9 +912,7 @@ impl Catalog {
 
     pub fn sink(&self, qualname: &str) -> Option<Sink> {
         let &index = self.sinks.get(qualname)?;
-        let (category, advice) = &self.groups[index];
-        let qualname = self.blocks_in[index].as_deref().unwrap_or(qualname).to_string();
-        Some(Sink { qualname, category: category.clone(), advice: advice.clone() })
+        Some(self.group_sink(index, self.blocks_in[index].as_deref().unwrap_or(qualname)))
     }
 
     /// Whether `qualname` is a sink only when called directly from loop code.
@@ -882,8 +928,7 @@ impl Catalog {
     /// The blocking behavior a decorator gives the sync functions it decorates.
     pub fn blocking_decorator(&self, qualname: &str) -> Option<Sink> {
         let &index = self.blocking_decorators.get(qualname)?;
-        let (category, advice) = &self.groups[index];
-        Some(Sink { qualname: qualname.to_string(), category: category.clone(), advice: advice.clone() })
+        Some(self.group_sink(index, qualname))
     }
 
     pub fn is_offload(&self, qualname: &str) -> bool {

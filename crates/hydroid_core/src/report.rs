@@ -1,6 +1,6 @@
 //! Analysis results.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::facts::Location;
 
@@ -13,11 +13,26 @@ pub struct Frame {
     pub callee: String,
 }
 
+/// How much a blocking call harms the server: how long it can stop the loop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// Stops the loop for a short, bounded time (local file metadata, small reads), or only
+    /// while the server starts or stops.
+    Warn,
+    /// Can stop the loop for a long or unknown time: waits on the network, another process or
+    /// thread, a timer, a person; or is slow by design, or raises on the loop.
+    #[default]
+    Critical,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Sink {
     pub qualname: String,
     pub category: String,
     pub advice: String,
+    /// The catalog severity of the blocking function.
+    pub severity: Severity,
 }
 
 /// How the event loop reaches the diagnostic's function, starting at a FastAPI entry point
@@ -41,6 +56,12 @@ pub struct Diagnostic {
     pub chain: Vec<Frame>,
     pub sink: Sink,
     pub reached_from: Option<ReachedFrom>,
+    /// The sink's severity, one level lower (critical to warn) when the call only runs while
+    /// the server starts or stops.
+    pub severity: Severity,
+    /// The call only runs while the server starts or stops (lifespan, startup and shutdown
+    /// handlers), never while it serves requests.
+    pub runs_once: bool,
 }
 
 /// A call on the event loop whose target could not be determined.

@@ -3,12 +3,13 @@ use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 use hydroid::config::Config;
-use hydroid::{Options, check, render};
+use hydroid::{Options, Severity, check, render};
 
 /// Finds blocking calls reachable on the event loop in async FastAPI code.
 ///
 /// Options also read from `[tool.hydroid]` in `<PATH>/pyproject.toml`; flags take precedence.
-/// Exit status: 0 clean, 1 blocking calls found (or unresolved calls with --strict), 2 error.
+/// Exit status: 0 clean, 1 blocking calls found at the --fail-on severity or worse (or
+/// unresolved calls with --strict), 2 error.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
@@ -27,6 +28,9 @@ struct Cli {
     /// Report calls on the event loop that could not be resolved, and fail on them.
     #[arg(long)]
     strict: bool,
+    /// Lowest severity of blocking call that fails the run [default: warn, any blocking call].
+    #[arg(long, value_enum)]
+    fail_on: Option<FailOn>,
     /// Gitignore-style glob of files to skip (repeatable).
     #[arg(long)]
     exclude: Vec<String>,
@@ -35,6 +39,21 @@ struct Cli {
     no_cache: bool,
     #[arg(long, value_enum, default_value_t = Format::Human)]
     format: Format,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum FailOn {
+    Warn,
+    Critical,
+}
+
+impl From<FailOn> for Severity {
+    fn from(value: FailOn) -> Self {
+        match value {
+            FailOn::Warn => Severity::Warn,
+            FailOn::Critical => Severity::Critical,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -48,6 +67,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let config = Config::load(&cli.path)?;
     let catalogs = config.catalog_document().into_iter().collect();
     let strict = cli.strict || config.strict;
+    let fail_on = cli.fail_on.map(Severity::from).or(config.fail_on).unwrap_or(Severity::Warn);
     let options = Options {
         python: cli.python.or(config.python),
         follow_libs: cli.follow_libs || config.follow_libs,
@@ -63,7 +83,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Format::Json => println!("{}", serde_json::to_string_pretty(&report)?),
         Format::Sarif => println!("{}", serde_json::to_string_pretty(&render::sarif(&report, strict))?),
     }
-    let failed = !report.diagnostics.is_empty() || (strict && !report.unresolved.is_empty());
+    let failed = report.diagnostics.iter().any(|d| d.severity >= fail_on) || (strict && !report.unresolved.is_empty());
     Ok(if failed { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 

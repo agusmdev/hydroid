@@ -20,7 +20,7 @@ use crate::facts::{
     Call, ClassId, Dump, Facts, FnId, Flow, FunctionKind, Location, LoggerName, Origin, ResponseOptions, Signature, Slot,
     Value,
 };
-use crate::report::{Diagnostic, Frame, ReachedFrom, Report, Sink, Unresolved};
+use crate::report::{Diagnostic, Frame, ReachedFrom, Report, Severity, Sink, Unresolved};
 
 pub fn analyze(mut facts: Facts, catalog: &Catalog) -> Report {
     // Copies (see `specialize`) come after the extracted functions and calls.
@@ -35,7 +35,10 @@ pub fn analyze(mut facts: Facts, catalog: &Catalog) -> Report {
 
 fn report(facts: &Facts, catalog: &Catalog, functions_analyzed: usize, call_sites: usize) -> Report {
     let graph = Graph::new(facts, catalog);
-    let blocking = graph.blocking_distances();
+    // The chain of a diagnostic leads to its worst sink: a call reaching a file check in one
+    // step and an HTTP request in three is critical, and shows the request.
+    let critical = graph.blocking_distances(Severity::Critical);
+    let blocking = graph.blocking_distances(Severity::Warn);
     let roots = graph.roots();
     let context = graph.entry_paths();
 
@@ -61,8 +64,12 @@ fn report(facts: &Facts, catalog: &Catalog, functions_analyzed: usize, call_site
             let reached = s.starts_at_entry_point().then(|| context.reached_from(&s, cut));
             (facts.function(caller).qualname.clone(), Some(call), prefix, reached)
         };
+        let runs_once = context.runs_once[root.0 as usize];
         for &call in &graph.calls_of[root.0 as usize] {
-            let Some((chain, sink)) = graph.blocking_chain(call, &blocking) else {
+            let Some((chain, sink)) = graph
+                .blocking_chain(call, &critical, Severity::Critical)
+                .or_else(|| graph.blocking_chain(call, &blocking, Severity::Warn))
+            else {
                 continue;
             };
             let location = &facts.calls[entered_at.unwrap_or(call)].location;
@@ -72,13 +79,17 @@ fn report(facts: &Facts, catalog: &Catalog, functions_analyzed: usize, call_site
             diagnostics.push(Diagnostic {
                 location: location.clone(),
                 function: function.clone(),
+                severity: if runs_once { Severity::Warn } else { sink.severity },
                 sink,
                 chain: prefix.iter().cloned().chain(chain).collect(),
                 reached_from: reached.clone(),
+                runs_once,
             });
         }
     }
-    diagnostics.sort_by(|a, b| (&a.location, &a.sink.qualname).cmp(&(&b.location, &b.sink.qualname)));
+    // A call site reached from several roots keeps its worst severity.
+    let key = |d: &Diagnostic| (d.location.clone(), d.sink.qualname.clone(), std::cmp::Reverse(d.severity));
+    diagnostics.sort_by_cached_key(key);
     diagnostics.dedup_by(|a, b| a.location == b.location && a.sink.qualname == b.sink.qualname);
 
     let mut report = Report { diagnostics, unresolved: graph.unresolved(&roots), ..Report::default() };
@@ -1514,8 +1525,8 @@ impl<'a> Graph<'a> {
     }
 
     /// For each sync function that blocks when called: `(distance, next call, next function)`
-    /// on a shortest chain to a blocking function.
-    fn blocking_distances(&self) -> Vec<Option<(u32, usize, FnId)>> {
+    /// on a shortest chain to a blocking function of severity `at_least` or worse.
+    fn blocking_distances(&self, at_least: Severity) -> Vec<Option<(u32, usize, FnId)>> {
         let n = self.facts.functions.len();
         let mut next: Vec<Option<(u32, usize, FnId)>> = vec![None; n];
         let mut callers_of: Vec<Vec<(FnId, usize)>> = vec![Vec::new(); n];
@@ -1529,8 +1540,12 @@ impl<'a> Graph<'a> {
                 if self.direct[t.0 as usize] {
                     continue;
                 }
-                if self.sink[t.0 as usize].is_some() {
-                    if !call.awaited && self.blocks_here(i, t) && next[call.caller.0 as usize].is_none() {
+                if let Some(sink) = &self.sink[t.0 as usize] {
+                    if sink.severity >= at_least
+                        && !call.awaited
+                        && self.blocks_here(i, t)
+                        && next[call.caller.0 as usize].is_none()
+                    {
                         next[call.caller.0 as usize] = Some((1, i, t));
                         queue.push_back(call.caller);
                     }
@@ -1551,14 +1566,21 @@ impl<'a> Graph<'a> {
         next
     }
 
-    /// The shortest blocking chain starting at `call`, and what blocks at its end.
-    fn blocking_chain(&self, call: usize, next: &[Option<(u32, usize, FnId)>]) -> Option<(Vec<Frame>, Sink)> {
+    /// The shortest blocking chain starting at `call` to a blocking function of severity
+    /// `at_least` or worse (`next` from [`Graph::blocking_distances`] for the same severity), and
+    /// what blocks at its end.
+    fn blocking_chain(
+        &self,
+        call: usize,
+        next: &[Option<(u32, usize, FnId)>],
+        at_least: Severity,
+    ) -> Option<(Vec<Frame>, Sink)> {
         let c = &self.facts.calls[call];
         let best = self.targets[call]
             .iter()
             .filter_map(|&t| {
-                if self.sink[t.0 as usize].is_some() {
-                    (!c.awaited && self.blocks_here(call, t)).then_some((0, t))
+                if let Some(sink) = &self.sink[t.0 as usize] {
+                    (sink.severity >= at_least && !c.awaited && self.blocks_here(call, t)).then_some((0, t))
                 } else if self.facts.function(t).is_async || !self.runs_body(call, t) {
                     None
                 } else {
@@ -1598,11 +1620,20 @@ impl<'a> Graph<'a> {
     /// to every function they reach.
     fn entry_paths(&self) -> EntryPaths<'_> {
         let mut entries: Vec<(FnId, String)> = Vec::new();
+        // Entry points that only run while the server starts or stops, and the others.
+        let (mut once, mut traffic): (Vec<FnId>, Vec<FnId>) = (Vec::new(), Vec::new());
         // Copies (see `specialize`) register what their original does.
         for flow in self.facts.flows.iter().filter(|f| self.facts.function(f.caller).specializes.is_none()) {
+            if self.roles[flow.into.0 as usize].loop_callback
+                && let Value::Function(f) = flow.value
+            {
+                // Scheduled on the loop: it may run at any time.
+                traffic.push(f);
+            }
             let into = &self.facts.function(flow.into).qualname;
-            let Some(kind) = self.entry_kind(flow.into) else { continue };
-            let label = entry_label(kind, into, flow);
+            let Some(entry) = self.entry(flow.into) else { continue };
+            let label = entry_label(&entry.kind, into, flow);
+            let added = entries.len();
             match flow.value {
                 Value::Function(f) => entries.push((f, label)),
                 Value::Class(class) => {
@@ -1614,8 +1645,11 @@ impl<'a> Graph<'a> {
                 }
                 Value::Param(..) => {}
             }
+            let registered = entries[added..].iter().map(|(f, _)| *f);
+            if entry.runs_once(&flow.slot) { once.extend(registered) } else { traffic.extend(registered) }
         }
         entries.extend(self.hooks.iter().cloned());
+        traffic.extend(self.hooks.iter().map(|(h, _)| *h));
         let project_async = self
             .facts
             .functions
@@ -1626,7 +1660,43 @@ impl<'a> Graph<'a> {
         let count = entries.len();
         let from_entries = self.bfs(entries);
         let from_project = self.bfs(project_async.collect());
-        EntryPaths { graph: self, from_entries, from_project, entries: count }
+        let runs_once = self.runs_once(once, traffic);
+        EntryPaths { graph: self, from_entries, from_project, entries: count, runs_once }
+    }
+
+    /// The functions that only run while the server starts or stops: reached from `once`
+    /// entry points, and not from `traffic` ones. A coroutine created there without being
+    /// awaited (a task, or a coroutine given to something else) may run later, so it counts as
+    /// traffic.
+    fn runs_once(&self, once: Vec<FnId>, mut traffic: Vec<FnId>) -> Vec<bool> {
+        let mut at_start = vec![false; self.facts.functions.len()];
+        let mut queue: VecDeque<FnId> = VecDeque::new();
+        for f in once {
+            if !std::mem::replace(&mut at_start[f.0 as usize], true) {
+                queue.push_back(f);
+            }
+        }
+        while let Some(f) = queue.pop_front() {
+            for &call in &self.calls_of[f.0 as usize] {
+                for &t in &self.targets[call] {
+                    if !self.runs_inline(f, t) || !self.runs_body(call, t) {
+                        continue;
+                    }
+                    if self.facts.function(t).is_async && !self.facts.calls[call].awaited {
+                        traffic.push(t);
+                        continue;
+                    }
+                    // Reaching a copy (see `specialize`) reaches the code of its original.
+                    for g in std::iter::once(t).chain(self.facts.function(t).specializes) {
+                        if !std::mem::replace(&mut at_start[g.0 as usize], true) {
+                            queue.push_back(g);
+                        }
+                    }
+                }
+            }
+        }
+        let serving = self.bfs(traffic.into_iter().map(|f| (f, String::new())).collect());
+        at_start.iter().zip(&serving).map(|(&start, serving)| start && serving.is_none()).collect()
     }
 
     fn bfs(&self, sources: Vec<(FnId, String)>) -> Vec<Option<Reach>> {
@@ -1780,6 +1850,8 @@ struct EntryPaths<'a> {
     from_entries: Vec<Option<Reach>>,
     from_project: Vec<Option<Reach>>,
     entries: usize,
+    /// See [`Graph::runs_once`], by function.
+    runs_once: Vec<bool>,
 }
 
 /// A shortest path from an entry point (or project code) to a function.
