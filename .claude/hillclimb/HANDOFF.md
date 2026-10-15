@@ -259,3 +259,38 @@ No hydroid code (`crates/`, `catalog.toml`), case labels or `split.json` changed
 **Verdict changes in `check.py --suite`:** only `std_email_make_msgid_fqdn`, INVALID → PASSES (line 37 `make_msgid(domain=...)` is no longer recorded). There are no candidates, so `check.py --candidates` had nothing to run.
 
 **Labels to review:** none found wrong.
+
+## 7. Final state for the PR to `main` (head `62c801d`)
+
+**Rounds 16-18:**
+
+| Round | Lever | Train | Holdout | FP | Polar warm (recorded) |
+|---|---|---|---|---|---|
+| 16 | phase B: library rules moved to catalog concepts | 161/161 | 4/34 | 0 | 378 ms |
+| 17 | PEP 561 `-stubs` packages, logging level literals | 161/161 | 4/34 | 0 | 348 ms |
+| 18 | deferred exit callbacks (`[[exit_stack]]`) | 162/166 | 4/38 | 0 | 762 ms (wrong, see below) |
+
+- `literals.py f02284a`: 0 qualified library names in Rust (27 at `7bd0d27`). Section 3 is stale: those
+  rules are now catalog data.
+- Polar: 104 diagnostics; chains and unresolved calls identical from `f02284a`'s refactor baseline
+  to `62c801d`.
+
+**Round-18 speed record is wrong.** 762 ms warm / 15.7 s cold was measured on a busy machine. An
+independent re-run on a quiet 8-vCPU box gave ~295 ms warm at `62c801d` (~770 ms before phase B).
+
+**4 `open` train cases left unfixed (by decision):**
+- `r18_abc_register_virtual`: an ABC with a virtual subclass (`Base.register(Impl)`).
+- `r18_callback_protocol_global`: a function stored in a global typed as a callback Protocol.
+- `r18_decorator_registry_dispatch`: callables put in a registry dict by a decorator, called by key.
+- `r18_protocol_factory_sync_client`: a factory `-> Protocol` returning a sync HTTP client.
+
+All are values behind Protocol/ABC types or callables through registries: the call resolves to the
+abstract method, or not at all. These are the best next targets (one general mechanism: track the
+concrete classes/callables that flow into a declared abstract type or a container).
+
+**Ideas for next time:**
+- Fix the 4 open cases above with one value-flow mechanism, not per-case rules.
+- Time Polar only on a quiet machine, 3+ runs, and record the box; re-measure the baseline in
+  the same run.
+- The holdout misses of section 4 still apply; the framework-calls-a-dunder group is the biggest.
+- Harness limits in section 2 (no `--cpu` mode in `check.py`, stdlib internal waits) are still open.
