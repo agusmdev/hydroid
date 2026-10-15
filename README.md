@@ -138,8 +138,8 @@ details, and what hydroid knowingly misses: [docs/GUIDE.md](docs/GUIDE.md#12-how
 ## Limits
 
 Python is dynamic: calls through `getattr`, untyped parameters, or registries of callables filled
-at run time cannot always be resolved. They are never silently dropped: `--strict` lists every one
-reachable on the loop. A call on a value typed as a Protocol or ABC resolves to the abstract
+at run time cannot always be resolved. `--strict` lists every one reachable on the loop (except
+awaited calls, assumed to run a coroutine). A call on a value typed as a Protocol or ABC resolves to the abstract
 method, so the real implementation can be missed. What hydroid knowingly misses, and why:
 [docs/GUIDE.md](docs/GUIDE.md#known-limits).
 

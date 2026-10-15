@@ -198,7 +198,8 @@ The comment goes on the line hydroid reports (the `-->` line).
 
 Python is dynamic; some calls cannot be resolved statically (`getattr(obj, name)()`, untyped
 parameters, callables stored in dicts). hydroid never drops them silently: the summary line counts
-them, and `--strict` lists each one reachable on the loop and exits `1`. Adding type annotations
+them, and `--strict` lists each one reachable on the loop (except awaited calls, assumed to run a
+coroutine) and exits `1`. Adding type annotations
 usually resolves them.
 
 ## 10. CI (GitHub code scanning)
@@ -346,8 +347,9 @@ a `try` that only probes for a running loop, runs only when no loop is running: 
 ### Known limits
 
 Python is dynamic: calls through `getattr`, untyped parameters, or containers of callables cannot
-always be resolved. They are never silently dropped: `--strict` lists every unresolved call
-reachable on the loop. Not modeled yet:
+always be resolved. `--strict` lists every unresolved call reachable on the loop, except awaited
+ones (`await client.fetch()` on an untyped `client`), which are assumed to run a coroutine. Not
+modeled yet:
 - `getattr(obj, "name")`, and containers of callables filled at run time: a registry dict a
   decorator or `__init_subclass__` fills (`EXPORTERS[fmt] = fn`), jobs put on a `queue.Queue` and
   called where it is drained;

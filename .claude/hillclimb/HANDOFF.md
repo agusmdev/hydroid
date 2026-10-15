@@ -294,3 +294,35 @@ concrete classes/callables that flow into a declared abstract type or a containe
   the same run.
 - The holdout misses of section 4 still apply; the framework-calls-a-dunder group is the biggest.
 - Harness limits in section 2 (no `--cpu` mode in `check.py`, stdlib internal waits) are still open.
+
+**Review of PR #8 (5 Claude reviewers + Codex gpt-6.1-sol), open follow-ups.** Each repro was run
+on `main` (`f02284a`) and on the head. Only one was a regression against `main`: dict/list
+literals with `**spread` / `*starred` elements in dispatch tables (fixed, case in
+`tests/fixtures/cases/dispatch_tables`). The rest are gaps or false positives in the new
+mechanisms, or older gaps; best targets first:
+- Catalog merge: a user `[[entry]]`/`[[arguments]]`/`[[sink]]`/`[[observer]]` that lists a built-in
+  name replaces the built-in group (its new flags go to defaults); user globs never override
+  built-in globs; wildcard expansion beats exact rules (`catalog.rs` `Patterns::insert`, `hydroid_ty/src/lib.rs` expansion).
+- Logging: one global threshold for all loggers (`analysis.rs` `logger_threshold`); any
+  `QueueListener` built anywhere (also in tests) drops every handler hook; handler levels per class,
+  test code counted; `debug` not in `dispatch`; `FileHandler`/`SMTPHandler`/`HTTPHandler` emit not sinks.
+- ORM lazy loads: dropped after any awaited non-offload call (`extract.rs` `may_be_persistent_value`),
+  hidden by an unrelated `AsyncSession` parameter or an unused eager option, and by awaited calls
+  given a callable that never calls it (`preloaded_off_loop`).
+- Pydantic: any project instance counts as "already a model" (`holds_instances`); response
+  validation skipped when the return type is `Any` or a union with the model.
+- Exit stacks: a stack built off the loop (startup, `__init__`, module level) and closed on the loop
+  is not reported; `stack.push(cm)` and `@stack.callback` missed; `frame_access` treats every
+  builtin (`len`) as frame access (false positive); nested `try/finally` is exponential in
+  `stacks.rs`; `copies` lists `run_in_executor`/`Executor.submit`, which always run in a thread.
+- Stubs: `--follow-libs` loses implementations re-exported from a private module; catalog names
+  given by implementation path stop matching with stubs installed; stub-to-source calls lose `iterates`.
+- Cache key: library contents (editable installs, in-place edits), `.gitignore`/`.ignore` files.
+- Others: `lazy_arguments` skips methods (false positive for streamed genexps in methods) and is
+  quadratic in names; `lifecycle` entries ignore `slot` (import-time callbacks reported);
+  specialization skips parameter narrowing on receiver copies; loop-probe `try` bodies with other
+  raising operations; `add_route` slot name is `route`, not `endpoint`.
+- Harness: the gate ignores holdout `errors` (an erroring case raises holdout recall);
+  `PROTECTED` misses `tests/fixtures/cases/` and other test files; `literals.py` only catches
+  dotted names; `HANDOFF.md` §4 describes holdout mechanisms a fixer can read; the oracle is not a
+  sandbox (cases write to `/tmp`, `/etc`); round 18's 762 ms stays in `_state.json`.
