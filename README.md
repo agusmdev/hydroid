@@ -127,7 +127,8 @@ drop it and the upload step to fail the build instead.
    - what blocks, and what offloads or schedules on the loop;
    - what functions do with their arguments;
    - framework entry points and what the framework runs around them;
-   - model hooks, observers (logging), lazily loaded attributes, and state namespaces.
+   - model hooks, observers (logging), exit stacks, running-loop probes, lazily loaded attributes,
+     and state namespaces.
    Library knowledge goes here, not in the Rust code. Every table can be extended from
    `pyproject.toml`, and a test checks that every name exists in a real environment.
 
@@ -136,9 +137,11 @@ details, and what hydroid knowingly misses: [docs/GUIDE.md](docs/GUIDE.md#12-how
 
 ## Limits
 
-Python is dynamic: calls through `getattr`, untyped parameters, or containers of callables cannot
-always be resolved. They are never silently dropped: `--strict` lists every one reachable on the
-loop. What hydroid knowingly misses, and why: [docs/GUIDE.md](docs/GUIDE.md#known-limits).
+Python is dynamic: calls through `getattr`, untyped parameters, or registries of callables filled
+at run time cannot always be resolved. They are never silently dropped: `--strict` lists every one
+reachable on the loop. A call on a value typed as a Protocol or ABC resolves to the abstract
+method, so the real implementation can be missed. What hydroid knowingly misses, and why:
+[docs/GUIDE.md](docs/GUIDE.md#known-limits).
 
 ## Development
 

@@ -171,9 +171,9 @@ a class name stands for constructing the class.
 | `[[entry]]` | callables passed to these are framework entry points | `kind`, `functions`; `slot` (the parameters taking what is registered; a decorator registers what it decorates; default: any argument); what the framework runs on the loop around it: `validates_params` (validates its annotated parameters, or those of a class's `__init__`), `serializes_return` (dumps what it returns, sync callables included), `validates_return` (validates what it returns into the response model, in the thread it runs in: only `async def` ones on the loop); `response_model` (the keyword giving the response model, `None` for none; default: the return annotation), `response_exclude` (the keyword naming top-level fields left out of the dump), `passthrough` (classes sent as is: a callable always returning them skips the return hooks); `injects` (a parameter whose default, or `Annotated` metadata, is a call to these is filled with what the callable at the first `slot` provides, and not validated from the request) |
 | `[[builds_on_loop]]` | a class (or a factory) given to these at `slot` is constructed (called) by the library later, on the loop: its `__init__` runs there, with the project overrides of what the library `__init__` it inherits calls on `self` (`Response.__init__` calls `self.render`) | `kind` (what running it is called in diagnostics), `slot`, `functions`; `label` (how diagnostics name what reaches it; default: the function's `[[entry]]`), `unless_passthrough` (not when every callable the same call registers always returns one of its entry's `passthrough` classes) |
 | `[[lazy_attribute]]` | `name = factory(...)` in a class body makes reading `instance.name` load it, running `loads`, unless it is already loaded (SQLAlchemy's `relationship()`) | `factories`, `loads`; `keyword` and `lazy` (the factory's keyword choosing how it loads, and its literal values that load on read; without the keyword, it does), `eager` (options loading the attributes they name up front), `expires_all` and `expires` (calls expiring every loaded attribute, or those of the instance given first), `reload` (`{ functions, names }`: calls loading the attributes named at `names` on the instance given first; given none, they expire it), `raises_under` (classes under which a load raises instead of blocking: a function naming one loads nothing) |
-| `[[observer]]` | a registry: `attach` calls attach observers (instances of `classes`, or callables) to the registry they are called on, and its `dispatch` calls run them on the calling thread (stdlib logging handlers, filters and formatters; blinker receivers) | `dispatch`; `attach` (`{ functions, propagates, callable }`), `classes` (`{ base, runs, calls, exception_only, level, offloaded_by }`: what runs on an attached instance: `runs`, or what the library's methods call on `self` where the project does not override them), `scope` (`{ naming, keyword, root, separator, stop }`: how registries are named; observers only run for the registries they are attached to); logging only: `levels`, `exception`, `level_names`, `level_keyword`, `default_level`, `threshold`, `any_level` |
+| `[[observer]]` | a registry: `attach` calls attach observers (instances of `classes`, or callables) to the registry they are called on, and its `dispatch` calls run them on the calling thread (stdlib logging handlers, filters and formatters; blinker receivers through `[tool.hydroid]`, see the commented example in `catalog.toml`) | `dispatch`; `attach` (`{ functions, propagates, callable }`), `classes` (`{ base, runs, calls, exception_only, level, offloaded_by }`: what runs on an attached instance: `runs`, or what the library's methods call on `self` where the project does not override them), `scope` (`{ naming, keyword, root, separator, stop }`: how registries are named; observers only run for the registries they are attached to); logging only: `levels`, `exception`, `level_names`, `level_keyword`, `default_level`, `threshold`, `any_level` |
 | `[[exit_stack]]` | calls storing a callable (`callbacks`), or a context manager's exit (`contexts`: entered now), on the instance they are called on, which runs what it stores later, where `runs` calls run it (and where a `with` block on it ends, when its `__exit__` is one); `moves` calls move what it stores to a new instance (`pop_all()`). Where hydroid cannot follow the instance to where it runs, the call does what `[[arguments]]` says | `callbacks`, `contexts`, `runs`, `moves` |
-| `[[state_namespace]]` | an attribute namespace the library types as `Any` (`app.state`, Flask's `g`): reading `<namespace>.name` gets the class of what the project stores under `name` there, when every store (and every key of a lifespan's yielded dict) agrees | `owners` (classes whose instances own one); `attribute` (the owners' attribute holding it; without it, the owner itself); `app` (`{ attribute, owners }`: `<owner>.<attribute>` is the application, typed as the one project subclass of `owners`); `lifespan` (`{ owners, keyword }`: the dicts yielded by the lifespan given at `keyword` to the constructor of `owners` go into the namespace) |
+| `[[state_namespace]]` | an attribute namespace the library types as `Any` (`app.state`; Flask's `g` through `[tool.hydroid]`, see the commented example in `catalog.toml`): reading `<namespace>.name` gets the class of what the project stores under `name` there, when every store (and every key of a lifespan's yielded dict) agrees | `owners` (classes whose instances own one); `attribute` (the owners' attribute holding it; without it, the owner itself); `app` (`{ attribute, owners }`: `<owner>.<attribute>` is the application, typed as the one project subclass of `owners`); `lifespan` (`{ owners, keyword }`: the dicts yielded by the lifespan given at `keyword` to the constructor of `owners` go into the namespace) |
 
 Argument slots (`calls`, `iterates`, `enters`) are positions (`0` is the first argument after
 `self`), keyword names, or `"*"` (every positional argument not in `calls`). For example, a
@@ -334,12 +334,13 @@ Some library code is described in the catalog, because its source does not show 
   project attaches, only for the loggers they are attached to and the records their levels let
   through.
 - Lazily loaded attributes (`[[lazy_attribute]]`): reading a lazy SQLAlchemy relationship
-  queries, unless an eager option loaded it, an async session holds it, or it was already
-  loaded off the loop.
+  queries, unless an eager option loaded it, the function names a class under which a load
+  raises instead (`raises_under`: SQLAlchemy's `AsyncSession`), or it was already loaded off the
+  loop.
 - Hooks run on attribute set (`[[hook]]`, `runs = "set"`): SQLAlchemy's `@validates`.
 
-Code in the `except RuntimeError:` of a `try` that only probes for a running loop
-(`[[loop_probe]]`) runs only when no loop is running: it is skipped. Starting an event loop
+Code in the handlers catching a `[[loop_probe]]`'s `raises` class (`RuntimeError`) or a base, of
+a `try` that only probes for a running loop, runs only when no loop is running: it is skipped. Starting an event loop
 (`asyncio.run`) is only reported when loop code does it directly.
 
 ### Known limits
@@ -347,9 +348,17 @@ Code in the `except RuntimeError:` of a `try` that only probes for a running loo
 Python is dynamic: calls through `getattr`, untyped parameters, or containers of callables cannot
 always be resolved. They are never silently dropped: `--strict` lists every unresolved call
 reachable on the loop. Not modeled yet:
-- `getattr(obj, "name")` and containers of callables (`HANDLERS[kind]()`);
+- `getattr(obj, "name")`, and containers of callables filled at run time: a registry dict a
+  decorator or `__init_subclass__` fills (`EXPORTERS[fmt] = fn`), jobs put on a `queue.Queue` and
+  called where it is drained;
+- values behind a Protocol or ABC type: a call on a value declared as a Protocol (a factory
+  `-> Transport` returning an `httpx.Client`, a function stored in a variable typed as a callback
+  Protocol) or as an ABC with virtual subclasses (`Base.register(Impl)`) resolves to the abstract
+  method, and the real implementation is missed;
+- library functions that block only through a callable stored earlier
+  (`sched.scheduler(time.monotonic, time.sleep).run()`) and are not in the catalog;
 - metaclasses;
-- `.pyi`-only libraries under `--follow-libs`.
+- `.pyi`-only libraries under `--follow-libs`;
 - Exit stacks: an exit that runs on the loop only when an unexpected exception is raised between
   storing it and an offloaded close (a property or `__format__` raising, an attribute deleted
   where hydroid does not see it) may go unreported; so may a stack reached through
