@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/agusmdev/hydroid/compare/v0.3.0...v0.4.0) (2026-10-15)
+
+
+### Features
+
+* severity levels for blocking calls (critical / warn) and --fail-on ([6b016be](https://github.com/agusmdev/hydroid/commit/6b016be6ac3716ce7350604fd812addaa93f59db))
+* severity levels for blocking calls (critical / warn) and --fail-on ([15b7351](https://github.com/agusmdev/hydroid/commit/15b7351ce39405ae841057866f00e8a4a11f90b6))
+
 ## [0.3.0](https://github.com/agusmdev/hydroid/compare/v0.2.0...v0.3.0) (2026-10-15)
 
 
