@@ -749,6 +749,8 @@ impl<'a> Merger<'a> {
             called_params: entry.called_params.clone(),
             stored_params: entry.stored_params.clone(),
             called_attributes: entry.called_attributes.clone(),
+            registered_params: entry.registered_params.clone(),
+            self_reads: entry.self_reads.clone(),
             parent: None,
             class: None,
             decorators: Vec::new(),

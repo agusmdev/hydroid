@@ -16,7 +16,7 @@ use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinition
 use ty_python_semantic::types::ide_support::{
     ResolvedDefinition, call_signature_details, static_member_type_for_attribute,
 };
-use ty_python_semantic::types::{KnownClass, SpecialFormType, Type, TypeDefinition};
+use ty_python_semantic::types::{KnownClass, SpecialFormType, Type, TypeDefinition, TypeVarKind};
 use ty_python_semantic::{
     HasType, ImportAliasResolution, SemanticModel, definitions_for_attribute, definitions_for_name,
 };
@@ -333,6 +333,7 @@ pub fn extract_file(
         call_arguments: RefCell::default(),
         offloaded_params: RefCell::default(),
         assigned: RefCell::default(),
+        type_checking: RefCell::default(),
         lazy_reads: Vec::new(),
         model: &model,
         index,
@@ -474,6 +475,9 @@ fn excluded_fields(call: &ast::ExprCall, keyword: &str) -> Vec<String> {
 /// A parameter a function hands on: its position (if it can be passed positionally) and name.
 type HandedParam = (Option<usize>, String);
 
+/// See [`crate::index::type_checking_methods`].
+type TypeCheckingMethods = FxHashMap<u32, (u32, String)>;
+
 struct Extractor<'a, 'db> {
     db: &'a HydroidDb,
     state: &'a AppState,
@@ -485,6 +489,8 @@ struct Extractor<'a, 'db> {
     call_arguments: RefCell<FxHashMap<u32, Option<&'a Arguments>>>,
     /// Memoized [`Extractor::assigned_names`].
     assigned: RefCell<FxHashMap<u32, std::rc::Rc<FxHashSet<String>>>>,
+    /// Memoized [`crate::index::type_checking_methods`], by file.
+    type_checking: RefCell<FxHashMap<File, std::rc::Rc<TypeCheckingMethods>>>,
     /// Memoized [`Extractor::offloaded_params`].
     offloaded_params: RefCell<FxHashMap<Key, Vec<HandedParam>>>,
     /// Lazy relationship reads recorded: `(function, location, relationship)`.
@@ -625,7 +631,22 @@ impl<'a, 'db> Extractor<'a, 'db> {
         };
         let module = parsed_module(db, def.python_file(db)).load(db);
         let range = def.focus_range(db, &module);
-        Some(((range.file(), range.start().to_u32()), is_function))
+        let key = (range.file(), range.start().to_u32());
+        if is_function && let Some(inherited) = self.inherited_at_run_time(key, module.syntax()) {
+            return Some((inherited, true));
+        }
+        Some((key, is_function))
+    }
+
+    /// A method declared only for type checkers (see [`crate::index::type_checking_methods`]):
+    /// what its class inherits under that name.
+    fn inherited_at_run_time(&self, key: Key, module: &ast::ModModule) -> Option<Key> {
+        let methods = {
+            let mut cache = self.type_checking.borrow_mut();
+            cache.entry(key.0).or_insert_with(|| std::rc::Rc::new(crate::index::type_checking_methods(module))).clone()
+        };
+        let (class, name) = methods.get(&key.1)?;
+        class_bases(self.db, (key.0, *class)).into_iter().find_map(|base| class_method(self.db, base, name))
     }
 
     /// `__enter__ = acquire` in a class body, `load = lambda: ...`: the function a name is bound to.
@@ -694,7 +715,19 @@ impl<'a, 'db> Extractor<'a, 'db> {
         if !resolution.targets.iter().any(|(_, bound)| *bound) {
             return (None, None);
         }
-        (self.self_class(&attr.value).or_else(|| instance_class(self.model, &attr.value)), None)
+        let class = self.self_class(&attr.value).or_else(|| instance_class(self.model, &attr.value));
+        (class.or_else(|| self.typing_self_class(&attr.value)), None)
+    }
+
+    /// The class of a value typed `Self` in a method (`server = cls(...)` in a classmethod): the
+    /// method's class.
+    fn typing_self_class(&self, expr: &Expr) -> Option<Key> {
+        let Some(Type::TypeVar(bound)) = expr.inferred_type(self.model) else { return None };
+        if bound.typevar(self.model.db()).kind(self.model.db()) != TypeVarKind::TypingSelf {
+            return None;
+        }
+        let class = self.index.functions.get(&self.current)?.class?;
+        Some((self.index.file, class))
     }
 
     /// See [`hydroid_core::facts::Instance`]: for `obj.name(...)` calling a method.
