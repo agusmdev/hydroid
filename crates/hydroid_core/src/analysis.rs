@@ -160,6 +160,19 @@ struct Graph<'a> {
     in_tests: Vec<bool>,
     /// Memoized [`Graph::template_hooks`].
     templates: RefCell<HashMap<TemplateKey, Rc<[FnId]>>>,
+    /// See [`Graph::registrations`].
+    registrations: Vec<Registration>,
+    /// Memoized [`Graph::registered_hooks`].
+    registered: RefCell<HashMap<TemplateKey, Rc<[FnId]>>>,
+}
+
+/// A project class added to a registry a library object keeps in an attribute (see
+/// [`crate::facts::Function::registered_params`]): the class of the object, the attribute, and
+/// the class added.
+struct Registration {
+    owner: ClassId,
+    attribute: String,
+    class: ClassId,
 }
 
 type ParamKey = (FnId, String);
@@ -235,7 +248,10 @@ impl<'a> Graph<'a> {
             below: RefCell::default(),
             in_tests: facts.functions.iter().map(|f| is_test_path(&f.location.path)).collect(),
             templates: RefCell::default(),
+            registrations: Vec::new(),
+            registered: RefCell::default(),
         };
+        graph.registrations = graph.registrations();
         // A class with no instances of its own may still have them through a registry its
         // ancestors keep (`__init_subclass__`).
         graph.instantiable = (0..facts.classes.len() as u32)
@@ -495,12 +511,14 @@ impl<'a> Graph<'a> {
             });
             out.extend(body.iter().copied());
             out.extend(dispatches.get(&original).into_iter().flatten());
-            // Awaiting a library coroutine method runs, on the loop, the project overrides of
-            // the hooks it calls on the instance.
+            // Calling a library method (awaiting it, for a coroutine method) runs the project
+            // overrides of the hooks it calls on the instance, and what the registries it reads
+            // hold.
             if let Some(receiver) = call.receiver
-                && self.facts.function(call.caller).is_async
+                && (!self.facts.function(original).is_async || self.facts.function(call.caller).is_async)
             {
-                out.extend(self.template_hooks(original, receiver).iter().copied());
+                out.extend(self.overrides_called(original, receiver).iter().copied());
+                out.extend(self.registered_hooks(original, receiver).iter().copied());
             }
             if virtual_dispatch {
                 // An instance of a known class runs only the overrides of its subclasses.
@@ -1408,6 +1426,91 @@ impl<'a> Graph<'a> {
         run.sort_unstable();
         run.dedup();
         run
+    }
+
+    /// The project classes added to registries library objects keep: a class passed to a library
+    /// method that adds that parameter to a container in an attribute of its instance
+    /// (`server.register_grant(RefreshTokenGrant)` appending to `self._token_grants`). The object
+    /// is the instance the method is called on, by its class: an object of an unknown class
+    /// registers nothing.
+    fn registrations(&self) -> Vec<Registration> {
+        let mut receivers: HashMap<(FnId, &Location, FnId), ClassId> = HashMap::default();
+        for call in &self.facts.calls {
+            let Some(receiver) = call.receiver else { continue };
+            for &t in &call.targets {
+                if !self.facts.function(t).registered_params.is_empty() {
+                    receivers.insert((call.caller, &call.location, t), receiver);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        for flow in &self.facts.flows {
+            let (Value::Class(class), Slot::Param(slot)) = (&flow.value, &flow.slot) else { continue };
+            let into = self.facts.function(flow.into);
+            if into.origin == Origin::Project {
+                continue;
+            }
+            let Some(&owner) = receivers.get(&(flow.caller, &flow.location, flow.into)) else { continue };
+            for (param, attribute) in &into.registered_params {
+                if param == slot {
+                    found.push(Registration { owner, attribute: attribute.clone(), class: *class });
+                }
+            }
+        }
+        found
+    }
+
+    /// What a library method running on an instance of `receiver` may run of the project classes
+    /// added to the registries it reads, directly or through other library methods it calls on
+    /// `self` (`create_token_response` calling `self.get_token_grant(...)`, which reads
+    /// `self._token_grants`): the library builds them and calls their methods, so their
+    /// construction and their overrides of library methods.
+    fn registered_hooks(&self, method: FnId, receiver: ClassId) -> Rc<[FnId]> {
+        let f = self.facts.function(method);
+        if self.registrations.is_empty() || f.origin == Origin::Project || f.class.is_none() {
+            return Rc::from([]);
+        }
+        if let Some(found) = self.registered.borrow().get(&(method, receiver)) {
+            return found.clone();
+        }
+        let related = |owner: ClassId| self.inherits(receiver, owner) || self.inherits(owner, receiver);
+        let mut reads: HashSet<&str> = HashSet::default();
+        if self.registrations.iter().any(|r| related(r.owner)) {
+            let mut seen = HashSet::from_iter([method]);
+            let mut queue = VecDeque::from([method]);
+            while let Some(m) = queue.pop_front() {
+                let caller = self.facts.function(m);
+                reads.extend(caller.self_reads.iter().map(String::as_str));
+                for name in &caller.self_calls {
+                    let Some(found) = Hierarchy::lookup(self.facts, receiver, name) else { continue };
+                    if self.facts.function(found).origin != Origin::Project && seen.insert(found) {
+                        queue.push_back(found);
+                    }
+                }
+            }
+        }
+        let mut hooks = Vec::new();
+        for r in self.registrations.iter().filter(|r| reads.contains(r.attribute.as_str()) && related(r.owner)) {
+            hooks.extend(self.construction(r.class));
+            for &a in self.ancestors(r.class).iter() {
+                for (name, m) in &self.facts.class(a).methods {
+                    if self.facts.function(*m).origin == Origin::Project {
+                        continue;
+                    }
+                    if let Some(o) = Hierarchy::lookup(self.facts, r.class, name)
+                        && self.facts.function(o).origin == Origin::Project
+                    {
+                        hooks.push(o);
+                    }
+                }
+            }
+        }
+        hooks.retain(|&h| self.facts.function(h).analyzed);
+        hooks.sort_unstable();
+        hooks.dedup();
+        let hooks: Rc<[FnId]> = Rc::from(hooks);
+        self.registered.borrow_mut().insert((method, receiver), hooks.clone());
+        hooks
     }
 
     /// What a library `async def` method runs of the project when it runs on an instance of

@@ -354,10 +354,24 @@ test code), narrowed by what is known:
   implementation behind its type-variable attributes.
 Methods are analyzed once per such instance.
 
-A library `async def` method running on an instance of a project subclass
-(`Security(scheme)`) runs the project's overrides of the library methods it calls on `self`,
-without `--follow-libs`. So does a project callable assigned over a library method on an
-instance (`app.openapi = custom_openapi`).
+A library method running on an instance of a project subclass runs the project's overrides of
+the library methods it calls on `self`, without `--follow-libs`: called from project code
+(`server.create_authorization_response(...)` calling `self.query_client(...)`), or, for an
+`async def` method, run by the framework (`Security(scheme)`). So does a project callable
+assigned over a library method on an instance (`app.openapi = custom_openapi`).
+
+Library objects keep registries: a library method adding a parameter to a container in an
+attribute of its instance (`self._token_grants.append((grant_cls, extensions))`,
+`self._endpoints[name] = endpoint`) registers the project class it is given there
+(`server.register_grant(RefreshTokenGrant)`). A library method reading that attribute, directly
+or through the library methods it calls on `self` (`create_token_response` calling
+`self.get_token_grant(...)`), may build the class and call any of its methods: it runs the
+class's construction and its overrides of library methods. Registries are known by the class of
+the object keeping them, not by object.
+
+A method declared in an `if TYPE_CHECKING:` block of a class body does not exist at run time:
+calling it runs what the class inherits under that name. A value typed `Self` in a method
+(`server = cls(...)` in a classmethod) is an instance of the method's class.
 
 Calling a generator function (or a decorated one whose call ty types as a context manager or an
 iterator) runs nothing until it is iterated (entered). A decorated function is reached through
@@ -385,7 +399,9 @@ ones (`await client.fetch()` on an untyped `client`), which are assumed to run a
 modeled yet:
 - `getattr(obj, "name")`, and containers of callables filled at run time: a registry dict a
   decorator or `__init_subclass__` fills (`EXPORTERS[fmt] = fn`), jobs put on a `queue.Queue` and
-  called where it is drained;
+  called where it is drained; library registries hold only classes (not instances or functions)
+  for hydroid, and two objects of one class share theirs: a non-blocking registration on one
+  server makes no difference, a blocking one is reported for both;
 - values behind a Protocol or ABC type: a call on a value declared as a Protocol (a factory
   `-> Transport` returning an `httpx.Client`, a function stored in a variable typed as a callback
   Protocol) or as an ABC with virtual subclasses (`Base.register(Impl)`) resolves to the abstract

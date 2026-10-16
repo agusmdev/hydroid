@@ -104,6 +104,15 @@ pub struct Function {
     /// The attributes of its instance a library method calls (`self.route_class(...)`).
     #[serde(default)]
     pub called_attributes: Vec<String>,
+    /// `(parameter, attribute)`: the parameters a library method adds to a container held in an
+    /// attribute of its instance, directly or through a local name: a registry
+    /// (`self._grants.append((grant_cls, extensions))`, `self._endpoints[name] = endpoint`).
+    /// The library methods reading the attribute later build and call what was added.
+    #[serde(default)]
+    pub registered_params: Vec<(String, String)>,
+    /// The attributes of its instance a library method reads (`self.name`).
+    #[serde(default)]
+    pub self_reads: Vec<String>,
     /// Whether the body was analyzed. Unanalyzed functions (stdlib stubs, libraries without
     /// `--follow-libs`) are leaves: only the catalog knows whether they block.
     pub analyzed: bool,
