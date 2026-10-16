@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0](https://github.com/agusmdev/hydroid/compare/v0.4.0...v0.5.0) (2026-10-16)
+
+
+### Features
+
+* follow project overrides through sync library methods and registries ([c5f9d76](https://github.com/agusmdev/hydroid/commit/c5f9d76022dc873e1ec62c2611142543de730240))
+* follow project overrides through sync library methods and registries ([7777e71](https://github.com/agusmdev/hydroid/commit/7777e71b9ec5159566a7483427ac7b668c6589cc))
+
 ## [0.4.0](https://github.com/agusmdev/hydroid/compare/v0.3.0...v0.4.0) (2026-10-15)
 
 
