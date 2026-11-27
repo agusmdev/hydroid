@@ -156,6 +156,7 @@ method, so the real implementation can be missed. What hydroid knowingly misses,
 
 ```sh
 cargo test --workspace        # needs `uv`; syncs tests/fixtures/.venv from uv.lock
+cargo test --workspace --profile ci   # what CI runs: optimized deps, much faster tests
 scripts/corpus.sh [names]     # Polar, mealie, lnbits, dispatch, litellm, open-webui, template
 ```
 

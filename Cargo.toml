@@ -47,3 +47,12 @@ inherits = "release"
 lto = false
 codegen-units = 16
 incremental = true
+
+# CI tests (`--profile ci`): ty is far too slow unoptimized, so dependencies are optimized while
+# the workspace keeps fast builds and debug assertions. Less debug info keeps `target/` small.
+[profile.ci]
+inherits = "dev"
+debug = "line-tables-only"
+
+[profile.ci.package."*"]
+opt-level = 2

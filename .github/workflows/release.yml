@@ -4,7 +4,9 @@
 # (after approval in the `pypi` environment) and attaches them to the GitHub release.
 # Everything stays in this one workflow: tags made with GITHUB_TOKEN don't trigger other
 # workflows, and PyPI trusts this file by name.
-# Pull requests that touch packaging build the wheels without publishing; so does a manual run.
+# Pull requests that touch packaging build and smoke-test one Linux wheel, uploading nothing
+# (ci.yml runs the tests). A manual run tests and builds every wheel without publishing.
+# Artifacts live 7 days: long enough for the `pypi` approval, short enough for the storage quota.
 name: Release
 
 on:
@@ -41,7 +43,7 @@ jobs:
 
   checks:
     needs: release-please
-    if: ${{ !cancelled() && (needs.release-please.outputs.created == 'true' || github.event_name != 'push') }}
+    if: ${{ !cancelled() && (needs.release-please.outputs.created == 'true' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,7 +52,14 @@ jobs:
           toolchain: "1.98.0"
           components: clippy
       - uses: astral-sh/setup-uv@v6
+        with:
+          cache-dependency-glob: tests/fixtures/uv.lock
+          save-cache: false
+      # ci.yml's cache; ci.yml saves it.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: false
       - name: Tag matches the workspace version
         if: needs.release-please.outputs.created == 'true'
         run: |
@@ -58,7 +67,23 @@ jobs:
             | jq -r '.packages[] | select(.name == "hydroid") | .version')
           test "v$version" = "${{ needs.release-please.outputs.tag }}"
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --profile ci
+
+  wheel-smoke:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          manylinux: auto
+          args: --release --locked --out dist
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+      - name: Smoke test the wheel
+        run: uvx --no-index --find-links dist --from hydroid-cli hydroid --version
 
   wheels:
     needs: checks
@@ -84,6 +109,8 @@ jobs:
           args: --release --locked --out dist
       - if: matrix.smoke
         uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
       - name: Smoke test the wheel
         if: matrix.smoke
         shell: bash
@@ -92,6 +119,7 @@ jobs:
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.manylinux || 'native' }}
           path: dist
+          retention-days: 7
 
   sdist:
     needs: checks
@@ -107,6 +135,7 @@ jobs:
         with:
           name: sdist
           path: dist
+          retention-days: 7
 
   publish:
     needs: [release-please, wheels, sdist]
