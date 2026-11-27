@@ -16,13 +16,14 @@ to PyPI as `hydroid-cli` by `.github/workflows/release.yml`.
    clippy and the tests, builds the wheels and the sdist, waits for approval in the `pypi`
    environment, publishes to PyPI and attaches the files to the GitHub release.
 
-The release PR is created with `GITHUB_TOKEN`, so CI does not run on it; the release run
-repeats clippy and the tests before anything is published.
+CI runs clippy and the tests on every PR, the release PR too. The release run repeats them on
+the tagged commit before anything is published.
 
 ## Dry run
 
-Run the **Release** workflow by hand (Actions → Release → Run workflow), or open a PR that
-touches packaging: it builds and smoke-tests every wheel without publishing.
+Run the **Release** workflow by hand (Actions → Release → Run workflow): it runs the tests and
+builds every wheel and the sdist without publishing. A PR that touches packaging builds and
+smoke-tests only the Linux x86_64 wheel, and uploads nothing.
 
 ## Setup (done once)
 

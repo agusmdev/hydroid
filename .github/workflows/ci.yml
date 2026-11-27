@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -15,6 +19,13 @@ jobs:
           toolchain: "1.98.0"
           components: clippy, rustfmt
       - uses: astral-sh/setup-uv@v6
+        with:
+          cache-dependency-glob: tests/fixtures/uv.lock
+      # One cache for this job and release.yml's `checks`, saved only from main: a cache per
+      # branch fills the repository's 10 GB cache quota.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --profile ci
