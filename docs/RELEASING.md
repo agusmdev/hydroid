@@ -20,8 +20,8 @@ CI runs clippy and the tests on every PR, the release PR too. The release PR is 
 `GITHUB_TOKEN`, so its CI waits until you select **Approve workflows to run** on it. The release
 run repeats clippy and the tests on the tagged commit before anything is published.
 
-Approve the `pypi` deployment within 7 days: the built wheels expire after that, and the
-publish jobs then fail.
+Approve the `pypi` deployment within 7 days of the release run: the wheels and the sdist expire
+7 days after upload, and the publish jobs then fail.
 
 ## Dry run
 
